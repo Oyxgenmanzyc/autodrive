@@ -1,0 +1,31 @@
+修改主题：基于上一帧预测轨迹的 temporal compatibility 噪声调制
+修改日期：2026-05-18
+
+修改目的：
+让 DiffusionDrive 在连续推理时利用上一轮 0.5s 预测轨迹，为当前 20 个固定 anchor 计算时间连续性匹配程度，并通过匹配程度调制扩散初始噪声强度，从而提升轨迹生成的时间连续性。
+
+涉及文件：
+navsim/agents/diffusiondrive/transfuser_agent.py
+navsim/agents/diffusiondrive/transfuser_model_v2.py
+
+核心改动：
+1. 在 TransfuserAgent 中缓存上一轮 compute_trajectory() 输出的预测轨迹。
+2. 下一轮推理时，将上一轮预测轨迹变换到当前 ego 坐标系，并构造 temporal reference。
+3. 不把上一轮轨迹作为新的第 21 个驾驶模态，也不生成新的 anchor。
+4. 不使用绝对位置贴合项，仅逐时间点比较局部位移趋势和由速度向量得到的局部航向。
+5. 在 TrajectoryHead.forward_test() 中根据 temporal compatibility 为 20 个固定 anchor 调制初始噪声强度。
+6. 噪声倍率限制在 0.85 到 1.25 之间，低兼容 anchor 只增加噪声，不会被删除或屏蔽。
+7. 增加 reset_temporal_context()，用于开始无关场景前清空上一轮预测缓存。
+
+预期影响：
+连续帧推理时，当前轨迹生成会更倾向于选择与上一轮预测局部运动趋势一致的 anchor，但仍保留突然变道、紧急避障、绕行等低连续性机动行为的生成可能。
+
+测试/验证结果：
+已运行：
+python -m py_compile navsim\agents\diffusiondrive\transfuser_agent.py navsim\agents\diffusiondrive\transfuser_model_v2.py
+
+结果：
+语法检查通过。
+
+与论文撰写的关系：
+该版本可作为“时间连续性约束/temporal compatibility guided diffusion noise modulation”的代码实验版本，用于描述在不增加新驾驶模态 anchor 的前提下，将上一帧预测轨迹作为连续性参考来影响当前扩散采样噪声。
