@@ -27,5 +27,14 @@ python -m py_compile navsim\agents\diffusiondrive\transfuser_agent.py navsim\age
 结果：
 语法检查通过。
 
+服务器冒烟验证（2026-05-20）：
+1. 在 /home/dell/navsim_workspace/DiffusionDrive 拉取分支 change/20260518-temporal-compat-noise，确认 HEAD 为 7690ade。
+2. 将 bkb_path 和 plan_anchor_path 调整为基于 NAVSIM_DEVKIT_ROOT 的本地模型资源路径：
+   - model/resnet34_checkpoint/pytorch_model.bin
+   - model/kmeans_navsim_traj_20.npy
+3. 使用已有兼容 cache /home/dell/navsim_exp_diffusiondrive_original/training_cache，未重新生成完整 navtrain cache。
+4. 使用 CUDA_VISIBLE_DEVICES=1、batch_size=64、limit_train_batches=1、limit_val_batches=0 跑通 1 个训练 batch。
+5. 训练日志显示 epoch 0 完成，Trainer.fit 因 max_epochs=1 正常停止。
+
 与论文撰写的关系：
 该版本可作为“时间连续性约束/temporal compatibility guided diffusion noise modulation”的代码实验版本，用于描述在不增加新驾驶模态 anchor 的前提下，将上一帧预测轨迹作为连续性参考来影响当前扩散采样噪声。
