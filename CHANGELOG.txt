@@ -39,7 +39,8 @@ python -m py_compile navsim\agents\diffusiondrive\transfuser_agent.py navsim\age
 训练配置调整（2026-05-21）：
 1. 完整训练在 epoch 25 附近停止后，检查 TensorBoard event 文件，未发现持久化日志中的 NaN/inf，train/loss_epoch 从约 78.6 下降到约 58.8，val/loss_epoch 约 35。
 2. 为降低单卡训练的显存与数值压力，将默认 batch_size 从 64 调整为 32。
-3. 如果 batch_size=32 仍出现梯度爆炸，下一步应优先检查学习率、AMP 数值稳定性和 gradient clipping，而不是继续只降低 batch size。
+3. 按 batch size 线性缩放规则，将默认学习率从 6e-4 调整为 3e-4，以匹配 batch_size=32。
+4. 如果 batch_size=32、lr=3e-4 仍出现梯度爆炸，下一步应优先检查 AMP 数值稳定性和 gradient clipping，而不是继续只降低 batch size。
 
 与论文撰写的关系：
 该版本可作为“时间连续性约束/temporal compatibility guided diffusion noise modulation”的代码实验版本，用于描述在不增加新驾驶模态 anchor 的前提下，将上一帧预测轨迹作为连续性参考来影响当前扩散采样噪声。
