@@ -44,3 +44,37 @@ python -m py_compile navsim\agents\diffusiondrive\transfuser_agent.py navsim\age
 
 与论文撰写的关系：
 该版本可作为“时间连续性约束/temporal compatibility guided diffusion noise modulation”的代码实验版本，用于描述在不增加新驾驶模态 anchor 的前提下，将上一帧预测轨迹作为连续性参考来影响当前扩散采样噪声。
+
+---
+
+修改主题：temporal compatibility noise modulation 完整 navtest 验证记录
+修改日期：2026-05-22
+
+修改目的：
+记录基于最新完整训练 checkpoint 的 navtest PDM scoring 结果，并保存本次训练配置调整后的复现实验表现。
+
+涉及文件：
+CHANGELOG.txt
+navsim/agents/diffusiondrive/transfuser_config.py
+navsim/planning/script/config/common/agent/diffusiondrive_agent.yaml
+navsim/planning/script/config/training/default_training.yaml
+
+核心改动：
+1. 延续 temporal compatibility guided diffusion noise modulation 代码版本。
+2. 保留 batch_size=32 与 lr=3e-4 的训练配置调整，用于降低单卡完整训练的显存与数值压力。
+3. 明确本地模型资源通过 NAVSIM_DEVKIT_ROOT 指向 DiffusionDrive 工程目录下的 model/ 资源。
+
+测试/验证结果：
+完整 navtest PDM scoring 已跑通。
+checkpoint：/home/dell/navsim_exp_autodrive_temporal_compat_noise_full_train/training_autodrive_temporal_compat_noise/2026.05.21.09.47.01/lightning_logs/version_0/checkpoints/epoch=99-step=266000.ckpt
+结果文件：/home/dell/navsim_exp_autodrive_temporal_compat_noise_eval/autodrive_temporal_compat_noise_navtest_eval/2026.05.22.13.55.35/2026.05.22.14.07.25.csv
+成功场景数：11881
+失败场景数：265
+Final average score of valid results：0.8815648874401228
+
+预期影响：
+相对于上一版复现结果，本次完整训练后的验证得分提升，可作为当前 temporal compatibility noise modulation 实验的最新有效结果。
+
+与论文撰写的关系：
+该结果可作为论文实验记录中 temporal compatibility guided diffusion noise modulation 方法的最新复现实验条目，用于支撑该时间连续性噪声调制策略在 navtest 上的有效性描述。
+
