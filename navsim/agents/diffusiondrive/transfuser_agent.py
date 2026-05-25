@@ -124,20 +124,24 @@ class TransfuserAgent(AbstractAgent):
 
         previous_ego_pose = agent_input.ego_statuses[-2].ego_pose
         previous_xy = self._previous_trajectory[:, :2]
+        if previous_xy.shape[0] < 2 or not np.isfinite(previous_xy).all():
+            return None
+
         cos_h = np.cos(previous_ego_pose[2])
         sin_h = np.sin(previous_ego_pose[2])
         rotation = np.array([[cos_h, -sin_h], [sin_h, cos_h]], dtype=np.float32)
         previous_xy_in_current = previous_xy @ rotation.T + previous_ego_pose[:2].astype(np.float32)
 
-        if previous_xy_in_current.shape[0] < 2:
+        interval_length = float(self._config.trajectory_sampling.interval_length)
+        shift_steps = max(1, int(round(0.5 / interval_length)))
+        if previous_xy_in_current.shape[0] <= shift_steps:
+            return None
+        if not np.isfinite(previous_xy_in_current).all():
             return None
         if np.linalg.norm(previous_xy_in_current[0]) > self._temporal_reset_distance:
             return None
 
-        last_delta = previous_xy_in_current[-1] - previous_xy_in_current[-2]
-        extrapolated_xy = previous_xy_in_current[-1] + last_delta
-        shifted_xy = np.concatenate([previous_xy_in_current[1:], extrapolated_xy[None]], axis=0)
-        shifted_xy = shifted_xy - previous_xy_in_current[0]
+        shifted_xy = previous_xy_in_current[shift_steps:] - previous_xy_in_current[0]
         return shifted_xy.astype(np.float32)
 
     def compute_trajectory(self, agent_input: AgentInput) -> Trajectory:

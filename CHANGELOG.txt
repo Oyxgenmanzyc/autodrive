@@ -1,31 +1,42 @@
-修改主题：基于上一帧预测轨迹的 temporal compatibility 噪声调制
-修改日期：2026-05-18
+修改主题：第二代 time-aligned temporal compatibility 噪声调制
+修改日期：2026-05-25
 
 修改目的：
-让 DiffusionDrive 在连续推理时利用上一轮 0.5s 预测轨迹，为当前 20 个固定 anchor 计算时间连续性匹配程度，并通过匹配程度调制扩散初始噪声强度，从而提升轨迹生成的时间连续性。
+让 DiffusionDrive 在连续推理时先对上一帧预测轨迹做时间对齐和真实重叠 horizon 裁剪，再与当前 20 个固定 anchor 计算 temporal compatibility，并通过该适配度调制推理阶段扩散初始噪声强度。
 
 涉及文件：
 navsim/agents/diffusiondrive/transfuser_agent.py
 navsim/agents/diffusiondrive/transfuser_model_v2.py
+tests/test_diffusiondrive_temporal_compat.py
 
 核心改动：
 1. 在 TransfuserAgent 中缓存上一轮 compute_trajectory() 输出的预测轨迹。
-2. 下一轮推理时，将上一轮预测轨迹变换到当前 ego 坐标系，并构造 temporal reference。
-3. 不把上一轮轨迹作为新的第 21 个驾驶模态，也不生成新的 anchor。
-4. 不使用绝对位置贴合项，仅逐时间点比较局部位移趋势和由速度向量得到的局部航向。
-5. 在 TrajectoryHead.forward_test() 中根据 temporal compatibility 为 20 个固定 anchor 调制初始噪声强度。
-6. 噪声倍率限制在 0.85 到 1.25 之间，低兼容 anchor 只增加噪声，不会被删除或屏蔽。
-7. 增加 reset_temporal_context()，用于开始无关场景前清空上一轮预测缓存。
+2. 下一轮推理时，将上一轮预测轨迹变换到当前 ego 坐标系。
+3. 根据 trajectory_sampling.interval_length 推导时间偏移，默认连续帧间隔 0.5s 时使用 shift_steps=1。
+4. temporal reference 只保留真实重叠段 previous_xy_in_current[1:]，不再外推末端点补齐到 8 个点。
+5. TrajectoryHead._temporal_noise_scale() 支持 7 点或更短的 aligned previous trajectory，并将 plan_anchor 裁剪到相同 overlap 长度。
+6. temporal compatibility cost 改为逐时间点计算 position、delta、speed、heading 四项误差，默认权重为 0.35、0.35、0.15、0.15。
+7. 不新增第 21 个 anchor，不删除或屏蔽任何低兼容 anchor，不修改训练路径、decoder mode 数、loss 或分类头。
+8. 噪声倍率继续限制在 0.85 到 1.25 之间，低兼容 anchor 只会增加初始噪声。
+9. 增加 temporal compatibility 轻量单元测试，覆盖空历史、overlap shape、匹配 anchor 噪声更低、position 项有效。
 
 预期影响：
-连续帧推理时，当前轨迹生成会更倾向于选择与上一轮预测局部运动趋势一致的 anchor，但仍保留突然变道、紧急避障、绕行等低连续性机动行为的生成可能。
+连续帧推理时，当前轨迹生成会更倾向于选择与上一帧预测在相同未来时间步上位置和局部运动趋势都一致的 anchor，同时仍保留突然变道、紧急避障、绕行等低连续性机动行为的生成可能。
 
 测试/验证结果：
 已运行：
-python -m py_compile navsim\agents\diffusiondrive\transfuser_agent.py navsim\agents\diffusiondrive\transfuser_model_v2.py
+python -m pytest tests\test_diffusiondrive_temporal_compat.py
+结果：当前默认 python 和 D:\python\venv\Scripts\python.exe 均未安装 pytest，无法执行该命令。
 
-结果：
-语法检查通过。
+D:\python\venv\Scripts\python.exe -c "<manual test runner>"
+结果：手动加载 tests\test_diffusiondrive_temporal_compat.py 并执行全部 test_ 函数，通过。
+
+python -m py_compile navsim\agents\diffusiondrive\transfuser_agent.py navsim\agents\diffusiondrive\transfuser_model_v2.py
+python -m py_compile tests\test_diffusiondrive_temporal_compat.py
+结果：语法检查通过。
+
+git diff --check
+结果：通过，仅提示工作区文件行尾会在 Git 操作时从 LF 转为 CRLF。
 
 与论文撰写的关系：
-该版本可作为“时间连续性约束/temporal compatibility guided diffusion noise modulation”的代码实验版本，用于描述在不增加新驾驶模态 anchor 的前提下，将上一帧预测轨迹作为连续性参考来影响当前扩散采样噪声。
+该版本可作为“time-aligned temporal compatibility guided diffusion noise modulation”的第二代实验版本，用于描述在不增加新驾驶模态 anchor 的前提下，将 BridgeAD 的 step-level historical planning 对齐思想迁移到 anchor 适配函数中。

@@ -413,6 +413,10 @@ class TrajectoryHead(nn.Module):
         self.temporal_noise_strength = 0.2
         self.temporal_noise_min_scale = 0.85
         self.temporal_noise_max_scale = 1.25
+        self.temporal_position_weight = 0.35
+        self.temporal_delta_weight = 0.35
+        self.temporal_speed_weight = 0.15
+        self.temporal_heading_weight = 0.15
 
         self.diffusion_scheduler = DDIMScheduler(
             num_train_timesteps=1000,
@@ -475,12 +479,24 @@ class TrajectoryHead(nn.Module):
             return None
 
         previous_trajectory = previous_trajectory.to(device=plan_anchor.device, dtype=plan_anchor.dtype)
-        previous_delta = self._point_deltas(previous_trajectory[..., :2]).unsqueeze(1)
-        anchor_delta = self._point_deltas(plan_anchor[..., :2])
+        if not torch.isfinite(previous_trajectory).all():
+            return None
+
+        overlap_len = min(previous_trajectory.shape[-2], plan_anchor.shape[-2])
+        if overlap_len < 1:
+            return None
+
+        previous_xy = previous_trajectory[..., :overlap_len, :2]
+        anchor_xy = plan_anchor[..., :overlap_len, :2]
+        previous_delta = self._point_deltas(previous_xy).unsqueeze(1)
+        anchor_delta = self._point_deltas(anchor_xy)
 
         eps = 1e-6
+        position_error = torch.linalg.norm(anchor_xy - previous_xy.unsqueeze(1), dim=-1) / 5.0
+        delta_error = torch.linalg.norm(anchor_delta - previous_delta, dim=-1)
         anchor_speed = torch.linalg.norm(anchor_delta, dim=-1)
         previous_speed = torch.linalg.norm(previous_delta, dim=-1)
+        delta_error = delta_error / (previous_speed + 1.0)
         speed_error = torch.abs(anchor_speed - previous_speed) / (previous_speed + 1.0)
 
         anchor_heading = torch.atan2(anchor_delta[..., 1], anchor_delta[..., 0])
@@ -491,7 +507,12 @@ class TrajectoryHead(nn.Module):
         ).abs() / np.pi
         heading_error = torch.where((anchor_speed > eps) & (previous_speed > eps), heading_error, torch.zeros_like(heading_error))
 
-        temporal_cost = (0.5 * speed_error.clamp(max=2.0) + 0.5 * heading_error).mean(dim=-1)
+        temporal_cost = (
+            self.temporal_position_weight * position_error.clamp(max=2.0)
+            + self.temporal_delta_weight * delta_error.clamp(max=2.0)
+            + self.temporal_speed_weight * speed_error.clamp(max=2.0)
+            + self.temporal_heading_weight * heading_error
+        ).mean(dim=-1)
         centered_cost = temporal_cost - temporal_cost.mean(dim=1, keepdim=True)
         noise_scale = 1.0 + self.temporal_noise_strength * torch.tanh(centered_cost)
         noise_scale = noise_scale.clamp(self.temporal_noise_min_scale, self.temporal_noise_max_scale)
