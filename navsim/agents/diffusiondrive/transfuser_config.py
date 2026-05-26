@@ -8,7 +8,7 @@ from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
 from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
 
 
-_NAVSIM_DEVKIT_ROOT = os.environ.get("NAVSIM_DEVKIT_ROOT", "/home/dell/zyc/autodrive_latest_smoke")
+_NAVSIM_DEVKIT_ROOT = os.environ.get("NAVSIM_DEVKIT_ROOT", "/home/dell/zyc/autodrive_time_aligned_temporal_compat")
 
 
 @dataclass

@@ -73,7 +73,7 @@ git diff --check
 temporal compatibility 单元测试 4 个用例通过，语法检查通过，diff 空白检查通过。
 
 服务器一批次训练 smoke：
-1. 工作区：/home/dell/zyc/autodrive_latest_smoke
+1. 工作区：/home/dell/zyc/autodrive_time_aligned_temporal_compat
 2. 分支：server/20260526-time-aligned-temporal-compat-smoke
 3. 基线提交：4722fff feat: add time-aligned temporal compatibility noise
 4. Python 环境：/home/dell/anaconda3/envs/navsim/bin/python
