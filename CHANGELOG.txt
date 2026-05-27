@@ -1,31 +1,44 @@
-修改主题：基于上一帧预测轨迹的 temporal compatibility 噪声调制
-修改日期：2026-05-18
+修改主题：第三版 factorized temporal compatibility 噪声调制
+修改日期：2026-05-27
 
 修改目的：
-让 DiffusionDrive 在连续推理时利用上一轮 0.5s 预测轨迹，为当前 20 个固定 anchor 计算时间连续性匹配程度，并通过匹配程度调制扩散初始噪声强度，从而提升轨迹生成的时间连续性。
+在第一版 temporal compatibility 噪声调制基础上，借鉴 SparseDriveV2 将轨迹拆成 geometric path 与 velocity profile 的思想，把上一帧预测轨迹与 20 个固定 anchor 的适配函数拆成 path、velocity、goal 三个分量，减少路径连续性和速度连续性的互相污染。
 
 涉及文件：
 navsim/agents/diffusiondrive/transfuser_agent.py
 navsim/agents/diffusiondrive/transfuser_model_v2.py
+tests/test_diffusiondrive_factorized_temporal_compat.py
 
 核心改动：
 1. 在 TransfuserAgent 中缓存上一轮 compute_trajectory() 输出的预测轨迹。
-2. 下一轮推理时，将上一轮预测轨迹变换到当前 ego 坐标系，并构造 temporal reference。
-3. 不把上一轮轨迹作为新的第 21 个驾驶模态，也不生成新的 anchor。
-4. 不使用绝对位置贴合项，仅逐时间点比较局部位移趋势和由速度向量得到的局部航向。
-5. 在 TrajectoryHead.forward_test() 中根据 temporal compatibility 为 20 个固定 anchor 调制初始噪声强度。
-6. 噪声倍率限制在 0.85 到 1.25 之间，低兼容 anchor 只增加噪声，不会被删除或屏蔽。
-7. 增加 reset_temporal_context()，用于开始无关场景前清空上一轮预测缓存。
+2. TransfuserAgent._build_temporal_reference() 沿用第一版逻辑：上一帧预测轨迹变换到当前 ego 坐标系，丢弃已执行点，并用末端速度外推补齐 8 个点。
+3. 不引入第二版 time-aligned overlap 裁剪，保证该版本只评估适配函数因子化的影响。
+4. 在 TrajectoryHead 中新增 _temporal_compatibility_components()，分别计算 path_cost、velocity_cost、goal_cost。
+5. path_cost 比较局部运动方向和转向变化，主要表达路径形状与横向意图连续性。
+6. velocity_cost 比较每个 waypoint 的位移幅值和相邻速度变化，主要表达跟车、制动、加速节奏连续性。
+7. goal_cost 比较最终点位置和最终运动方向，表达目标趋向一致性。
+8. 新增 _temporal_compatibility_cost()，默认按 path=0.45、velocity=0.35、goal=0.20 加权组合。
+9. _temporal_noise_scale() 只负责将 compatibility cost 映射为噪声倍率，倍率范围仍为 0.85 到 1.25。
+10. 不新增第 21 个 anchor，不删除或屏蔽任何低兼容 anchor，不修改训练路径、decoder mode 数、loss 或分类头。
+11. A_safe 暂不实现，安全相关场景门控留作后续需要显式障碍物、地图或 PDM 信号的独立版本。
+12. 增加 factorized temporal compatibility 轻量单元测试，覆盖空历史、shape、path/velocity/goal 分量和匹配 anchor 噪声更低。
 
 预期影响：
-连续帧推理时，当前轨迹生成会更倾向于选择与上一轮预测局部运动趋势一致的 anchor，但仍保留突然变道、紧急避障、绕行等低连续性机动行为的生成可能。
+连续帧推理时，当前轨迹生成会更倾向于选择与上一轮预测在路径形状、速度节奏和目标趋向上分别兼容的 anchor。相比第一版单一 speed/heading cost，该版本可区分“路径不一致”和“速度不一致”的原因，减少例如跟车减速场景下对合理变道候选的过度压制。
 
 测试/验证结果：
 已运行：
-python -m py_compile navsim\agents\diffusiondrive\transfuser_agent.py navsim\agents\diffusiondrive\transfuser_model_v2.py
+python -m pytest tests\test_diffusiondrive_factorized_temporal_compat.py
+结果：当前默认 python 未安装 pytest，无法执行该命令。
 
-结果：
-语法检查通过。
+D:\python\venv\Scripts\python.exe -c "<manual test runner>"
+结果：手动加载 tests\test_diffusiondrive_factorized_temporal_compat.py 并执行全部 test_ 函数，通过。
+
+python -m py_compile navsim\agents\diffusiondrive\transfuser_model_v2.py tests\test_diffusiondrive_factorized_temporal_compat.py
+结果：语法检查通过。
+
+git diff --check
+结果：通过，仅提示工作区文件行尾会在 Git 操作时从 LF 转为 CRLF。
 
 与论文撰写的关系：
-该版本可作为“时间连续性约束/temporal compatibility guided diffusion noise modulation”的代码实验版本，用于描述在不增加新驾驶模态 anchor 的前提下，将上一帧预测轨迹作为连续性参考来影响当前扩散采样噪声。
+该版本可作为“factorized temporal compatibility guided diffusion noise modulation”的第三版实验版本，用于描述在不增加新驾驶模态 anchor 的前提下，借鉴 SparseDriveV2 的 path/velocity factorization 思想，将上一帧预测轨迹对当前 anchor 的连续性约束拆成路径适配、速度适配和目标适配。

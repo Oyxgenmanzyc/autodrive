@@ -413,6 +413,9 @@ class TrajectoryHead(nn.Module):
         self.temporal_noise_strength = 0.2
         self.temporal_noise_min_scale = 0.85
         self.temporal_noise_max_scale = 1.25
+        self.temporal_path_weight = 0.45
+        self.temporal_velocity_weight = 0.35
+        self.temporal_goal_weight = 0.20
 
         self.diffusion_scheduler = DDIMScheduler(
             num_train_timesteps=1000,
@@ -470,28 +473,86 @@ class TrajectoryHead(nn.Module):
         previous_points = torch.cat([origin, points[..., :-1, :]], dim=-2)
         return points - previous_points
 
-    def _temporal_noise_scale(self, plan_anchor, previous_trajectory):
+    def _angle_error(self, anchor_angle, previous_angle):
+        return torch.atan2(
+            torch.sin(anchor_angle - previous_angle),
+            torch.cos(anchor_angle - previous_angle),
+        ).abs() / np.pi
+
+    def _temporal_compatibility_components(self, plan_anchor, previous_trajectory):
         if previous_trajectory is None:
-            return None
+            return None, None, None
 
         previous_trajectory = previous_trajectory.to(device=plan_anchor.device, dtype=plan_anchor.dtype)
-        previous_delta = self._point_deltas(previous_trajectory[..., :2]).unsqueeze(1)
-        anchor_delta = self._point_deltas(plan_anchor[..., :2])
+        if not torch.isfinite(previous_trajectory).all():
+            return None, None, None
+
+        overlap_len = min(previous_trajectory.shape[-2], plan_anchor.shape[-2])
+        if overlap_len < 1:
+            return None, None, None
+
+        previous_xy = previous_trajectory[..., :overlap_len, :2]
+        anchor_xy = plan_anchor[..., :overlap_len, :2]
+        previous_delta = self._point_deltas(previous_xy).unsqueeze(1)
+        anchor_delta = self._point_deltas(anchor_xy)
 
         eps = 1e-6
         anchor_speed = torch.linalg.norm(anchor_delta, dim=-1)
         previous_speed = torch.linalg.norm(previous_delta, dim=-1)
-        speed_error = torch.abs(anchor_speed - previous_speed) / (previous_speed + 1.0)
 
         anchor_heading = torch.atan2(anchor_delta[..., 1], anchor_delta[..., 0])
         previous_heading = torch.atan2(previous_delta[..., 1], previous_delta[..., 0])
-        heading_error = torch.atan2(
-            torch.sin(anchor_heading - previous_heading),
-            torch.cos(anchor_heading - previous_heading),
-        ).abs() / np.pi
+        heading_error = self._angle_error(anchor_heading, previous_heading)
         heading_error = torch.where((anchor_speed > eps) & (previous_speed > eps), heading_error, torch.zeros_like(heading_error))
 
-        temporal_cost = (0.5 * speed_error.clamp(max=2.0) + 0.5 * heading_error).mean(dim=-1)
+        path_heading_cost = heading_error.mean(dim=-1)
+        if overlap_len > 1:
+            anchor_turn = torch.atan2(
+                torch.sin(anchor_heading[..., 1:] - anchor_heading[..., :-1]),
+                torch.cos(anchor_heading[..., 1:] - anchor_heading[..., :-1]),
+            )
+            previous_turn = torch.atan2(
+                torch.sin(previous_heading[..., 1:] - previous_heading[..., :-1]),
+                torch.cos(previous_heading[..., 1:] - previous_heading[..., :-1]),
+            )
+            turn_error = self._angle_error(anchor_turn, previous_turn)
+            turn_cost = turn_error.mean(dim=-1)
+        else:
+            turn_cost = torch.zeros_like(path_heading_cost)
+        path_cost = 0.7 * path_heading_cost + 0.3 * turn_cost
+
+        speed_error = torch.abs(anchor_speed - previous_speed) / (previous_speed + 1.0)
+        speed_cost = speed_error.clamp(max=2.0).mean(dim=-1)
+        if overlap_len > 1:
+            anchor_speed_delta = anchor_speed[..., 1:] - anchor_speed[..., :-1]
+            previous_speed_delta = previous_speed[..., 1:] - previous_speed[..., :-1]
+            speed_delta_error = torch.abs(anchor_speed_delta - previous_speed_delta) / (previous_speed_delta.abs() + 1.0)
+            speed_delta_cost = speed_delta_error.clamp(max=2.0).mean(dim=-1)
+        else:
+            speed_delta_cost = torch.zeros_like(speed_cost)
+        velocity_cost = 0.7 * speed_cost + 0.3 * speed_delta_cost
+
+        goal_position_error = torch.linalg.norm(anchor_xy[..., -1, :] - previous_xy.unsqueeze(1)[..., -1, :], dim=-1) / 5.0
+        goal_heading_error = heading_error[..., -1]
+        goal_cost = 0.7 * goal_position_error.clamp(max=2.0) + 0.3 * goal_heading_error
+        return path_cost, velocity_cost, goal_cost
+
+    def _temporal_compatibility_cost(self, plan_anchor, previous_trajectory):
+        path_cost, velocity_cost, goal_cost = self._temporal_compatibility_components(plan_anchor, previous_trajectory)
+        if path_cost is None:
+            return None
+
+        return (
+            self.temporal_path_weight * path_cost.clamp(max=2.0)
+            + self.temporal_velocity_weight * velocity_cost.clamp(max=2.0)
+            + self.temporal_goal_weight * goal_cost.clamp(max=2.0)
+        )
+
+    def _temporal_noise_scale(self, plan_anchor, previous_trajectory):
+        temporal_cost = self._temporal_compatibility_cost(plan_anchor, previous_trajectory)
+        if temporal_cost is None:
+            return None
+
         centered_cost = temporal_cost - temporal_cost.mean(dim=1, keepdim=True)
         noise_scale = 1.0 + self.temporal_noise_strength * torch.tanh(centered_cost)
         noise_scale = noise_scale.clamp(self.temporal_noise_min_scale, self.temporal_noise_max_scale)
