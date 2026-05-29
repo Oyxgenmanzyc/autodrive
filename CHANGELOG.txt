@@ -48,3 +48,50 @@ git diff --check
 
 与论文撰写的关系：
 该版本可作为“scene-change gated time-aligned temporal compatibility guided diffusion noise modulation”的第四版实验版本，用于描述在保留 BridgeAD-style step-level historical alignment 思想的基础上，通过场景突变门控动态降低历史轨迹对当前 anchor 噪声分配的影响。
+
+---
+
+修改主题：scene-change gated temporal compatibility 服务器 smoke 运行适配
+修改日期：2026-05-29
+
+修改目的：
+将第四版 scene-change gated time-aligned temporal compatibility 实验分支适配到远程服务器环境，在不改动方法逻辑的前提下复用服务器已有模型资源和训练 cache，确认训练链路可跑通。
+
+涉及文件：
+navsim/agents/diffusiondrive/transfuser_config.py
+navsim/planning/script/config/common/agent/diffusiondrive_agent.yaml
+navsim/planning/script/config/training/default_training.yaml
+CHANGELOG.txt
+
+核心改动：
+1. 将 resnet34 backbone 和 20 anchor 文件路径改为基于 NAVSIM_DEVKIT_ROOT 的服务器本地资源路径：
+   - model/resnet34_checkpoint/pytorch_model.bin
+   - model/kmeans_navsim_traj_20.npy
+2. 保留第四版 scene-change gated temporal compatibility / diffusion 方法逻辑，不修改训练 forward、decoder mode 数、loss 或分类头。
+3. 复用上一版服务器稳定训练配置，将默认 batch_size 从 64 调整为 32。
+4. 按 batch size 线性缩放规则，将默认学习率从 6e-4 调整为 3e-4。
+
+测试/验证结果：
+已运行：
+/home/dell/anaconda3/envs/navsim/bin/python -m pytest tests/test_diffusiondrive_temporal_compat.py tests/test_diffusiondrive_scene_change_gate.py
+python -m py_compile navsim/agents/diffusiondrive/transfuser_agent.py navsim/agents/diffusiondrive/transfuser_model_v2.py tests/test_diffusiondrive_temporal_compat.py tests/test_diffusiondrive_scene_change_gate.py navsim/agents/diffusiondrive/transfuser_config.py
+git diff --check
+
+结果：
+temporal compatibility 和 scene-change gate 单元测试共 10 个用例通过，语法检查通过，diff 空白检查通过。
+
+服务器一批次训练 smoke：
+1. 工作区：/home/dell/zyc/autodrive_scene_change_gated_temporal_compat
+2. 分支：server/20260529-scene-change-gated-temporal-compat-smoke
+3. 基线提交：d4daf10 feat: add scene-change gated temporal noise
+4. Python 环境：/home/dell/anaconda3/envs/navsim/bin/python
+5. GPU：CUDA_VISIBLE_DEVICES=0
+6. cache：/home/dell/navsim_exp_diffusiondrive_original/training_cache/
+7. cache 策略：use_cache_without_dataset=True，force_cache_computation=False
+8. 日志确认：Using cached data without building SceneLoader，未重新生成 cache。
+9. 输出目录：/home/dell/navsim_exp_autodrive_scene_change_gated_temporal_compat_smoke/training_scene_change_gated_temporal_compat_smoke/2026.05.29.17.10.05
+10. 训练设置：max_epochs=1，limit_train_batches=1，limit_val_batches=0。
+11. 结果：1 个训练 batch 跑通，Trainer.fit 因 max_epochs=1 正常停止。
+
+与论文撰写的关系：
+该记录说明第四版 scene-change gated temporal compatibility 实验分支已在远程服务器环境完成最小训练链路验证，可作为后续完整训练前的工程可运行性依据。
