@@ -16,6 +16,7 @@ from navsim.agents.diffusiondrive.transfuser_callback import TransfuserCallback
 from navsim.agents.diffusiondrive.transfuser_loss import transfuser_loss
 from navsim.agents.diffusiondrive.transfuser_features import TransfuserFeatureBuilder, TransfuserTargetBuilder
 from navsim.common.dataclasses import SensorConfig
+from navsim.common.enums import LidarIndex
 from navsim.planning.training.abstract_feature_target_builder import AbstractFeatureBuilder, AbstractTargetBuilder
 from navsim.agents.diffusiondrive.modules.scheduler import WarmupCosLR
 from omegaconf import DictConfig, OmegaConf, open_dict
@@ -53,7 +54,9 @@ class TransfuserAgent(AbstractAgent):
         self._checkpoint_path = checkpoint_path
         self._transfuser_model = TransfuserModel(config)
         self._previous_trajectory: Optional[np.ndarray] = None
+        self._previous_scene_summary: Optional[Dict[str, Any]] = None
         self._temporal_reset_distance = 5.0
+        self._history_weight_min = 0.10
         self.init_from_pretrained()
 
     def init_from_pretrained(self):
@@ -110,13 +113,114 @@ class TransfuserAgent(AbstractAgent):
         features: Dict[str, torch.Tensor],
         targets: Dict[str, torch.Tensor]=None,
         previous_trajectory: Optional[torch.Tensor]=None,
+        history_weight: Optional[float]=None,
     ) -> Dict[str, torch.Tensor]:
         """Inherited, see superclass."""
-        return self._transfuser_model(features, targets=targets, previous_trajectory=previous_trajectory)
+        return self._transfuser_model(
+            features,
+            targets=targets,
+            previous_trajectory=previous_trajectory,
+            history_weight=history_weight,
+        )
 
     def reset_temporal_context(self) -> None:
         """Clears cached inference trajectory before starting an unrelated scene."""
         self._previous_trajectory = None
+        self._previous_scene_summary = None
+
+    def _build_scene_summary(self, agent_input: AgentInput) -> Dict[str, Any]:
+        ego_status = agent_input.ego_statuses[-1]
+        ego_velocity = np.asarray(ego_status.ego_velocity, dtype=np.float32)
+        ego_acceleration = np.asarray(ego_status.ego_acceleration, dtype=np.float32)
+        route_command = np.asarray(ego_status.driving_command, dtype=np.float32)
+
+        summary: Dict[str, Any] = {
+            "route_command": route_command,
+            "ego_speed": float(np.linalg.norm(ego_velocity[:2])),
+            "ego_lon_accel": float(ego_acceleration[0]) if ego_acceleration.size > 0 else 0.0,
+            "front_min_distance": np.inf,
+            "near_front_count": 0.0,
+            "left_front_count": 0.0,
+            "right_front_count": 0.0,
+            "approx_ttc": np.inf,
+        }
+
+        if not agent_input.lidars or agent_input.lidars[-1].lidar_pc is None:
+            return summary
+
+        lidar_pc = agent_input.lidars[-1].lidar_pc
+        points = np.asarray(lidar_pc[LidarIndex.POSITION].T, dtype=np.float32)
+        if points.size == 0:
+            return summary
+
+        finite_mask = np.isfinite(points).all(axis=-1)
+        points = points[finite_mask]
+        if points.size == 0:
+            return summary
+
+        x, y, z = points[:, 0], points[:, 1], points[:, 2]
+        height_mask = (z > self._config.lidar_split_height) & (z < self._config.max_height_lidar)
+        front_mask = height_mask & (x > 0.5) & (x < 30.0) & (np.abs(y) < 4.0)
+        if np.any(front_mask):
+            summary["front_min_distance"] = float(np.min(x[front_mask]))
+
+        near_front_mask = height_mask & (x > 0.5) & (x < 15.0) & (np.abs(y) < 4.0)
+        left_front_mask = height_mask & (x > 0.5) & (x < 20.0) & (y > 1.5) & (y < 6.0)
+        right_front_mask = height_mask & (x > 0.5) & (x < 20.0) & (y < -1.5) & (y > -6.0)
+        summary["near_front_count"] = float(np.count_nonzero(near_front_mask))
+        summary["left_front_count"] = float(np.count_nonzero(left_front_mask))
+        summary["right_front_count"] = float(np.count_nonzero(right_front_mask))
+        return summary
+
+    def _scene_change_score(self, previous_summary: Optional[Dict[str, Any]], current_summary: Dict[str, Any]) -> float:
+        if previous_summary is None:
+            return 0.0
+
+        score = 0.0
+        if not np.array_equal(previous_summary["route_command"], current_summary["route_command"]):
+            score += 0.8
+
+        speed_drop = max(previous_summary["ego_speed"] - current_summary["ego_speed"], 0.0)
+        score += 0.6 * min(speed_drop / 5.0, 1.0)
+
+        hard_decel = max(-current_summary["ego_lon_accel"] - 2.5, 0.0)
+        score += 0.6 * min(hard_decel / 4.0, 1.0)
+
+        previous_front = previous_summary["front_min_distance"]
+        current_front = current_summary["front_min_distance"]
+        if np.isfinite(previous_front) and np.isfinite(current_front):
+            front_drop = max(previous_front - current_front, 0.0)
+            score += 0.7 * min(front_drop / 8.0, 1.0)
+
+            dt = max(float(self._config.trajectory_sampling.interval_length), 1e-3)
+            closing_speed = max(front_drop / dt, 0.0)
+            if closing_speed > 1e-3:
+                current_ttc = current_front / closing_speed
+                current_summary["approx_ttc"] = float(current_ttc)
+                score += 0.8 * min(max((4.0 - current_ttc) / 4.0, 0.0), 1.0)
+                previous_ttc = previous_summary.get("approx_ttc", np.inf)
+                if np.isfinite(previous_ttc):
+                    score += 0.4 * min(max((previous_ttc - current_ttc) / 4.0, 0.0), 1.0)
+
+        for key, weight in (
+            ("near_front_count", 0.35),
+            ("left_front_count", 0.25),
+            ("right_front_count", 0.25),
+        ):
+            previous_count = previous_summary[key]
+            current_count = current_summary[key]
+            count_growth = max(current_count - previous_count, 0.0)
+            score += weight * min(count_growth / (previous_count + 20.0), 1.0)
+
+        return float(score)
+
+    def _history_weight_from_scene_change(
+        self,
+        previous_summary: Optional[Dict[str, Any]],
+        current_summary: Dict[str, Any],
+    ) -> float:
+        change_score = self._scene_change_score(previous_summary, current_summary)
+        return float(np.clip(np.exp(-change_score), self._history_weight_min, 1.0))
 
     def _build_temporal_reference(self, agent_input: AgentInput) -> Optional[np.ndarray]:
         if self._previous_trajectory is None or len(agent_input.ego_statuses) < 2:
@@ -154,16 +258,27 @@ class TransfuserAgent(AbstractAgent):
             features.update(builder.compute_features(agent_input))
 
         features = {k: v.unsqueeze(0) for k, v in features.items()}
+        current_scene_summary = self._build_scene_summary(agent_input)
         previous_trajectory = self._build_temporal_reference(agent_input)
+        history_weight = None
         previous_trajectory_tensor = None
         if previous_trajectory is not None:
             previous_trajectory_tensor = torch.tensor(previous_trajectory).unsqueeze(0)
+            history_weight = self._history_weight_from_scene_change(
+                self._previous_scene_summary,
+                current_scene_summary,
+            )
 
         with torch.no_grad():
-            predictions = self.forward(features, previous_trajectory=previous_trajectory_tensor)
+            predictions = self.forward(
+                features,
+                previous_trajectory=previous_trajectory_tensor,
+                history_weight=history_weight,
+            )
             poses = predictions["trajectory"].squeeze(0).numpy()
 
         self._previous_trajectory = poses.copy()
+        self._previous_scene_summary = current_scene_summary
         return Trajectory(poses)
         
     def compute_loss(
