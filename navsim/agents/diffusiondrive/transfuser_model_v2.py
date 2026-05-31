@@ -100,6 +100,9 @@ class V2TransfuserModel(nn.Module):
         history_weight: Optional[float]=None,
     ) -> Dict[str, torch.Tensor]:
         """Torch module forward pass."""
+        if self.training:
+            previous_trajectory = None
+            history_weight = None
 
         camera_feature: torch.Tensor = features["camera_feature"]
         lidar_feature: torch.Tensor = features["lidar_feature"]

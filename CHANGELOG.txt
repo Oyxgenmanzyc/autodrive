@@ -1,8 +1,8 @@
-修改主题：4.1 版 minimal scene-change gated time-aligned temporal compatibility 噪声调制
+修改主题：4.2 版 train-isolated minimal scene-change gated time-aligned temporal compatibility 噪声调制
 修改日期：2026-05-31
 
 修改目的：
-在第四版 scene-change gate 指标明显下降后，保守收缩场景突变门控。该版本仍基于第二版 time-aligned temporal compatibility，但移除 LiDAR front-sector 点数、front distance 和 approximate TTC 对 history_weight 的影响，只保留 route command 变化与 ego 动态突变，避免 raw LiDAR proxy 误触发导致历史调制大面积失效。
+在第四版 scene-change gate 指标明显下降、且训练日志出现 BEV semantic loss NaN 后，保守收缩场景突变门控并显式隔离训练路径。该版本仍基于第二版 time-aligned temporal compatibility，但移除 LiDAR front-sector 点数、front distance 和 approximate TTC 对 history_weight 的影响，只保留 route command 变化与 ego 动态突变，并在模型 forward 中确保训练期忽略 previous_trajectory/history_weight。
 
 涉及文件：
 navsim/agents/diffusiondrive/transfuser_agent.py
@@ -27,9 +27,10 @@ tests/test_diffusiondrive_scene_change_gate.py
 14. 暂不实现安全可行性门控，后续交互式安全评定版本再处理。
 15. 增加 scene-change gate 轻量单元测试，覆盖 history_weight 行为、route command 变化、dead zone 和 0.70 下限。
 16. 增加 scene_change_dead_zone=0.8；当 change_score 小于该阈值时 history_weight 直接保持 1.0，小变化不触发历史调制衰减。
+17. 在 V2TransfuserModel.forward() 中增加训练期保护：self.training=True 时强制 previous_trajectory=None、history_weight=None，确保 temporal inference gate 不进入训练图。
 
 预期影响：
-连续帧推理时，平稳场景下保持第二版的 time-aligned temporal compatibility 调制；只有 route command 变化或明显 ego 动态突变时才保守削弱历史轨迹引导。相比第四版，该版本应显著减少 scene-change gate 的误触发。
+连续帧推理时，平稳场景下保持第二版的 time-aligned temporal compatibility 调制；只有 route command 变化或明显 ego 动态突变时才保守削弱历史轨迹引导。相比第四版，该版本应显著减少 scene-change gate 的误触发；训练时行为应与第二版保持一致，避免 temporal gate 与 BEV semantic loss NaN 混在同一训练图中。
 
 测试/验证结果：
 已运行：
@@ -48,4 +49,4 @@ git diff --check
 结果：通过，仅提示工作区文件行尾会在 Git 操作时从 LF 转为 CRLF。
 
 与论文撰写的关系：
-该版本可作为“minimal scene-change gated time-aligned temporal compatibility guided diffusion noise modulation”的 4.1 消融版本，用于验证保守场景突变门控是否能避免第四版 raw LiDAR proxy 造成的性能下降。
+该版本可作为“train-isolated minimal scene-change gated time-aligned temporal compatibility guided diffusion noise modulation”的 4.2 消融版本，用于验证保守场景突变门控是否能避免第四版 raw LiDAR proxy 造成的性能下降，并明确区分推理期 temporal gate 与训练期 BEV semantic loss NaN 问题。
