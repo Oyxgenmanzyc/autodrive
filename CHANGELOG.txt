@@ -1,8 +1,8 @@
-修改主题：第四版 scene-change gated time-aligned temporal compatibility 噪声调制
-修改日期：2026-05-29
+修改主题：4.1 版 minimal scene-change gated time-aligned temporal compatibility 噪声调制
+修改日期：2026-05-31
 
 修改目的：
-在第二版 time-aligned temporal compatibility 噪声调制基础上，加入轻量场景突变门控。当当前场景相对上一帧变化较大时，降低上一帧预测轨迹对当前 20 个固定 anchor 初始扩散噪声的调制强度，避免历史连续性在突发场景中产生过强约束。
+在第四版 scene-change gate 指标明显下降后，保守收缩场景突变门控。该版本仍基于第二版 time-aligned temporal compatibility，但移除 LiDAR front-sector 点数、front distance 和 approximate TTC 对 history_weight 的影响，只保留 route command 变化与 ego 动态突变，避免 raw LiDAR proxy 误触发导致历史调制大面积失效。
 
 涉及文件：
 navsim/agents/diffusiondrive/transfuser_agent.py
@@ -17,18 +17,19 @@ tests/test_diffusiondrive_scene_change_gate.py
 4. temporal reference 只保留真实重叠段 previous_xy_in_current[1:]，不再外推末端点补齐到 8 个点。
 5. TrajectoryHead._temporal_noise_scale() 支持 7 点或更短的 aligned previous trajectory，并将 plan_anchor 裁剪到相同 overlap 长度。
 6. temporal compatibility cost 改为逐时间点计算 position、delta、speed、heading 四项误差，默认权重为 0.35、0.35、0.15、0.15。
-7. 新增上一帧 scene summary 缓存，记录 route command、ego speed、ego longitudinal acceleration、LiDAR front-sector min distance 和点数统计。
-8. 新增 scene-change score，覆盖 route command 变化、ego 急减速、速度快速下降、front distance 快速下降、front-sector 点数增长和近似 TTC 下降。
-9. approximate TTC 使用前后帧 front min distance 差分估计 closing speed：closing_speed=max((prev_front_distance-curr_front_distance)/dt, 0)，approx_ttc=curr_front_distance/max(closing_speed, eps)。
-10. history_weight=clip(exp(-change_score), 0.10, 1.0)，并作为可选 scalar 传入 V2TransfuserModel 和 TrajectoryHead。
+7. 新增上一帧 scene summary 缓存，仅记录 route command、ego speed 和 ego longitudinal acceleration。
+8. scene-change score 只覆盖 route command 变化、ego 速度快速下降和当前 ego 急减速。
+9. 移除第四版中的 LiDAR front-sector point count、front min distance 和 approximate TTC gate，避免 raw LiDAR 最近点或点数波动误判场景突变。
+10. history_weight=clip(exp(-change_score), 0.70, 1.0)，并作为可选 scalar 传入 V2TransfuserModel 和 TrajectoryHead。
 11. 第二版 temporal compatibility cost 不变，只在噪声映射前使用 centered_cost=centered_cost*history_weight。
 12. history_weight=1 时等价第二版；history_weight 越小，noise scale 越接近 1.0。
 13. 不新增第 21 个 anchor，不删除或屏蔽任何低兼容 anchor，不修改训练路径、decoder mode 数、loss 或分类头。
 14. 暂不实现安全可行性门控，后续交互式安全评定版本再处理。
-15. 增加 scene-change gate 轻量单元测试，覆盖 history_weight 行为、route command 变化、front distance/TTC 变化和 front-sector 点数增长。
+15. 增加 scene-change gate 轻量单元测试，覆盖 history_weight 行为、route command 变化、dead zone 和 0.70 下限。
+16. 增加 scene_change_dead_zone=0.8；当 change_score 小于该阈值时 history_weight 直接保持 1.0，小变化不触发历史调制衰减。
 
 预期影响：
-连续帧推理时，平稳场景下保持第二版的 time-aligned temporal compatibility 调制；当场景出现明显突变时，历史轨迹引导会被自动削弱，使扩散采样更接近原始多模态探索，降低历史误导风险。
+连续帧推理时，平稳场景下保持第二版的 time-aligned temporal compatibility 调制；只有 route command 变化或明显 ego 动态突变时才保守削弱历史轨迹引导。相比第四版，该版本应显著减少 scene-change gate 的误触发。
 
 测试/验证结果：
 已运行：
@@ -47,4 +48,4 @@ git diff --check
 结果：通过，仅提示工作区文件行尾会在 Git 操作时从 LF 转为 CRLF。
 
 与论文撰写的关系：
-该版本可作为“scene-change gated time-aligned temporal compatibility guided diffusion noise modulation”的第四版实验版本，用于描述在保留 BridgeAD-style step-level historical alignment 思想的基础上，通过场景突变门控动态降低历史轨迹对当前 anchor 噪声分配的影响。
+该版本可作为“minimal scene-change gated time-aligned temporal compatibility guided diffusion noise modulation”的 4.1 消融版本，用于验证保守场景突变门控是否能避免第四版 raw LiDAR proxy 造成的性能下降。

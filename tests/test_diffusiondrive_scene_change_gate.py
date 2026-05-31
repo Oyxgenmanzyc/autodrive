@@ -93,7 +93,8 @@ def _make_agent():
     from navsim.agents.diffusiondrive.transfuser_agent import TransfuserAgent
 
     agent = TransfuserAgent.__new__(TransfuserAgent)
-    agent._history_weight_min = 0.10
+    agent._history_weight_min = 0.70
+    agent._scene_change_dead_zone = 0.8
     agent._config = SimpleNamespace(
         trajectory_sampling=SimpleNamespace(interval_length=0.5),
         lidar_split_height=0.2,
@@ -110,21 +111,11 @@ def _summary(
     route=(1.0, 0.0, 0.0),
     speed=8.0,
     accel=0.0,
-    front=20.0,
-    near_count=10.0,
-    left_count=2.0,
-    right_count=2.0,
-    ttc=np.inf,
 ):
     return {
         "route_command": np.asarray(route, dtype=np.float32),
         "ego_speed": float(speed),
         "ego_lon_accel": float(accel),
-        "front_min_distance": float(front),
-        "near_front_count": float(near_count),
-        "left_front_count": float(left_count),
-        "right_front_count": float(right_count),
-        "approx_ttc": float(ttc),
     }
 
 
@@ -176,22 +167,22 @@ def test_route_command_change_lowers_history_weight():
     assert weight < 1.0
 
 
-def test_front_distance_drop_and_ttc_lowers_history_weight():
+def test_small_speed_drop_stays_in_dead_zone():
     agent = _make_agent()
-    previous = _summary(front=24.0, ttc=8.0)
-    current = _summary(front=16.0)
+    previous = _summary(speed=8.0)
+    current = _summary(speed=7.0)
 
     weight = agent._history_weight_from_scene_change(previous, current)
 
-    assert current["approx_ttc"] < previous["approx_ttc"]
-    assert weight < 1.0
+    assert weight == 1.0
 
 
-def test_front_sector_point_growth_lowers_history_weight():
+def test_strong_ego_deceleration_lowers_history_weight_but_keeps_floor():
     agent = _make_agent()
-    previous = _summary(near_count=5.0, left_count=1.0, right_count=1.0)
-    current = _summary(near_count=80.0, left_count=40.0, right_count=35.0)
+    previous = _summary(speed=10.0, accel=0.0)
+    current = _summary(speed=2.0, accel=-8.0)
 
     weight = agent._history_weight_from_scene_change(previous, current)
 
     assert weight < 1.0
+    assert weight >= 0.70
