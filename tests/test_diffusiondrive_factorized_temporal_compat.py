@@ -53,6 +53,7 @@ def _make_head():
     head.temporal_path_weight = 0.45
     head.temporal_velocity_weight = 0.35
     head.temporal_goal_weight = 0.20
+    head.temporal_executed_weight = 0.30
     return head
 
 
@@ -130,3 +131,39 @@ def test_matching_anchor_gets_lower_noise_than_mismatched_anchor():
     noise_scale = head._temporal_noise_scale(plan_anchor, previous)
 
     assert noise_scale[0, 0, 0, 0] < noise_scale[0, 1, 0, 0]
+
+
+def test_near_horizon_reference_ignores_far_anchor_points():
+    head = _make_head()
+    previous = _straight_x(steps=4).unsqueeze(0)
+    plan_anchor = torch.zeros(1, 20, 8, 2)
+    plan_anchor[:, 0, :4] = previous
+    plan_anchor[:, 0, 4:] = _straight_y(steps=4) + torch.tensor([10.0, 0.0])
+    plan_anchor[:, 1, :4] = _straight_y(steps=4)
+
+    path_cost, velocity_cost, goal_cost = head._temporal_compatibility_components(plan_anchor, previous)
+
+    assert path_cost[0, 0] < path_cost[0, 1]
+    assert velocity_cost[0, 0] <= velocity_cost[0, 1]
+    assert goal_cost[0, 0] < goal_cost[0, 1]
+
+
+def test_executed_delta_keeps_path_and_velocity_factorized():
+    head = _make_head()
+    executed_delta = torch.tensor([[1.0, 0.0]])
+    plan_anchor = torch.zeros(1, 20, 8, 2)
+    plan_anchor[:, 0, 0] = torch.tensor([1.0, 0.0])
+    plan_anchor[:, 1, 0] = torch.tensor([2.0, 0.0])
+    plan_anchor[:, 2, 0] = torch.tensor([0.0, 1.0])
+
+    path_cost, velocity_cost, goal_cost = head._temporal_compatibility_components(
+        plan_anchor,
+        previous_trajectory=None,
+        previous_ego_delta=executed_delta,
+    )
+
+    assert path_cost[0, 1] == path_cost[0, 0]
+    assert velocity_cost[0, 1] > velocity_cost[0, 0]
+    assert path_cost[0, 2] > path_cost[0, 0]
+    assert velocity_cost[0, 2] == velocity_cost[0, 0]
+    assert torch.all(goal_cost == 0)

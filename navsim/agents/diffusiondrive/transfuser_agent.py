@@ -110,9 +110,15 @@ class TransfuserAgent(AbstractAgent):
         features: Dict[str, torch.Tensor],
         targets: Dict[str, torch.Tensor]=None,
         previous_trajectory: Optional[torch.Tensor]=None,
+        previous_ego_delta: Optional[torch.Tensor]=None,
     ) -> Dict[str, torch.Tensor]:
         """Inherited, see superclass."""
-        return self._transfuser_model(features, targets=targets, previous_trajectory=previous_trajectory)
+        return self._transfuser_model(
+            features,
+            targets=targets,
+            previous_trajectory=previous_trajectory,
+            previous_ego_delta=previous_ego_delta,
+        )
 
     def reset_temporal_context(self) -> None:
         """Clears cached inference trajectory before starting an unrelated scene."""
@@ -134,11 +140,16 @@ class TransfuserAgent(AbstractAgent):
         if np.linalg.norm(previous_xy_in_current[0]) > self._temporal_reset_distance:
             return None
 
-        last_delta = previous_xy_in_current[-1] - previous_xy_in_current[-2]
-        extrapolated_xy = previous_xy_in_current[-1] + last_delta
-        shifted_xy = np.concatenate([previous_xy_in_current[1:], extrapolated_xy[None]], axis=0)
-        shifted_xy = shifted_xy - previous_xy_in_current[0]
-        return shifted_xy.astype(np.float32)
+        near_horizon_points = 4
+        temporal_reference = previous_xy_in_current[1:1 + near_horizon_points]
+        return temporal_reference.astype(np.float32)
+
+    def _build_previous_ego_delta(self, agent_input: AgentInput) -> Optional[np.ndarray]:
+        if len(agent_input.ego_statuses) < 2:
+            return None
+
+        previous_ego_pose = agent_input.ego_statuses[-2].ego_pose
+        return (-previous_ego_pose[:2]).astype(np.float32)
 
     def compute_trajectory(self, agent_input: AgentInput) -> Trajectory:
         """
@@ -154,9 +165,17 @@ class TransfuserAgent(AbstractAgent):
         previous_trajectory_tensor = None
         if previous_trajectory is not None:
             previous_trajectory_tensor = torch.tensor(previous_trajectory).unsqueeze(0)
+        previous_ego_delta = self._build_previous_ego_delta(agent_input)
+        previous_ego_delta_tensor = None
+        if previous_ego_delta is not None:
+            previous_ego_delta_tensor = torch.tensor(previous_ego_delta).unsqueeze(0)
 
         with torch.no_grad():
-            predictions = self.forward(features, previous_trajectory=previous_trajectory_tensor)
+            predictions = self.forward(
+                features,
+                previous_trajectory=previous_trajectory_tensor,
+                previous_ego_delta=previous_ego_delta_tensor,
+            )
             poses = predictions["trajectory"].squeeze(0).numpy()
 
         self._previous_trajectory = poses.copy()
