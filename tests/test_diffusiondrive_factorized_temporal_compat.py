@@ -47,13 +47,18 @@ def _load_trajectory_head():
 def _make_head():
     TrajectoryHead = _load_trajectory_head()
     head = TrajectoryHead.__new__(TrajectoryHead)
-    head.temporal_noise_strength = 0.2
-    head.temporal_noise_min_scale = 0.85
-    head.temporal_noise_max_scale = 1.25
+    head.temporal_noise_min_scale = 0.90
+    head.temporal_noise_max_scale = 1.20
     head.temporal_start_weight = 0.25
     head.temporal_path_weight = 0.40
     head.temporal_velocity_weight = 0.35
     head.temporal_reversal_threshold = 0.5
+    head.temporal_spread_tau = 0.30
+    head.temporal_mean_ref = 0.80
+    head.temporal_mean_tau = 0.25
+    head.temporal_z_tau = 1.0
+    head.temporal_good_eta = 0.08
+    head.temporal_bad_eta = 0.15
     return head
 
 
@@ -141,15 +146,12 @@ def test_reference_path_affects_near_horizon_without_overriding_start_connection
 
 def test_matching_anchor_gets_lower_noise_than_mismatched_anchor():
     head = _make_head()
-    previous = _straight_x(steps=3).unsqueeze(0)
-    executed_delta = torch.tensor([[1.0, 0.0]])
-    plan_anchor = torch.zeros(1, 20, 8, 2)
-    plan_anchor[:, 0, :3] = previous
-    plan_anchor[:, 1, :3] = _straight_y(scale=2.0, steps=3)
+    temporal_cost = torch.linspace(0.1, 1.0, 20).unsqueeze(0)
 
-    noise_scale = head._temporal_noise_scale(plan_anchor, previous, executed_delta)
+    noise_scale = head._distribution_aware_noise_scale(temporal_cost)
 
-    assert noise_scale[0, 0, 0, 0] < noise_scale[0, 1, 0, 0]
+    assert noise_scale[0, 0, 0, 0] < 1.0
+    assert noise_scale[0, -1, 0, 0] > 1.0
 
 
 def test_near_horizon_reference_ignores_far_anchor_points():
@@ -198,3 +200,45 @@ def test_low_speed_turn_segments_do_not_create_false_turn_cost():
     reference_delta = torch.tensor([[[[0.0, 0.0], [0.0, 0.0], [0.0, 1.0]]]])
 
     assert torch.all(head._turn_cost(anchor_delta, reference_delta) == 0)
+
+
+def test_distribution_aware_noise_stays_near_one_for_low_spread_costs():
+    head = _make_head()
+    temporal_cost = torch.ones(1, 20) * 0.5
+
+    noise_scale = head._distribution_aware_noise_scale(temporal_cost)
+
+    assert torch.allclose(noise_scale, torch.ones_like(noise_scale))
+
+
+def test_high_mean_cost_reduces_distribution_modulation_strength():
+    head = _make_head()
+    low_mean_cost = torch.linspace(0.1, 1.0, 20).unsqueeze(0)
+    high_mean_cost = low_mean_cost + 1.0
+
+    low_mean_scale = head._distribution_aware_noise_scale(low_mean_cost)
+    high_mean_scale = head._distribution_aware_noise_scale(high_mean_cost)
+
+    assert (low_mean_scale - 1.0).abs().max() > (high_mean_scale - 1.0).abs().max()
+
+
+def test_single_extreme_anchor_does_not_dominate_robust_distribution_gate():
+    head = _make_head()
+    temporal_cost = torch.ones(1, 20) * 0.5
+    temporal_cost[0, -1] = 4.0
+
+    noise_scale = head._distribution_aware_noise_scale(temporal_cost)
+
+    assert torch.allclose(noise_scale, torch.ones_like(noise_scale))
+
+
+def test_distribution_aware_noise_scale_clamps_to_conservative_range():
+    head = _make_head()
+    head.temporal_good_eta = 10.0
+    head.temporal_bad_eta = 10.0
+    temporal_cost = torch.linspace(0.1, 1.0, 20).unsqueeze(0)
+
+    noise_scale = head._distribution_aware_noise_scale(temporal_cost)
+
+    assert noise_scale.min() >= 0.90
+    assert noise_scale.max() <= 1.20

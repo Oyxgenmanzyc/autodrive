@@ -412,13 +412,18 @@ class TrajectoryHead(nn.Module):
         self._d_ffn = d_ffn
         self.diff_loss_weight = 2.0
         self.ego_fut_mode = 20
-        self.temporal_noise_strength = 0.2
-        self.temporal_noise_min_scale = 0.85
-        self.temporal_noise_max_scale = 1.25
+        self.temporal_noise_min_scale = 0.90
+        self.temporal_noise_max_scale = 1.20
         self.temporal_start_weight = 0.25
         self.temporal_path_weight = 0.40
         self.temporal_velocity_weight = 0.35
         self.temporal_reversal_threshold = 0.5
+        self.temporal_spread_tau = 0.30
+        self.temporal_mean_ref = 0.80
+        self.temporal_mean_tau = 0.25
+        self.temporal_z_tau = 1.0
+        self.temporal_good_eta = 0.08
+        self.temporal_bad_eta = 0.15
 
         self.diffusion_scheduler = DDIMScheduler(
             num_train_timesteps=1000,
@@ -626,8 +631,24 @@ class TrajectoryHead(nn.Module):
         if temporal_cost is None:
             return None
 
-        centered_cost = temporal_cost - temporal_cost.mean(dim=1, keepdim=True)
-        noise_scale = 1.0 + self.temporal_noise_strength * torch.tanh(centered_cost)
+        return self._distribution_aware_noise_scale(temporal_cost)
+
+    def _distribution_aware_noise_scale(self, temporal_cost):
+        eps = 1e-6
+        cost_mean = temporal_cost.mean(dim=1, keepdim=True)
+        cost_median = temporal_cost.median(dim=1, keepdim=True).values
+        cost_mad = (temporal_cost - cost_median).abs().median(dim=1, keepdim=True).values
+        relative_spread = cost_mad / (cost_median.abs() + eps)
+
+        spread_gate = torch.tanh(relative_spread / self.temporal_spread_tau)
+        mean_gate = torch.sigmoid((self.temporal_mean_ref - cost_mean) / self.temporal_mean_tau)
+        modulation_gate = spread_gate * mean_gate
+
+        normalized_cost = (temporal_cost - cost_median) / (cost_mad + eps)
+        modulation = torch.tanh(normalized_cost / self.temporal_z_tau)
+        lower_noise = 1.0 - modulation_gate * self.temporal_good_eta * modulation.abs()
+        higher_noise = 1.0 + modulation_gate * self.temporal_bad_eta * modulation
+        noise_scale = torch.where(modulation < 0, lower_noise, higher_noise)
         noise_scale = noise_scale.clamp(self.temporal_noise_min_scale, self.temporal_noise_max_scale)
         return noise_scale[:, :, None, None]
 

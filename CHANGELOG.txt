@@ -126,3 +126,35 @@ D:\python\venv\Scripts\python.exe 手动 test runner
 
 3.2 本地验证策略修正：
 用户明确要求：本地电脑不运行测试、手动 runner 或冒烟验证；冒烟测试与完整验证均在服务器环境执行。后续 Autodrive Experiment Workflow 已同步更新为默认不进行本地验证，除非用户明确要求。此前本地静态命令输出仅作为已发生事实保留，不作为后续流程要求。
+
+修改主题：4.1 Distribution-aware adaptive noise allocation
+修改日期：2026-06-01
+
+修改目的：
+在 3.2 Near-horizon Tri-factor Temporal Compatibility 的 start/path/velocity 三因子 cost 基础上，只修改 cost 到 noise scale 的映射方式。该版本不再使用固定 mean-centered tanh 调制，而是利用当前帧 20 个固定 anchor 的 temporal compatibility cost 分布进行自适应噪声分配，避免依赖人工场景库或硬阈值。
+
+涉及文件：
+navsim/agents/diffusiondrive/transfuser_model_v2.py
+tests/test_diffusiondrive_factorized_temporal_compat.py
+
+核心改动：
+1. 保留 3.2 的 start/path/velocity 三因子 temporal compatibility 定义，不修改训练路径、decoder mode、loss 或分类头。
+2. 新增 distribution-aware 参数：temporal_spread_tau=0.30、temporal_mean_ref=0.80、temporal_mean_tau=0.25、temporal_z_tau=1.0、temporal_good_eta=0.08、temporal_bad_eta=0.15。
+3. 将 noise scale 范围调整为更保守的 [0.90, 1.20]。
+4. _temporal_compatibility_cost() 仍返回每个 batch 下 20 个 anchor 的 temporal cost。
+5. 新增 _distribution_aware_noise_scale()：基于 mean、median、MAD 和 relative_spread 计算当前帧的噪声调制强度。
+6. 使用 g_var=tanh(relative_spread / tau_var) 判断当前帧 anchor 间是否存在足够差异，使用 g_mean=sigmoid((mu_ref - mean) / tau_mean) 判断整体历史是否可信。
+7. 使用 z=(cost - median)/(MAD + eps) 和 tanh(z/tau_z) 将相对适配性映射到 noise scale。
+8. cost 低于 median 的高兼容 anchor 轻微降低噪声，cost 高于 median 的低兼容 anchor 增加噪声。
+9. 单个极端 anchor 不应主导整体调制强度，median/MAD 逻辑用于提高 20 anchor 小样本分布下的稳健性。
+10. 不引入 scene library、route/speed/accel scene gate 或旧 4.2 的 history_weight；该版本等价于 h_scene=1。
+11. 不新增第 21 个 anchor，不删除或屏蔽任何低兼容 anchor。
+
+预期影响：
+该版本把 4.1 重新定义为分布感知的自适应噪声分配策略。相比 3.2 固定中心化映射，它能根据当前帧 20 个 anchor 的 cost 分布自适应决定是否值得差异化分配噪声，并在整体 cost 偏高时削弱历史调制强度，避免历史参考不可靠时过度拉开 anchor 噪声。
+
+测试/验证结果：
+本地不运行测试、手动 runner 或冒烟验证。冒烟测试与完整验证在服务器环境执行。
+
+与论文撰写的关系：
+该版本可表述为 distribution-aware adaptive noise allocation。其核心贡献是：在缺少显式场景统计先验的情况下，不使用固定阈值判断适配性差异，而是利用当前帧 20 个固定 anchor 的 compatibility cost 分布进行自适应校准，通过整体均值判断历史参考可信度，通过相对离散度判断 anchor 间是否存在足够差异，并用非线性映射将相对适配性转化为保守的初始扩散噪声倍率。
