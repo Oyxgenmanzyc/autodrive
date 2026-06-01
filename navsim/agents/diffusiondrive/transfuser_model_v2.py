@@ -415,10 +415,10 @@ class TrajectoryHead(nn.Module):
         self.temporal_noise_strength = 0.2
         self.temporal_noise_min_scale = 0.85
         self.temporal_noise_max_scale = 1.25
-        self.temporal_path_weight = 0.45
+        self.temporal_start_weight = 0.25
+        self.temporal_path_weight = 0.40
         self.temporal_velocity_weight = 0.35
-        self.temporal_goal_weight = 0.20
-        self.temporal_executed_weight = 0.30
+        self.temporal_reversal_threshold = 0.5
 
         self.diffusion_scheduler = DDIMScheduler(
             num_train_timesteps=1000,
@@ -482,11 +482,66 @@ class TrajectoryHead(nn.Module):
             torch.cos(anchor_angle - previous_angle),
         ).abs() / np.pi
 
+    def _cosine_direction_cost(self, anchor_delta, reference_delta):
+        eps = 1e-6
+        anchor_speed = torch.linalg.norm(anchor_delta, dim=-1)
+        reference_speed = torch.linalg.norm(reference_delta, dim=-1)
+        cosine = (anchor_delta * reference_delta).sum(dim=-1) / (anchor_speed * reference_speed + eps)
+        direction_cost = 0.5 * (1.0 - cosine.clamp(-1.0, 1.0))
+        return torch.where(
+            (anchor_speed > eps) & (reference_speed > eps),
+            direction_cost,
+            torch.zeros_like(direction_cost),
+        )
+
+    def _turn_cost(self, anchor_delta, reference_delta):
+        eps = 1e-6
+        anchor_speed = torch.linalg.norm(anchor_delta, dim=-1)
+        reference_speed = torch.linalg.norm(reference_delta, dim=-1)
+        if anchor_delta.shape[-2] < 2:
+            return torch.zeros_like(anchor_speed[..., 0])
+
+        anchor_heading = torch.atan2(anchor_delta[..., 1], anchor_delta[..., 0])
+        reference_heading = torch.atan2(reference_delta[..., 1], reference_delta[..., 0])
+        anchor_turn = torch.atan2(
+            torch.sin(anchor_heading[..., 1:] - anchor_heading[..., :-1]),
+            torch.cos(anchor_heading[..., 1:] - anchor_heading[..., :-1]),
+        )
+        reference_turn = torch.atan2(
+            torch.sin(reference_heading[..., 1:] - reference_heading[..., :-1]),
+            torch.cos(reference_heading[..., 1:] - reference_heading[..., :-1]),
+        )
+        turn_error = self._angle_error(anchor_turn, reference_turn)
+        turn_valid = (
+            (anchor_speed[..., 1:] > eps)
+            & (anchor_speed[..., :-1] > eps)
+            & (reference_speed[..., 1:] > eps)
+            & (reference_speed[..., :-1] > eps)
+        )
+        turn_error = torch.where(turn_valid, turn_error, torch.zeros_like(turn_error))
+        return turn_error.mean(dim=-1)
+
+    def _reversal_cost(self, anchor_speed):
+        if anchor_speed.shape[-1] < 3:
+            return torch.zeros_like(anchor_speed[..., 0])
+
+        accel = anchor_speed[..., 1:] - anchor_speed[..., :-1]
+        accel_then_brake = (accel[..., :-1] > self.temporal_reversal_threshold) & (
+            accel[..., 1:] < -self.temporal_reversal_threshold
+        )
+        brake_then_accel = (accel[..., :-1] < -self.temporal_reversal_threshold) & (
+            accel[..., 1:] > self.temporal_reversal_threshold
+        )
+        reversal = accel_then_brake.to(anchor_speed.dtype) + 0.5 * brake_then_accel.to(anchor_speed.dtype)
+        return reversal.mean(dim=-1)
+
     def _temporal_compatibility_components(self, plan_anchor, previous_trajectory, previous_ego_delta=None):
+        start_cost = None
         path_cost = None
         velocity_cost = None
-        goal_cost = None
         eps = 1e-6
+        start_direction_cost = None
+        start_speed_cost = None
 
         if previous_trajectory is not None:
             previous_trajectory = previous_trajectory.to(device=plan_anchor.device, dtype=plan_anchor.dtype)
@@ -504,41 +559,21 @@ class TrajectoryHead(nn.Module):
                 anchor_speed = torch.linalg.norm(anchor_delta, dim=-1)
                 previous_speed = torch.linalg.norm(previous_delta, dim=-1)
 
-                anchor_heading = torch.atan2(anchor_delta[..., 1], anchor_delta[..., 0])
-                previous_heading = torch.atan2(previous_delta[..., 1], previous_delta[..., 0])
-                heading_error = self._angle_error(anchor_heading, previous_heading)
-                heading_error = torch.where((anchor_speed > eps) & (previous_speed > eps), heading_error, torch.zeros_like(heading_error))
+                direction_cost = self._cosine_direction_cost(anchor_delta, previous_delta).mean(dim=-1)
+                turn_cost = self._turn_cost(anchor_delta, previous_delta)
+                path_ref_cost = 0.3 * direction_cost + 0.7 * turn_cost
 
-                path_heading_cost = heading_error.mean(dim=-1)
-                if overlap_len > 1:
-                    anchor_turn = torch.atan2(
-                        torch.sin(anchor_heading[..., 1:] - anchor_heading[..., :-1]),
-                        torch.cos(anchor_heading[..., 1:] - anchor_heading[..., :-1]),
-                    )
-                    previous_turn = torch.atan2(
-                        torch.sin(previous_heading[..., 1:] - previous_heading[..., :-1]),
-                        torch.cos(previous_heading[..., 1:] - previous_heading[..., :-1]),
-                    )
-                    turn_error = self._angle_error(anchor_turn, previous_turn)
-                    turn_cost = turn_error.mean(dim=-1)
-                else:
-                    turn_cost = torch.zeros_like(path_heading_cost)
-                path_cost = 0.7 * path_heading_cost + 0.3 * turn_cost
-
-                speed_error = torch.abs(anchor_speed - previous_speed) / (previous_speed + 1.0)
-                speed_cost = speed_error.clamp(max=2.0).mean(dim=-1)
                 if overlap_len > 1:
                     anchor_speed_delta = anchor_speed[..., 1:] - anchor_speed[..., :-1]
                     previous_speed_delta = previous_speed[..., 1:] - previous_speed[..., :-1]
                     speed_delta_error = torch.abs(anchor_speed_delta - previous_speed_delta) / (previous_speed_delta.abs() + 1.0)
-                    speed_delta_cost = speed_delta_error.clamp(max=2.0).mean(dim=-1)
+                    accel_cost = speed_delta_error.clamp(max=2.0).mean(dim=-1)
                 else:
-                    speed_delta_cost = torch.zeros_like(speed_cost)
-                velocity_cost = 0.7 * speed_cost + 0.3 * speed_delta_cost
-
-                goal_position_error = torch.linalg.norm(anchor_xy[..., -1, :] - previous_xy.unsqueeze(1)[..., -1, :], dim=-1) / 5.0
-                goal_heading_error = heading_error[..., -1]
-                goal_cost = 0.7 * goal_position_error.clamp(max=2.0) + 0.3 * goal_heading_error
+                    accel_cost = torch.zeros_like(anchor_speed[..., 0])
+                reversal_cost = self._reversal_cost(anchor_speed)
+                velocity_ref_cost = 0.40 * accel_cost + 0.25 * reversal_cost
+                path_cost = path_ref_cost
+                velocity_cost = velocity_ref_cost
 
         if previous_ego_delta is not None:
             previous_ego_delta = previous_ego_delta.to(device=plan_anchor.device, dtype=plan_anchor.dtype)
@@ -550,45 +585,40 @@ class TrajectoryHead(nn.Module):
                 anchor_start_delta = plan_anchor[..., 0, :2]
                 anchor_start_speed = torch.linalg.norm(anchor_start_delta, dim=-1)
                 executed_speed = torch.linalg.norm(executed_delta, dim=-1)
-                anchor_start_heading = torch.atan2(anchor_start_delta[..., 1], anchor_start_delta[..., 0])
-                executed_heading = torch.atan2(executed_delta[..., 1], executed_delta[..., 0])
-
-                executed_path_cost = self._angle_error(anchor_start_heading, executed_heading)
-                executed_path_cost = torch.where(
-                    (anchor_start_speed > eps) & (executed_speed > eps),
-                    executed_path_cost,
-                    torch.zeros_like(executed_path_cost),
-                )
-                executed_velocity_cost = torch.abs(anchor_start_speed - executed_speed) / (executed_speed + 1.0)
-                executed_velocity_cost = executed_velocity_cost.clamp(max=2.0)
-
+                start_direction_cost = self._cosine_direction_cost(anchor_start_delta, executed_delta)
+                start_speed_cost = torch.abs(anchor_start_speed - executed_speed) / (executed_speed + 1.0)
+                start_speed_cost = start_speed_cost.clamp(max=2.0)
+                start_cost = 0.6 * start_direction_cost + 0.4 * start_speed_cost
                 if path_cost is None:
-                    path_cost = executed_path_cost
-                    velocity_cost = executed_velocity_cost
-                    goal_cost = torch.zeros_like(path_cost)
+                    path_cost = start_direction_cost
                 else:
-                    reference_weight = 1.0 - self.temporal_executed_weight
-                    path_cost = reference_weight * path_cost + self.temporal_executed_weight * executed_path_cost
-                    velocity_cost = reference_weight * velocity_cost + self.temporal_executed_weight * executed_velocity_cost
+                    path_cost = 0.6 * start_direction_cost + 0.4 * path_cost
+                if velocity_cost is None:
+                    velocity_cost = start_speed_cost
+                else:
+                    velocity_cost = 0.35 * start_speed_cost + velocity_cost
 
-        if path_cost is None:
+        if start_cost is None and path_cost is not None:
+            start_cost = torch.zeros_like(path_cost)
+
+        if start_cost is None or path_cost is None or velocity_cost is None:
             return None, None, None
 
-        return path_cost, velocity_cost, goal_cost
+        return start_cost, path_cost, velocity_cost
 
     def _temporal_compatibility_cost(self, plan_anchor, previous_trajectory, previous_ego_delta=None):
-        path_cost, velocity_cost, goal_cost = self._temporal_compatibility_components(
+        start_cost, path_cost, velocity_cost = self._temporal_compatibility_components(
             plan_anchor,
             previous_trajectory,
             previous_ego_delta,
         )
-        if path_cost is None:
+        if start_cost is None:
             return None
 
         return (
-            self.temporal_path_weight * path_cost.clamp(max=2.0)
+            self.temporal_start_weight * start_cost.clamp(max=2.0)
+            + self.temporal_path_weight * path_cost.clamp(max=2.0)
             + self.temporal_velocity_weight * velocity_cost.clamp(max=2.0)
-            + self.temporal_goal_weight * goal_cost.clamp(max=2.0)
         )
 
     def _temporal_noise_scale(self, plan_anchor, previous_trajectory, previous_ego_delta=None):

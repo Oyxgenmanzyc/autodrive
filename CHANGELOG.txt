@@ -76,3 +76,53 @@ git diff --check
 
 与论文撰写的关系：
 该版本可描述为 near-horizon factorized temporal compatibility：历史约束只作用在真实刚执行运动和短期预测 overlap 上，避免长期目标被历史预测过度绑定；同时通过 path/velocity 解耦展示第三版创新点，即路径意图连续性和速度节奏连续性可以分别影响 diffusion noise modulation。
+
+修改主题：3.2 Near-horizon Tri-factor Temporal Compatibility
+修改日期：2026-06-01
+
+修改目的：
+在 3.1 near-horizon temporal compatibility 基础上，将时间兼容性进一步明确为 start、path、velocity 三因子。真实过去 0.5s ego motion 是当前 anchor 起步连接的主参考，上一帧预测 p2-p4 仅作为近端预测趋势辅助，不再让远端预测或终点位置约束当前帧。
+
+涉及文件：
+navsim/agents/diffusiondrive/transfuser_agent.py
+navsim/agents/diffusiondrive/transfuser_model_v2.py
+tests/test_diffusiondrive_factorized_temporal_compat.py
+
+核心改动：
+1. _build_temporal_reference() 只返回上一帧预测变换到当前 ego 坐标系后的 p2、p3、p4，对齐当前帧 q1、q2、q3。
+2. 保留 _build_previous_ego_delta()，将真实过去 0.5s ego 位移作为 3.2 起步连接的核心输入。
+3. 删除 goal_cost、goal_position_error 和 goal_heading_error，不再比较当前 anchor 与上一帧预测的终点绝对位置。
+4. _temporal_compatibility_components() 返回 start_cost、path_cost、velocity_cost。
+5. start_cost 比较 executed_delta 与 anchor_start_delta = q1 - q0，按 direction=0.6、speed=0.4 加权。
+6. path_cost 强调真实运动到 q1 的连接，同时用 p2-p4 辅助近端路径趋势，按 connect=0.6、reference=0.4 加权。
+7. path reference 使用 direction=0.3、turn=0.7，direction 使用余弦距离，turn 使用低速有效性 mask，避免停车或近零速段产生伪转向误差。
+8. velocity_cost 使用 speed_connect、accel、reversal 三项；speed_connect 来自真实 0.5s 运动与 q1 的速度连接，accel 来自近端速度节奏，reversal 惩罚短时间加速-急刹反复。
+9. reversal 中加速后急刹惩罚权重为 1.0，急刹后恢复加速惩罚权重为 0.5，初始阈值为 0.5。
+10. temporal 总 cost 使用 start=0.25、path=0.40、velocity=0.35。
+11. 噪声调制范围保持 0.85 到 1.25；不新增 anchor，不删除或屏蔽低兼容 anchor，不修改训练路径、decoder mode、loss 或分类头。
+
+预期影响：
+该版本更强调真实历史运动与当前 anchor 起步动作的直接连接，避免用上一帧预测 p2 代替真实 ego motion。p2-p4 只提供近端趋势参考，p5-p8 和终点绝对位置不再影响兼容性判断。相比 3.1，3.2 更清楚地区分起步连接、路径几何连续和速度节奏连续。
+
+测试/验证结果：
+待运行：
+python -m py_compile navsim\agents\diffusiondrive\transfuser_agent.py navsim\agents\diffusiondrive\transfuser_model_v2.py tests\test_diffusiondrive_factorized_temporal_compat.py
+git diff --check
+
+与论文撰写的关系：
+该版本可表述为 Near-horizon Tri-factor Temporal Compatibility。其核心贡献是将历史时间兼容性拆成 start、path、velocity 三个近端因子：start 约束真实 0.5s 历史运动与当前起步动作的衔接，path 约束近端几何趋势，velocity 约束速度节奏和短期加减速反复；该设计避免了远端目标位置贴合，也避免了将上一帧预测轨迹当作新的驾驶模态 anchor。
+
+3.2 验证补充：
+已运行：
+python -m py_compile navsim\agents\diffusiondrive\transfuser_agent.py navsim\agents\diffusiondrive\transfuser_model_v2.py tests\test_diffusiondrive_factorized_temporal_compat.py
+结果：通过。
+
+git diff --check
+结果：通过，仅提示工作区文件行尾会在 Git 操作时从 LF 转为 CRLF。
+
+未运行：
+D:\python\venv\Scripts\python.exe 手动 test runner
+原因：用户本轮拒绝执行测试命令，本次仅完成静态验证。
+
+3.2 本地验证策略修正：
+用户明确要求：本地电脑不运行测试、手动 runner 或冒烟验证；冒烟测试与完整验证均在服务器环境执行。后续 Autodrive Experiment Workflow 已同步更新为默认不进行本地验证，除非用户明确要求。此前本地静态命令输出仅作为已发生事实保留，不作为后续流程要求。

@@ -140,7 +140,7 @@ class TransfuserAgent(AbstractAgent):
         if np.linalg.norm(previous_xy_in_current[0]) > self._temporal_reset_distance:
             return None
 
-        near_horizon_points = 4
+        near_horizon_points = 3
         temporal_reference = previous_xy_in_current[1:1 + near_horizon_points]
         return temporal_reference.astype(np.float32)
 
