@@ -634,12 +634,12 @@ class TrajectoryHead(nn.Module):
     def forward(self, ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None,previous_trajectory=None,previous_ego_delta=None) -> Dict[str, torch.Tensor]:
         """Torch module forward pass."""
         if self.training:
-            return self.forward_train(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,targets,global_img)
+            return self.forward_train(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,targets,global_img,previous_trajectory,previous_ego_delta)
         else:
             return self.forward_test(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,global_img,previous_trajectory,previous_ego_delta)
 
 
-    def forward_train(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None) -> Dict[str, torch.Tensor]:
+    def forward_train(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None,previous_trajectory=None,previous_ego_delta=None) -> Dict[str, torch.Tensor]:
         bs = ego_query.shape[0]
         device = ego_query.device
         # 1. add truncated noise to the plan anchor
@@ -650,6 +650,20 @@ class TrajectoryHead(nn.Module):
             (bs,), device=device
         )
         noise = torch.randn(odo_info_fut.shape, device=device)
+        temporal_noise_scale = self._temporal_noise_scale(plan_anchor, previous_trajectory, previous_ego_delta)
+        temporal_metrics = {}
+        if temporal_noise_scale is not None:
+            noise = noise * temporal_noise_scale
+            start_cost, path_cost, velocity_cost = self._temporal_compatibility_components(
+                plan_anchor,
+                previous_trajectory,
+                previous_ego_delta,
+            )
+            temporal_metrics = {
+                "temporal_start_cost": start_cost.mean().detach(),
+                "temporal_path_cost": path_cost.mean().detach(),
+                "temporal_velocity_cost": velocity_cost.mean().detach(),
+            }
         noisy_traj_points = self.diffusion_scheduler.add_noise(
             original_samples=odo_info_fut,
             noise=noise,
@@ -682,7 +696,9 @@ class TrajectoryHead(nn.Module):
         mode_idx = poses_cls_list[-1].argmax(dim=-1)
         mode_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
         best_reg = torch.gather(poses_reg_list[-1], 1, mode_idx).squeeze(1)
-        return {"trajectory": best_reg,"trajectory_loss":ret_traj_loss,"trajectory_loss_dict":trajectory_loss_dict}
+        output = {"trajectory": best_reg,"trajectory_loss":ret_traj_loss,"trajectory_loss_dict":trajectory_loss_dict}
+        output.update(temporal_metrics)
+        return output
 
     def forward_test(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding,global_img,previous_trajectory=None,previous_ego_delta=None) -> Dict[str, torch.Tensor]:
         step_num = 2

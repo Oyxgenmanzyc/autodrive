@@ -1,14 +1,18 @@
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 import logging
 import pickle
 import gzip
 import os
+import hashlib
 
+import numpy as np
 import torch
 from tqdm import tqdm
+from pyquaternion import Quaternion
 
 from navsim.common.dataloader import SceneLoader
+from navsim.common.dataclasses import SceneFilter
 from navsim.planning.training.abstract_feature_target_builder import AbstractFeatureBuilder, AbstractTargetBuilder
 
 logger = logging.getLogger(__name__)
@@ -130,6 +134,208 @@ class CacheOnlyDataset(torch.utils.data.Dataset):
             targets.update(data_dict)
 
         return (features, targets)
+
+
+def _yaw_from_scene_frame(scene_frame: Dict[str, Any]) -> float:
+    """Extracts ego yaw from a raw NAVSIM scene frame."""
+    ego_quaternion = Quaternion(*scene_frame["ego2global_rotation"])
+    return ego_quaternion.yaw_pitch_roll[0]
+
+
+def _previous_ego_delta_in_current_frame(previous_frame: Dict[str, Any], current_frame: Dict[str, Any]) -> np.ndarray:
+    """Returns previous ego -> current ego displacement in the current ego frame."""
+    previous_pose = _previous_ego_pose_in_current_frame(previous_frame, current_frame)
+    return (-previous_pose[:2]).astype(np.float32)
+
+
+def _previous_ego_pose_in_current_frame(previous_frame: Dict[str, Any], current_frame: Dict[str, Any]) -> np.ndarray:
+    """Returns previous ego pose as (x, y, heading) in the current ego frame."""
+    previous_translation = np.asarray(previous_frame["ego2global_translation"][:2], dtype=np.float32)
+    current_translation = np.asarray(current_frame["ego2global_translation"][:2], dtype=np.float32)
+    previous_yaw = _yaw_from_scene_frame(previous_frame)
+    current_yaw = _yaw_from_scene_frame(current_frame)
+    cos_h = np.cos(current_yaw)
+    sin_h = np.sin(current_yaw)
+    world_to_current = np.array([[cos_h, sin_h], [-sin_h, cos_h]], dtype=np.float32)
+    previous_xy_in_current = world_to_current @ (previous_translation - current_translation)
+    previous_heading_in_current = np.arctan2(
+        np.sin(previous_yaw - current_yaw),
+        np.cos(previous_yaw - current_yaw),
+    )
+    return np.array(
+        [previous_xy_in_current[0], previous_xy_in_current[1], previous_heading_in_current],
+        dtype=np.float32,
+    )
+
+
+class TemporalPairCacheOnlyDataset(torch.utils.data.Dataset):
+    """Dataset wrapper that returns adjacent cached samples as prev -> current pairs."""
+
+    def __init__(
+        self,
+        cache_path: str,
+        data_path: str,
+        scene_filter: SceneFilter,
+        feature_builders: List[AbstractFeatureBuilder],
+        target_builders: List[AbstractTargetBuilder],
+        log_names: Optional[List[str]] = None,
+        pair_index_cache_path: Optional[str] = None,
+        split_name: str = "train",
+    ):
+        super().__init__()
+        self._base_dataset = CacheOnlyDataset(
+            cache_path=cache_path,
+            feature_builders=feature_builders,
+            target_builders=target_builders,
+            log_names=log_names,
+        )
+        self._cache_path = Path(cache_path)
+        self._data_path = Path(data_path)
+        self._scene_filter = scene_filter
+        self._pair_index_cache_path = Path(pair_index_cache_path) if pair_index_cache_path else None
+        self._split_name = split_name
+        self._pairs = self._load_or_build_pair_index(log_names=log_names)
+
+    def __len__(self) -> int:
+        return len(self._pairs)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        pair = self._pairs[idx]
+        prev_features, prev_targets = self._base_dataset._load_scene_with_token(pair["prev_token"])
+        curr_features, curr_targets = self._base_dataset._load_scene_with_token(pair["curr_token"])
+        return {
+            "prev_features": prev_features,
+            "prev_targets": prev_targets,
+            "curr_features": curr_features,
+            "curr_targets": curr_targets,
+            "pair_metadata": {
+                "log_name": pair["log_name"],
+                "prev_token": pair["prev_token"],
+                "curr_token": pair["curr_token"],
+                "previous_ego_delta": torch.tensor(pair["previous_ego_delta"], dtype=torch.float32),
+                "previous_ego_pose": torch.tensor(pair["previous_ego_pose"], dtype=torch.float32),
+            },
+        }
+
+    @property
+    def tokens(self) -> List[str]:
+        return [pair["curr_token"] for pair in self._pairs]
+
+    def _index_cache_file(self, log_names: Optional[List[str]]) -> Optional[Path]:
+        if self._pair_index_cache_path is None:
+            return None
+        os.makedirs(self._pair_index_cache_path, exist_ok=True)
+        log_key = ",".join(log_names or [])
+        digest = hashlib.sha1(log_key.encode("utf-8")).hexdigest()[:12]
+        return self._pair_index_cache_path / f"{self._split_name}_temporal_pairs_{digest}.pkl"
+
+    def _metadata(self, log_names: Optional[List[str]]) -> Dict[str, Any]:
+        return {
+            "split_name": self._split_name,
+            "cache_path": str(self._cache_path),
+            "data_path": str(self._data_path),
+            "log_names": list(log_names or []),
+            "num_history_frames": self._scene_filter.num_history_frames,
+            "num_future_frames": self._scene_filter.num_future_frames,
+            "frame_interval": self._scene_filter.frame_interval,
+            "has_route": self._scene_filter.has_route,
+        }
+
+    def _load_or_build_pair_index(self, log_names: Optional[List[str]]) -> List[Dict[str, Any]]:
+        index_cache_file = self._index_cache_file(log_names)
+        expected_metadata = self._metadata(log_names)
+        if index_cache_file is not None and index_cache_file.is_file():
+            with open(index_cache_file, "rb") as f:
+                payload = pickle.load(f)
+            if payload.get("metadata") == expected_metadata:
+                pairs = self._filter_pairs_with_valid_cache(payload["pairs"])
+                logger.info("Loaded %d temporal pairs from %s", len(pairs), index_cache_file)
+                return pairs
+
+        pairs = self._build_pair_index(log_names=log_names)
+        if index_cache_file is not None:
+            with open(index_cache_file, "wb") as f:
+                pickle.dump({"metadata": expected_metadata, "pairs": pairs}, f)
+            logger.info("Saved %d temporal pairs to %s", len(pairs), index_cache_file)
+        return pairs
+
+    def _filter_pairs_with_valid_cache(self, pairs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        valid_tokens = set(self._base_dataset.tokens)
+        return [pair for pair in pairs if pair["prev_token"] in valid_tokens and pair["curr_token"] in valid_tokens]
+
+    def _build_pair_index(self, log_names: Optional[List[str]]) -> List[Dict[str, Any]]:
+        valid_tokens = set(self._base_dataset.tokens)
+        selected_log_names = set(log_names or [])
+        pairs: List[Dict[str, Any]] = []
+        log_files = sorted(self._data_path.iterdir())
+        if selected_log_names:
+            log_files = [log_file for log_file in log_files if log_file.name.replace(".pkl", "") in selected_log_names]
+
+        for log_pickle_path in tqdm(log_files, desc=f"Building {self._split_name} temporal pairs"):
+            scene_dict_list = pickle.load(open(log_pickle_path, "rb"))
+            log_pairs = self._build_pairs_for_log(scene_dict_list=scene_dict_list, valid_tokens=valid_tokens)
+            pairs.extend(log_pairs)
+
+        logger.info("Built %d %s temporal pairs", len(pairs), self._split_name)
+        return pairs
+
+    def _build_pairs_for_log(
+        self,
+        scene_dict_list: List[Dict[str, Any]],
+        valid_tokens: set,
+    ) -> List[Dict[str, Any]]:
+        sample_records: List[Dict[str, Any]] = []
+        num_frames = self._scene_filter.num_frames
+        step = self._scene_filter.frame_interval
+        history_idx = self._scene_filter.num_history_frames - 1
+        filter_tokens = self._scene_filter.tokens is not None
+        allowed_tokens = set(self._scene_filter.tokens or [])
+
+        for start_idx in range(0, len(scene_dict_list), step):
+            frame_list = scene_dict_list[start_idx : start_idx + num_frames]
+            if len(frame_list) < num_frames:
+                continue
+            current_frame = frame_list[history_idx]
+            if self._scene_filter.has_route and len(current_frame["roadblock_ids"]) == 0:
+                continue
+            current_token = current_frame["token"]
+            if filter_tokens and current_token not in allowed_tokens:
+                continue
+            if current_token not in valid_tokens:
+                continue
+            sample_records.append(
+                {
+                    "token": current_token,
+                    "frame": current_frame,
+                    "log_name": current_frame["log_name"],
+                    "start_idx": start_idx,
+                }
+            )
+
+        pairs: List[Dict[str, Any]] = []
+        for prev_record, curr_record in zip(sample_records[:-1], sample_records[1:]):
+            if curr_record["start_idx"] - prev_record["start_idx"] != step:
+                continue
+            prev_token = prev_record["token"]
+            curr_token = curr_record["token"]
+            if prev_token not in valid_tokens or curr_token not in valid_tokens:
+                continue
+            pairs.append(
+                {
+                    "log_name": curr_record["log_name"],
+                    "prev_token": prev_token,
+                    "curr_token": curr_token,
+                    "previous_ego_delta": _previous_ego_delta_in_current_frame(
+                        prev_record["frame"],
+                        curr_record["frame"],
+                    ),
+                    "previous_ego_pose": _previous_ego_pose_in_current_frame(
+                        prev_record["frame"],
+                        curr_record["frame"],
+                    ),
+                }
+            )
+        return pairs
 
 
 class Dataset(torch.utils.data.Dataset):

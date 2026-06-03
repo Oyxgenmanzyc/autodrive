@@ -97,7 +97,7 @@ def test_start_component_penalizes_same_direction_with_different_speed():
     )
 
     assert start_cost[0, 1] > start_cost[0, 0]
-    assert path_cost[0, 1] == path_cost[0, 0]
+    assert torch.allclose(path_cost[0, 1], path_cost[0, 0], atol=1e-6)
     assert velocity_cost[0, 1] > velocity_cost[0, 0]
 
 

@@ -1,7 +1,8 @@
 import pytorch_lightning as pl
+import torch
 
 from torch import Tensor
-from typing import Dict, Tuple
+from typing import Any, Dict, Tuple
 
 from navsim.agents.abstract_agent import AbstractAgent
 
@@ -56,3 +57,71 @@ class AgentLightningModule(pl.LightningModule):
     def configure_optimizers(self):
         """Inherited, see superclass."""
         return self.agent.get_optimizers()
+
+
+class TemporalPairAgentLightningModule(AgentLightningModule):
+    """Lightning wrapper for train-time prev -> current temporal-pair rollout."""
+
+    def _log_loss_dict(self, loss_dict: Dict[str, Tensor], logging_prefix: str, batch_size: int) -> Tensor:
+        for k, v in loss_dict.items():
+            if v is not None:
+                self.log(f"{logging_prefix}/{k}", v, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=batch_size)
+        return loss_dict["loss"]
+
+    @staticmethod
+    def _batch_size(features: Dict[str, Tensor]) -> int:
+        first_tensor = next(iter(features.values()))
+        return first_tensor.shape[0]
+
+    @staticmethod
+    def _build_temporal_reference(previous_trajectory: Tensor, previous_ego_pose: Tensor) -> Tensor:
+        previous_xy = previous_trajectory[..., :2]
+        previous_heading = previous_ego_pose[..., 2]
+        cos_h = torch.cos(previous_heading)
+        sin_h = torch.sin(previous_heading)
+        rotation = torch.stack(
+            [
+                torch.stack([cos_h, -sin_h], dim=-1),
+                torch.stack([sin_h, cos_h], dim=-1),
+            ],
+            dim=-2,
+        )
+        previous_xy_in_current = torch.bmm(previous_xy, rotation.transpose(1, 2)) + previous_ego_pose[:, None, :2]
+        return previous_xy_in_current[:, 1:4].detach()
+
+    def _step(self, batch: Dict[str, Any], logging_prefix: str) -> Tensor:
+        prev_features = batch["prev_features"]
+        prev_targets = batch["prev_targets"]
+        curr_features = batch["curr_features"]
+        curr_targets = batch["curr_targets"]
+        previous_ego_delta = batch["pair_metadata"]["previous_ego_delta"]
+        previous_ego_pose = batch["pair_metadata"]["previous_ego_pose"]
+
+        with torch.no_grad():
+            prev_prediction = self.agent.forward(prev_features, prev_targets)
+            previous_trajectory = self._build_temporal_reference(
+                prev_prediction["trajectory"],
+                previous_ego_pose,
+            )
+
+        curr_prediction = self.agent.forward(
+            curr_features,
+            curr_targets,
+            previous_trajectory=previous_trajectory,
+            previous_ego_delta=previous_ego_delta,
+        )
+        loss_dict = self.agent.compute_loss(curr_features, curr_targets, curr_prediction)
+        batch_size = self._batch_size(curr_features)
+        self.log(f"{logging_prefix}/temporal_pair_active", torch.ones((), device=self.device), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True, batch_size=batch_size)
+        for metric_name in ("temporal_start_cost", "temporal_path_cost", "temporal_velocity_cost"):
+            if metric_name in curr_prediction:
+                self.log(
+                    f"{logging_prefix}/{metric_name}",
+                    curr_prediction[metric_name],
+                    on_step=True,
+                    on_epoch=True,
+                    prog_bar=False,
+                    sync_dist=True,
+                    batch_size=batch_size,
+                )
+        return self._log_loss_dict(loss_dict, logging_prefix, batch_size)

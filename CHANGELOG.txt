@@ -126,3 +126,49 @@ D:\python\venv\Scripts\python.exe 手动 test runner
 
 3.2 本地验证策略修正：
 用户明确要求：本地电脑不运行测试、手动 runner 或冒烟验证；冒烟测试与完整验证均在服务器环境执行。后续 Autodrive Experiment Workflow 已同步更新为默认不进行本地验证，除非用户明确要求。此前本地静态命令输出仅作为已发生事实保留，不作为后续流程要求。
+
+修改主题：3.3 Train-time Temporal Pair Tri-factor Compatibility
+修改日期：2026-06-03
+
+修改目的：
+在 3.2 Near-horizon Tri-factor Temporal Compatibility 基础上，将 start/path/velocity 三因子 temporal noise modulation 接入 forward_train。训练时不再只在 forward_test/compute_trajectory 中使用上一帧预测，而是构造相邻帧 pair，用上一帧模型预测作为当前帧训练加噪的历史参考，使训练过程更接近连续帧推理逻辑。
+
+涉及文件：
+navsim/agents/diffusiondrive/transfuser_config.py
+navsim/agents/diffusiondrive/transfuser_model_v2.py
+navsim/planning/script/config/common/agent/diffusiondrive_agent.yaml
+navsim/planning/script/config/training/default_training.yaml
+navsim/planning/script/run_training.py
+navsim/planning/training/agent_lightning_module.py
+navsim/planning/training/dataset.py
+tests/test_diffusiondrive_factorized_temporal_compat.py
+tests/test_temporal_pair_dataset.py
+
+核心改动：
+1. 新增 TemporalPairCacheOnlyDataset，复用已有训练 cache 读取 feature/target，同时从 navsim_logs 构建相邻帧 prev -> curr pair。
+2. pair index 只接受原始 log 中 start index 真正相邻的样本，避免过滤后不连续 token 被误认为连续帧。
+3. pair metadata 中保存 previous_ego_delta 和 previous_ego_pose，用于训练时复现推理中的上一帧 ego 到当前 ego 坐标变换。
+4. 新增 TemporalPairAgentLightningModule。上一帧在 torch.no_grad() 下 forward，只生成固定 previous trajectory reference；当前帧 forward 才参与 loss。
+5. 训练 loss 只使用当前帧 curr loss，不加入 prev loss，严格模拟 forward_test 中“上一帧预测已经发生，当前帧使用固定历史参考”的逻辑。
+6. 训练时将上一帧预测从 previous ego 坐标系变换到 current ego 坐标系，丢弃已执行 p1，只保留 p2-p4 作为 near-horizon temporal reference。
+7. TrajectoryHead.forward_train() 新增 previous_trajectory 和 previous_ego_delta 输入，训练加噪时调用与 forward_test 相同的 3.2 _temporal_noise_scale()。
+8. forward_train 输出 temporal_start_cost、temporal_path_cost、temporal_velocity_cost 的均值，LightningModule 记录到训练日志。
+9. default_training.yaml 增加 temporal_pair_training 和 temporal_pair_index_cache_path 开关；默认 temporal_pair_training=false，不影响普通训练。
+10. 服务器适配：transfuser_config.py 使用 NAVSIM_DEVKIT_ROOT 定位 resnet34 和 kmeans anchor；diffusiondrive_agent.yaml lr 改为 3e-4；default_training.yaml batch_size 改为 32。
+
+预期影响：
+3.3 让 3.2 的 start/path/velocity 三因子在训练阶段真实生效。当前帧训练样本会根据上一帧模型预测和真实过去 0.5s ego motion 调制 diffusion noise，而不是仅在验证/推理时才启用 temporal compatibility。这样更符合“连续帧历史参考指导当前帧轨迹生成”的实验思想，同时保留 path 与 velocity 分开建模这一核心创新点。
+
+验证结果：
+已运行：
+git diff --check
+结果：通过。
+
+/home/dell/anaconda3/envs/navsim/bin/python -m py_compile navsim/planning/training/dataset.py navsim/planning/training/agent_lightning_module.py navsim/planning/script/run_training.py navsim/agents/diffusiondrive/transfuser_model_v2.py tests/test_temporal_pair_dataset.py tests/test_diffusiondrive_factorized_temporal_compat.py
+结果：通过。
+
+/home/dell/anaconda3/envs/navsim/bin/python -m pytest tests/test_temporal_pair_dataset.py tests/test_diffusiondrive_factorized_temporal_compat.py
+结果：14 passed。
+
+冒烟测试：
+用户明确要求本轮不用冒烟测试，因此不再执行 GPU smoke；完整训练与后续验证在新云服务器环境执行。
