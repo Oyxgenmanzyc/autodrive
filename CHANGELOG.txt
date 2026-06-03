@@ -204,3 +204,38 @@ CHANGELOG.txt
 
 与论文撰写的关系：
 3.4 可作为 GT teacher-forcing train-time temporal compatibility 对照版，说明模型在训练阶段接触真实连续帧连接参考后，是否能改善 start/path/velocity 三因子时间一致性。
+
+修改主题：3.5 Loss-aware Mixed-reference Connection Temporal Training
+修改日期：2026-06-03
+
+修改目的：
+在 3.4 GT-guided connection-aligned temporal training 基础上，加入 loss-aware mixed reference。训练早期继续依赖上一帧 GT future 的 p0,p1,p2 作为稳定 teacher reference；当训练 loss EMA 相对初始 EMA 明显改善后，逐步混入上一帧模型预测 reference，使训练分布更接近测试阶段“真实 historical ego motion + 上一帧模型预测”的使用方式。
+
+涉及文件：
+navsim/planning/training/agent_lightning_module.py
+tests/test_temporal_pair_dataset.py
+CHANGELOG.txt
+
+核心改动：
+1. 保留 3.4 的连接适配逻辑：executed_delta 对 q0-origin，p1-p0 对 q1-q0，p2-p1 对 q2-q1。
+2. 新增 loss EMA 调度参数：
+   loss_ema_beta = 0.98
+   rho_max = 0.50
+   min_warmup_steps = 1000
+   mix_start_improvement = 0.15
+   mix_full_improvement = 0.35
+3. 训练时 reference 默认使用 GT reference；当 EMA 改善超过 15% 后，reference_mix_ratio rho 开始从 0 增长；改善达到 35% 后 rho clamp 到 0.50。
+4. pred_reference 来自上一帧模型在 eval/forward_test 路径下的预测，detach 后作为弱参考，不作为 GT 直接监督。
+5. mixed reference 计算为：
+   reference = (1 - rho) * gt_reference + rho * pred_reference
+6. 真实 historical ego motion 不参与混合，始终作为 executed_delta 主导 C_start。
+7. 记录 temporal_reference_mix_ratio 方便服务器训练日志观察调度是否生效。
+
+预期影响：
+3.5 试图缓解长期 GT teacher forcing 造成的 train/test gap。模型先从可靠 GT reference 学会连接规律，成熟后逐步接触自身预测 reference，减少测试阶段使用上一帧模型预测时的分布偏移。mode diversity 不写入训练逻辑，仅作为服务器结果分析时的观察点。
+
+验证结果：
+本地不运行测试、pytest、manual runner 或 smoke。轻量测试文件已更新，等待服务器 smoke/full validation。
+
+与论文撰写的关系：
+3.5 可作为 loss-aware scheduled temporal reference training 版本，用于论证 temporal reference 不应一直由 GT 模板主导，而应随着训练成熟逐步向 self-predicted reference 过渡。

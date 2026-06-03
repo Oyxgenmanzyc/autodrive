@@ -62,6 +62,25 @@ class AgentLightningModule(pl.LightningModule):
 class TemporalPairAgentLightningModule(AgentLightningModule):
     """Lightning wrapper for train-time prev -> current temporal-pair rollout."""
 
+    def __init__(
+        self,
+        agent: AbstractAgent,
+        loss_ema_beta: float = 0.98,
+        rho_max: float = 0.50,
+        min_warmup_steps: int = 1000,
+        mix_start_improvement: float = 0.15,
+        mix_full_improvement: float = 0.35,
+    ):
+        super().__init__(agent=agent)
+        self.loss_ema_beta = loss_ema_beta
+        self.rho_max = rho_max
+        self.min_warmup_steps = min_warmup_steps
+        self.mix_start_improvement = mix_start_improvement
+        self.mix_full_improvement = mix_full_improvement
+        self.register_buffer("_loss_ema", torch.tensor(float("nan")), persistent=False)
+        self.register_buffer("_initial_loss_ema", torch.tensor(float("nan")), persistent=False)
+        self.register_buffer("_loss_ema_steps", torch.tensor(0, dtype=torch.long), persistent=False)
+
     def _log_loss_dict(self, loss_dict: Dict[str, Tensor], logging_prefix: str, batch_size: int) -> Tensor:
         for k, v in loss_dict.items():
             if v is not None:
@@ -89,17 +108,60 @@ class TemporalPairAgentLightningModule(AgentLightningModule):
         previous_xy_in_current = torch.bmm(previous_xy, rotation.transpose(1, 2)) + previous_ego_pose[:, None, :2]
         return previous_xy_in_current[:, :3].detach()
 
+    def _reference_mix_ratio(self) -> Tensor:
+        if self._loss_ema_steps < self.min_warmup_steps:
+            return torch.zeros((), device=self._loss_ema.device)
+        if not torch.isfinite(self._loss_ema) or not torch.isfinite(self._initial_loss_ema):
+            return torch.zeros((), device=self._loss_ema.device)
+
+        improvement = (self._initial_loss_ema - self._loss_ema) / (self._initial_loss_ema.abs() + 1e-6)
+        progress = (improvement - self.mix_start_improvement) / (
+            self.mix_full_improvement - self.mix_start_improvement + 1e-6
+        )
+        return (progress.clamp(0.0, 1.0) * self.rho_max).to(device=self._loss_ema.device)
+
+    def _update_loss_schedule(self, loss: Tensor) -> None:
+        loss = loss.detach()
+        if not torch.isfinite(loss):
+            return
+        if not torch.isfinite(self._loss_ema):
+            self._loss_ema.copy_(loss)
+            self._initial_loss_ema.copy_(loss)
+        else:
+            self._loss_ema.mul_(self.loss_ema_beta).add_(loss * (1.0 - self.loss_ema_beta))
+        self._loss_ema_steps.add_(1)
+
+    def _build_predicted_temporal_reference(self, prev_features: Dict[str, Tensor], previous_ego_pose: Tensor) -> Tensor:
+        was_training = self.agent.training
+        self.agent.eval()
+        with torch.no_grad():
+            prev_prediction = self.agent.forward(prev_features)
+        if was_training:
+            self.agent.train()
+        return self._build_temporal_reference(prev_prediction["trajectory"], previous_ego_pose)
+
+    @staticmethod
+    def _mix_temporal_reference(gt_reference: Tensor, pred_reference: Tensor, rho: Tensor) -> Tensor:
+        rho = rho.to(device=gt_reference.device, dtype=gt_reference.dtype)
+        return ((1.0 - rho) * gt_reference + rho * pred_reference).detach()
+
     def _step(self, batch: Dict[str, Any], logging_prefix: str) -> Tensor:
+        prev_features = batch["prev_features"]
         prev_targets = batch["prev_targets"]
         curr_features = batch["curr_features"]
         curr_targets = batch["curr_targets"]
         previous_ego_delta = batch["pair_metadata"]["previous_ego_delta"]
         previous_ego_pose = batch["pair_metadata"]["previous_ego_pose"]
 
-        previous_trajectory = self._build_temporal_reference(
+        gt_reference = self._build_temporal_reference(
             prev_targets["trajectory"],
             previous_ego_pose,
         )
+        reference_mix_ratio = self._reference_mix_ratio()
+        previous_trajectory = gt_reference
+        if reference_mix_ratio.item() > 0.0:
+            pred_reference = self._build_predicted_temporal_reference(prev_features, previous_ego_pose)
+            previous_trajectory = self._mix_temporal_reference(gt_reference, pred_reference, reference_mix_ratio)
 
         curr_prediction = self.agent.forward(
             curr_features,
@@ -109,7 +171,10 @@ class TemporalPairAgentLightningModule(AgentLightningModule):
         )
         loss_dict = self.agent.compute_loss(curr_features, curr_targets, curr_prediction)
         batch_size = self._batch_size(curr_features)
+        if logging_prefix == "train":
+            self._update_loss_schedule(loss_dict["loss"])
         self.log(f"{logging_prefix}/temporal_pair_active", torch.ones((), device=self.device), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True, batch_size=batch_size)
+        self.log(f"{logging_prefix}/temporal_reference_mix_ratio", reference_mix_ratio, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True, batch_size=batch_size)
         for metric_name in ("temporal_start_cost", "temporal_path_cost", "temporal_velocity_cost"):
             if metric_name in curr_prediction:
                 self.log(

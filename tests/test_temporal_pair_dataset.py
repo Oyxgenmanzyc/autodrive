@@ -112,3 +112,63 @@ def test_temporal_pair_reference_keeps_connection_points_p0_to_p2():
         temporal_reference,
         torch.tensor([[[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]]),
     )
+
+
+def _make_schedule_module():
+    module = TemporalPairAgentLightningModule.__new__(TemporalPairAgentLightningModule)
+    module.loss_ema_beta = 0.98
+    module.rho_max = 0.5
+    module.min_warmup_steps = 2
+    module.mix_start_improvement = 0.15
+    module.mix_full_improvement = 0.35
+    module._loss_ema = torch.tensor(float("nan"))
+    module._initial_loss_ema = torch.tensor(float("nan"))
+    module._loss_ema_steps = torch.tensor(0, dtype=torch.long)
+    return module
+
+
+def test_loss_aware_mix_ratio_stays_zero_before_warmup_and_improvement():
+    module = _make_schedule_module()
+    module._update_loss_schedule(torch.tensor(10.0))
+
+    assert module._reference_mix_ratio() == 0.0
+
+    module._loss_ema_steps = torch.tensor(2, dtype=torch.long)
+    module._loss_ema = torch.tensor(9.0)
+
+    assert module._reference_mix_ratio() == 0.0
+
+
+def test_loss_aware_mix_ratio_increases_and_clamps_to_rho_max():
+    module = _make_schedule_module()
+    module._initial_loss_ema = torch.tensor(10.0)
+    module._loss_ema_steps = torch.tensor(2, dtype=torch.long)
+
+    module._loss_ema = torch.tensor(8.0)
+    partial_ratio = module._reference_mix_ratio()
+    assert 0.0 < partial_ratio < module.rho_max
+
+    module._loss_ema = torch.tensor(6.0)
+    assert torch.allclose(module._reference_mix_ratio(), torch.tensor(module.rho_max))
+
+
+def test_temporal_reference_mix_uses_gt_at_zero_and_prediction_when_enabled():
+    gt_reference = torch.tensor([[[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]])
+    pred_reference = torch.tensor([[[0.0, 1.0], [1.0, 1.0], [2.0, 1.0]]])
+
+    assert torch.allclose(
+        TemporalPairAgentLightningModule._mix_temporal_reference(
+            gt_reference,
+            pred_reference,
+            torch.tensor(0.0),
+        ),
+        gt_reference,
+    )
+    assert torch.allclose(
+        TemporalPairAgentLightningModule._mix_temporal_reference(
+            gt_reference,
+            pred_reference,
+            torch.tensor(0.5),
+        ),
+        0.5 * gt_reference + 0.5 * pred_reference,
+    )
