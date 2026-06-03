@@ -168,6 +168,22 @@ def test_near_horizon_reference_ignores_far_anchor_points():
         assert torch.allclose(cost, changed_far_cost)
 
 
+def test_reference_points_after_p2_do_not_change_temporal_cost():
+    head = _make_head()
+    previous = _straight_x(steps=8).unsqueeze(0)
+    changed_far_previous = previous.clone()
+    changed_far_previous[:, 3:] = _straight_y(steps=5) + torch.tensor([10.0, 0.0])
+    executed_delta = torch.tensor([[1.0, 0.0]])
+    plan_anchor = torch.zeros(1, 20, 8, 2)
+    plan_anchor[:, 0, :3] = previous[:, :3]
+
+    costs = head._temporal_compatibility_components(plan_anchor, previous, executed_delta)
+    changed_far_costs = head._temporal_compatibility_components(plan_anchor, changed_far_previous, executed_delta)
+
+    for cost, changed_far_cost in zip(costs, changed_far_costs):
+        assert torch.allclose(cost, changed_far_cost)
+
+
 def test_terminal_absolute_position_no_longer_changes_cost():
     head = _make_head()
     previous = _straight_x(steps=3).unsqueeze(0)

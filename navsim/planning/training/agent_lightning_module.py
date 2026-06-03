@@ -87,22 +87,19 @@ class TemporalPairAgentLightningModule(AgentLightningModule):
             dim=-2,
         )
         previous_xy_in_current = torch.bmm(previous_xy, rotation.transpose(1, 2)) + previous_ego_pose[:, None, :2]
-        return previous_xy_in_current[:, 1:4].detach()
+        return previous_xy_in_current[:, :3].detach()
 
     def _step(self, batch: Dict[str, Any], logging_prefix: str) -> Tensor:
-        prev_features = batch["prev_features"]
         prev_targets = batch["prev_targets"]
         curr_features = batch["curr_features"]
         curr_targets = batch["curr_targets"]
         previous_ego_delta = batch["pair_metadata"]["previous_ego_delta"]
         previous_ego_pose = batch["pair_metadata"]["previous_ego_pose"]
 
-        with torch.no_grad():
-            prev_prediction = self.agent.forward(prev_features, prev_targets)
-            previous_trajectory = self._build_temporal_reference(
-                prev_prediction["trajectory"],
-                previous_ego_pose,
-            )
+        previous_trajectory = self._build_temporal_reference(
+            prev_targets["trajectory"],
+            previous_ego_pose,
+        )
 
         curr_prediction = self.agent.forward(
             curr_features,

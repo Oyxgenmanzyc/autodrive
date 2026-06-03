@@ -89,7 +89,7 @@ def test_temporal_pair_dataset_returns_prev_and_current_cache(tmp_path):
     assert torch.allclose(sample["pair_metadata"]["previous_ego_pose"], torch.tensor([-1.0, 0.0, 0.0]))
 
 
-def test_temporal_pair_reference_matches_inference_near_horizon_crop():
+def test_temporal_pair_reference_keeps_connection_points_p0_to_p2():
     previous_trajectory = torch.tensor(
         [
             [
@@ -110,5 +110,5 @@ def test_temporal_pair_reference_matches_inference_near_horizon_crop():
 
     assert torch.allclose(
         temporal_reference,
-        torch.tensor([[[1.0, 0.0], [2.0, 0.0], [3.0, 0.0]]]),
+        torch.tensor([[[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]]),
     )

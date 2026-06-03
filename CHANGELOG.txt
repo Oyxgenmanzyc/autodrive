@@ -172,3 +172,35 @@ git diff --check
 
 冒烟测试：
 用户明确要求本轮不用冒烟测试，因此不再执行 GPU smoke；完整训练与后续验证在新云服务器环境执行。
+
+修改主题：3.4 GT-guided Connection-aligned Temporal Training
+修改日期：2026-06-03
+
+修改目的：
+在 3.3 train-time temporal pair 基础上修正时间连接语义。训练阶段继续使用相邻帧 pair，但 temporal reference 不再来自上一帧 training-mode prediction，而是来自上一帧 GT future 的近端 p0,p1,p2。该版本作为干净的 GT teacher-forcing 对照实验，只验证连接适配逻辑和 GT-guided 训练是否有效，不加入 mode diversity 相关逻辑。
+
+涉及文件：
+navsim/agents/diffusiondrive/transfuser_agent.py
+navsim/agents/diffusiondrive/transfuser_model_v2.py
+navsim/planning/training/agent_lightning_module.py
+tests/test_diffusiondrive_factorized_temporal_compat.py
+tests/test_temporal_pair_dataset.py
+CHANGELOG.txt
+
+核心改动：
+1. temporal reference 改为保留上一帧近端 p0,p1,p2，而不是 3.3 中的 p1,p2,p3。
+2. 训练阶段从 prev_targets["trajectory"] 直接构造 GT temporal reference，避免上一帧在 training mode 下生成不干净的历史预测。
+3. model 内部将上一帧 reference 显式转成连接段：p1-p0、p2-p1。
+4. 当前 anchor 显式使用 q0-origin、q1-q0、q2-q1 三段局部运动。
+5. C_start 仍由真实 historical ego motion 对 q0-origin 主导。
+6. C_path 和 C_velocity 使用 p1-p0 对 q1-q0、p2-p1 对 q2-q1 的近端连接趋势，不再把 p1 对 q0 作为主约束。
+7. 测试侧上一帧模型预测 reference 也裁剪为 p0,p1,p2，以匹配新的连接段语义；PDM scoring 流程本身不改。
+
+预期影响：
+3.4 用更干净的 GT-guided temporal pair 训练验证“真实历史连接 + 上一帧近端连接趋势”的核心想法。相比 3.3，该版本避免 training-mode previous prediction 带来的语义混合，也避免 p1/q0 同时间段一致性削弱当前帧新决策。
+
+验证结果：
+本地不运行测试、pytest、manual runner 或 smoke。轻量测试文件已更新，等待服务器 smoke/full validation。
+
+与论文撰写的关系：
+3.4 可作为 GT teacher-forcing train-time temporal compatibility 对照版，说明模型在训练阶段接触真实连续帧连接参考后，是否能改善 start/path/velocity 三因子时间一致性。

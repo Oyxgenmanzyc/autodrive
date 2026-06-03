@@ -135,13 +135,13 @@ class TransfuserAgent(AbstractAgent):
         rotation = np.array([[cos_h, -sin_h], [sin_h, cos_h]], dtype=np.float32)
         previous_xy_in_current = previous_xy @ rotation.T + previous_ego_pose[:2].astype(np.float32)
 
-        if previous_xy_in_current.shape[0] < 2:
+        if previous_xy_in_current.shape[0] < 3:
             return None
         if np.linalg.norm(previous_xy_in_current[0]) > self._temporal_reset_distance:
             return None
 
         near_horizon_points = 3
-        temporal_reference = previous_xy_in_current[1:1 + near_horizon_points]
+        temporal_reference = previous_xy_in_current[:near_horizon_points]
         return temporal_reference.astype(np.float32)
 
     def _build_previous_ego_delta(self, agent_input: AgentInput) -> Optional[np.ndarray]:

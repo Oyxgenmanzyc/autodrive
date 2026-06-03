@@ -545,31 +545,28 @@ class TrajectoryHead(nn.Module):
 
         if previous_trajectory is not None:
             previous_trajectory = previous_trajectory.to(device=plan_anchor.device, dtype=plan_anchor.dtype)
-            if torch.isfinite(previous_trajectory).all():
-                overlap_len = min(previous_trajectory.shape[-2], plan_anchor.shape[-2])
-            else:
-                overlap_len = 0
-
-            if overlap_len >= 1:
-                previous_xy = previous_trajectory[..., :overlap_len, :2]
-                anchor_xy = plan_anchor[..., :overlap_len, :2]
-                previous_delta = self._point_deltas(previous_xy).unsqueeze(1)
+            if torch.isfinite(previous_trajectory).all() and previous_trajectory.shape[-2] >= 3 and plan_anchor.shape[-2] >= 3:
+                previous_xy = previous_trajectory[..., :3, :2]
+                anchor_xy = plan_anchor[..., :3, :2]
+                previous_delta = (previous_xy[..., 1:, :] - previous_xy[..., :-1, :]).unsqueeze(1)
                 anchor_delta = self._point_deltas(anchor_xy)
+                anchor_ref_delta = anchor_delta[..., 1:3, :]
 
                 anchor_speed = torch.linalg.norm(anchor_delta, dim=-1)
+                anchor_ref_speed = torch.linalg.norm(anchor_ref_delta, dim=-1)
                 previous_speed = torch.linalg.norm(previous_delta, dim=-1)
 
-                direction_cost = self._cosine_direction_cost(anchor_delta, previous_delta).mean(dim=-1)
-                turn_cost = self._turn_cost(anchor_delta, previous_delta)
+                direction_cost = self._cosine_direction_cost(anchor_ref_delta, previous_delta).mean(dim=-1)
+                turn_cost = self._turn_cost(anchor_ref_delta, previous_delta)
                 path_ref_cost = 0.3 * direction_cost + 0.7 * turn_cost
 
-                if overlap_len > 1:
-                    anchor_speed_delta = anchor_speed[..., 1:] - anchor_speed[..., :-1]
+                if previous_delta.shape[-2] > 1:
+                    anchor_speed_delta = anchor_ref_speed[..., 1:] - anchor_ref_speed[..., :-1]
                     previous_speed_delta = previous_speed[..., 1:] - previous_speed[..., :-1]
                     speed_delta_error = torch.abs(anchor_speed_delta - previous_speed_delta) / (previous_speed_delta.abs() + 1.0)
                     accel_cost = speed_delta_error.clamp(max=2.0).mean(dim=-1)
                 else:
-                    accel_cost = torch.zeros_like(anchor_speed[..., 0])
+                    accel_cost = torch.zeros_like(anchor_ref_speed[..., 0])
                 reversal_cost = self._reversal_cost(anchor_speed)
                 velocity_ref_cost = 0.40 * accel_cost + 0.25 * reversal_cost
                 path_cost = path_ref_cost
