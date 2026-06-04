@@ -267,12 +267,17 @@ class TemporalPairCacheOnlyDataset(torch.utils.data.Dataset):
         valid_tokens = set(self._base_dataset.tokens)
         selected_log_names = set(log_names or [])
         pairs: List[Dict[str, Any]] = []
-        log_files = sorted(self._data_path.iterdir())
+        log_files = sorted(
+            log_file
+            for log_file in self._data_path.iterdir()
+            if log_file.is_file() and log_file.suffix == ".pkl"
+        )
         if selected_log_names:
-            log_files = [log_file for log_file in log_files if log_file.name.replace(".pkl", "") in selected_log_names]
+            log_files = [log_file for log_file in log_files if log_file.stem in selected_log_names]
 
         for log_pickle_path in tqdm(log_files, desc=f"Building {self._split_name} temporal pairs"):
-            scene_dict_list = pickle.load(open(log_pickle_path, "rb"))
+            with open(log_pickle_path, "rb") as f:
+                scene_dict_list = pickle.load(f)
             log_pairs = self._build_pairs_for_log(scene_dict_list=scene_dict_list, valid_tokens=valid_tokens)
             pairs.extend(log_pairs)
 

@@ -94,6 +94,14 @@ class TemporalPairAgentLightningModule(AgentLightningModule):
 
     @staticmethod
     def _build_temporal_reference(previous_trajectory: Tensor, previous_ego_pose: Tensor) -> Tensor:
+        if previous_trajectory is None or previous_trajectory.shape[-2] < 3:
+            return None
+
+        previous_trajectory = previous_trajectory[..., :3, :2]
+        previous_ego_pose = previous_ego_pose.to(
+            device=previous_trajectory.device,
+            dtype=previous_trajectory.dtype,
+        )
         previous_xy = previous_trajectory[..., :2]
         previous_heading = previous_ego_pose[..., 2]
         cos_h = torch.cos(previous_heading)
@@ -106,7 +114,7 @@ class TemporalPairAgentLightningModule(AgentLightningModule):
             dim=-2,
         )
         previous_xy_in_current = torch.bmm(previous_xy, rotation.transpose(1, 2)) + previous_ego_pose[:, None, :2]
-        return previous_xy_in_current[:, :3].detach()
+        return previous_xy_in_current.detach()
 
     def _reference_mix_ratio(self) -> Tensor:
         if self._loss_ema_steps < self.min_warmup_steps:
@@ -134,10 +142,12 @@ class TemporalPairAgentLightningModule(AgentLightningModule):
     def _build_predicted_temporal_reference(self, prev_features: Dict[str, Tensor], previous_ego_pose: Tensor) -> Tensor:
         was_training = self.agent.training
         self.agent.eval()
-        with torch.no_grad():
-            prev_prediction = self.agent.forward(prev_features)
-        if was_training:
-            self.agent.train()
+        try:
+            with torch.no_grad():
+                prev_prediction = self.agent.forward(prev_features)
+        finally:
+            if was_training:
+                self.agent.train()
         return self._build_temporal_reference(prev_prediction["trajectory"], previous_ego_pose)
 
     @staticmethod
@@ -150,18 +160,26 @@ class TemporalPairAgentLightningModule(AgentLightningModule):
         prev_targets = batch["prev_targets"]
         curr_features = batch["curr_features"]
         curr_targets = batch["curr_targets"]
-        previous_ego_delta = batch["pair_metadata"]["previous_ego_delta"]
-        previous_ego_pose = batch["pair_metadata"]["previous_ego_pose"]
+        reference_tensor = prev_targets["trajectory"]
+        previous_ego_delta = batch["pair_metadata"]["previous_ego_delta"].to(
+            device=reference_tensor.device,
+            dtype=reference_tensor.dtype,
+        )
+        previous_ego_pose = batch["pair_metadata"]["previous_ego_pose"].to(
+            device=reference_tensor.device,
+            dtype=reference_tensor.dtype,
+        )
 
         gt_reference = self._build_temporal_reference(
-            prev_targets["trajectory"],
+            reference_tensor,
             previous_ego_pose,
         )
         reference_mix_ratio = self._reference_mix_ratio()
         previous_trajectory = gt_reference
-        if reference_mix_ratio.item() > 0.0:
+        if previous_trajectory is not None and reference_mix_ratio.item() > 0.0:
             pred_reference = self._build_predicted_temporal_reference(prev_features, previous_ego_pose)
-            previous_trajectory = self._mix_temporal_reference(gt_reference, pred_reference, reference_mix_ratio)
+            if pred_reference is not None:
+                previous_trajectory = self._mix_temporal_reference(gt_reference, pred_reference, reference_mix_ratio)
 
         curr_prediction = self.agent.forward(
             curr_features,
