@@ -204,3 +204,32 @@ CHANGELOG.txt
 
 与论文撰写的关系：
 3.4 可作为 GT teacher-forcing train-time temporal compatibility 对照版，说明模型在训练阶段接触真实连续帧连接参考后，是否能改善 start/path/velocity 三因子时间一致性。
+
+修改主题：3.4 Server Compatibility Fixes for GT-guided Connection Training
+修改日期：2026-06-04
+
+修改目的：
+根据云服务器部署 3.3 时暴露的问题，对 3.4 先做跑通兼容修复。修复只面向训练配置、temporal pair index 构建和 batch tensor device/dtype 对齐，不改变 3.4 的 GT-guided temporal reference 逻辑，也不改变连接适配定义。
+
+涉及文件：
+navsim/planning/script/config/training/default_training.yaml
+navsim/planning/training/dataset.py
+navsim/planning/training/agent_lightning_module.py
+CHANGELOG.txt
+
+核心改动：
+1. default_training.yaml 默认改为 use_cache_without_dataset=true、force_cache_computation=false，避免 temporal pair 训练时误触发 training cache 重建。
+2. 保留 temporal_pair_training 和 temporal_pair_index_cache_path 配置项，避免 Hydra struct 模式下缺少 temporal_pair_index_cache_path。
+3. TemporalPairCacheOnlyDataset 构建 pair index 时只读取 data_path 下的 .pkl 文件，跳过目录、隐藏文件和非 pkl 文件。
+4. 读取 navsim log pickle 时使用 with open(...)，避免文件句柄泄漏。
+5. TemporalPairAgentLightningModule 在构造 GT temporal reference 前，显式将 previous_ego_pose 和 previous_ego_delta 对齐到 prev_targets["trajectory"] 的 device/dtype。
+6. _build_temporal_reference 增加少于 3 个 waypoint 时返回 None 的保护。
+
+预期影响：
+提升 3.4 在服务器训练环境中的可运行性，减少配置未同步、原始 log 目录混杂文件、CPU/GPU tensor 混用等问题。该修复不引入 DDP unused-parameter workaround，不修改 p0,p1,p2 连接段逻辑。
+
+验证结果：
+本地不运行测试、pytest、manual runner 或 smoke。等待服务器 smoke/full validation。
+
+与论文撰写的关系：
+该记录用于说明 3.4 的服务器兼容修复不属于新实验变量，实验变量仍是 GT-guided connection-aligned temporal training。

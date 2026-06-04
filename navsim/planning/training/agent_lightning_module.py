@@ -75,6 +75,14 @@ class TemporalPairAgentLightningModule(AgentLightningModule):
 
     @staticmethod
     def _build_temporal_reference(previous_trajectory: Tensor, previous_ego_pose: Tensor) -> Tensor:
+        if previous_trajectory is None or previous_trajectory.shape[-2] < 3:
+            return None
+
+        previous_trajectory = previous_trajectory[..., :3, :2]
+        previous_ego_pose = previous_ego_pose.to(
+            device=previous_trajectory.device,
+            dtype=previous_trajectory.dtype,
+        )
         previous_xy = previous_trajectory[..., :2]
         previous_heading = previous_ego_pose[..., 2]
         cos_h = torch.cos(previous_heading)
@@ -87,17 +95,24 @@ class TemporalPairAgentLightningModule(AgentLightningModule):
             dim=-2,
         )
         previous_xy_in_current = torch.bmm(previous_xy, rotation.transpose(1, 2)) + previous_ego_pose[:, None, :2]
-        return previous_xy_in_current[:, :3].detach()
+        return previous_xy_in_current.detach()
 
     def _step(self, batch: Dict[str, Any], logging_prefix: str) -> Tensor:
         prev_targets = batch["prev_targets"]
         curr_features = batch["curr_features"]
         curr_targets = batch["curr_targets"]
-        previous_ego_delta = batch["pair_metadata"]["previous_ego_delta"]
-        previous_ego_pose = batch["pair_metadata"]["previous_ego_pose"]
+        reference_tensor = prev_targets["trajectory"]
+        previous_ego_delta = batch["pair_metadata"]["previous_ego_delta"].to(
+            device=reference_tensor.device,
+            dtype=reference_tensor.dtype,
+        )
+        previous_ego_pose = batch["pair_metadata"]["previous_ego_pose"].to(
+            device=reference_tensor.device,
+            dtype=reference_tensor.dtype,
+        )
 
         previous_trajectory = self._build_temporal_reference(
-            prev_targets["trajectory"],
+            reference_tensor,
             previous_ego_pose,
         )
 

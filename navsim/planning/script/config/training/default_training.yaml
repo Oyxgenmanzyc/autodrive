@@ -16,8 +16,8 @@ defaults:
 
 split: trainval
 cache_path: ${oc.env:NAVSIM_EXP_ROOT}/training_cache
-use_cache_without_dataset: false # load the training samples from the cache. scene-filter will be ignored
-force_cache_computation: true
+use_cache_without_dataset: true # load the training samples from the cache. scene-filter will be ignored
+force_cache_computation: false
 temporal_pair_training: false
 temporal_pair_index_cache_path: ${oc.env:NAVSIM_EXP_ROOT}/temporal_pair_index
 seed: 0
