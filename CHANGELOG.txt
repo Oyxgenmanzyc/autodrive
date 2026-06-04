@@ -233,3 +233,31 @@ CHANGELOG.txt
 
 与论文撰写的关系：
 该记录用于说明 3.4 的服务器兼容修复不属于新实验变量，实验变量仍是 GT-guided connection-aligned temporal training。
+
+修改主题：3.4 Ordered PDM Evaluation and Temporal Debug Flags
+修改日期：2026-06-04
+
+修改目的：
+修正 PDM 验证脚本对 temporal-reference agent 不友好的评估顺序问题。验证阶段不再使用 set() 打乱 token 顺序，并在每个 log 开始前清空 temporal context，避免上一 log 的最后一帧影响下一 log。新增 temporal debug 字段写入 CSV，用于确认验证时是否实际启用了上一帧 temporal reference。
+
+涉及文件：
+navsim/planning/script/run_pdm_score.py
+navsim/agents/diffusiondrive/transfuser_agent.py
+CHANGELOG.txt
+
+核心改动：
+1. run_pdm_score.py 保持 SceneLoader / get_tokens_list_per_log 提供的 token 顺序，不再用 list(set(...)) 生成评估序列。
+2. 每个 log 开始前调用 agent.reset_temporal_context()，保证 temporal cache 不跨 log 传播。
+3. PDM CSV 增加 temporal_reference_active 和 previous_ego_delta_active 两列。
+4. TransfuserAgent 增加 _last_temporal_reference_active、_last_previous_ego_delta_active 和 get_temporal_debug_info()。
+5. 验证日志打印 cfg.agent 的 _target_ 和 checkpoint_path，方便确认 PDM 是否真的加载了 diffusiondrive_agent 与目标 checkpoint。
+6. 保持 3.4 的 p0,p1,p2 temporal reference 逻辑不变，用于模型内部构造 p1-p0、p2-p1 连接段。
+
+预期影响：
+使 3.4 的 PDM 验证更符合连续帧 temporal reference 的假设，并提供 CSV 级别的开关证据。如果 temporal_reference_active 长期为 0，可直接定位验证阶段 temporal reference 没有生效。
+
+验证结果：
+本地不运行测试、pytest、manual runner 或 smoke。等待服务器 PDM 验证。
+
+与论文撰写的关系：
+该修复用于保证 3.4 验证流程正确反映 temporal reference 机制，不作为新的训练实验变量。

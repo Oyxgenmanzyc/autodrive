@@ -54,6 +54,8 @@ class TransfuserAgent(AbstractAgent):
         self._transfuser_model = TransfuserModel(config)
         self._previous_trajectory: Optional[np.ndarray] = None
         self._temporal_reset_distance = 5.0
+        self._last_temporal_reference_active = False
+        self._last_previous_ego_delta_active = False
         self.init_from_pretrained()
 
     def init_from_pretrained(self):
@@ -76,6 +78,7 @@ class TransfuserAgent(AbstractAgent):
                 print(f"Missing keys when loading pretrained weights: {missing_keys}")
             if unexpected_keys:
                 print(f"Unexpected keys when loading pretrained weights: {unexpected_keys}")
+            print(f"Loaded checkpoint from: {self._checkpoint_path}")
         else:
             print("No checkpoint path provided. Initializing from scratch.")
     def name(self) -> str:
@@ -91,6 +94,7 @@ class TransfuserAgent(AbstractAgent):
                 "state_dict"
             ]
         self.load_state_dict({k.replace("agent.", ""): v for k, v in state_dict.items()})
+        print(f"Initialized agent from checkpoint: {self._checkpoint_path}")
 
 
     def get_sensor_config(self) -> SensorConfig:
@@ -123,6 +127,8 @@ class TransfuserAgent(AbstractAgent):
     def reset_temporal_context(self) -> None:
         """Clears cached inference trajectory before starting an unrelated scene."""
         self._previous_trajectory = None
+        self._last_temporal_reference_active = False
+        self._last_previous_ego_delta_active = False
 
     def _build_temporal_reference(self, agent_input: AgentInput) -> Optional[np.ndarray]:
         if self._previous_trajectory is None or len(agent_input.ego_statuses) < 2:
@@ -151,6 +157,12 @@ class TransfuserAgent(AbstractAgent):
         previous_ego_pose = agent_input.ego_statuses[-2].ego_pose
         return (-previous_ego_pose[:2]).astype(np.float32)
 
+    def get_temporal_debug_info(self) -> Dict[str, bool]:
+        return {
+            "temporal_reference_active": self._last_temporal_reference_active,
+            "previous_ego_delta_active": self._last_previous_ego_delta_active,
+        }
+
     def compute_trajectory(self, agent_input: AgentInput) -> Trajectory:
         """
         Computes trajectory while passing the previous prediction as a temporal continuity reference.
@@ -169,6 +181,8 @@ class TransfuserAgent(AbstractAgent):
         previous_ego_delta_tensor = None
         if previous_ego_delta is not None:
             previous_ego_delta_tensor = torch.tensor(previous_ego_delta).unsqueeze(0)
+        self._last_temporal_reference_active = previous_trajectory_tensor is not None
+        self._last_previous_ego_delta_active = previous_ego_delta_tensor is not None
 
         with torch.no_grad():
             predictions = self.forward(
