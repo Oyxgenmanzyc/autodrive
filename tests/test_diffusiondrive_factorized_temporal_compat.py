@@ -44,6 +44,21 @@ def _load_trajectory_head():
     return TrajectoryHead
 
 
+def _load_loss_computer():
+    _stub_module("navsim.agents.diffusiondrive.transfuser_config", TransfuserConfig=object)
+    sys.modules.pop("navsim.agents.diffusiondrive.modules.multimodal_loss", None)
+
+    from navsim.agents.diffusiondrive.modules.multimodal_loss import LossComputer
+
+    return LossComputer
+
+
+class _LossConfig:
+    trajectory_cls_weight = 10.0
+    trajectory_reg_weight = 8.0
+    trajectory_weight = 12.0
+
+
 def _make_head():
     TrajectoryHead = _load_trajectory_head()
     head = TrajectoryHead.__new__(TrajectoryHead)
@@ -53,6 +68,15 @@ def _make_head():
     head.temporal_start_weight = 0.25
     head.temporal_path_weight = 0.40
     head.temporal_velocity_weight = 0.35
+    head.temporal_match_start_weight = 0.35
+    head.temporal_match_path_weight = 0.40
+    head.temporal_match_velocity_weight = 0.25
+    head.temporal_aux_start_weight = 0.45
+    head.temporal_aux_path_weight = 0.30
+    head.temporal_aux_velocity_weight = 0.25
+    head.temporal_match_alpha = 0.05
+    head.temporal_match_topk = 3
+    head.temporal_aux_loss_weight = 0.02
     head.temporal_reversal_threshold = 0.5
     return head
 
@@ -214,3 +238,67 @@ def test_low_speed_turn_segments_do_not_create_false_turn_cost():
     reference_delta = torch.tensor([[[[0.0, 0.0], [0.0, 0.0], [0.0, 1.0]]]])
 
     assert torch.all(head._turn_cost(anchor_delta, reference_delta) == 0)
+
+
+def _make_loss_inputs():
+    target_xy = _straight_x(steps=3)
+    target = torch.cat([target_xy, torch.zeros(3, 1)], dim=-1).unsqueeze(0)
+    plan_anchor = torch.zeros(1, 4, 3, 2)
+    plan_anchor[:, 0] = target_xy
+    plan_anchor[:, 1] = target_xy + torch.tensor([0.05, 0.0])
+    plan_anchor[:, 2] = target_xy + torch.tensor([5.0, 0.0])
+    plan_anchor[:, 3] = target_xy + torch.tensor([8.0, 0.0])
+    poses_reg = torch.cat([plan_anchor, torch.zeros(1, 4, 3, 1)], dim=-1)
+    poses_cls = torch.zeros(1, 4)
+    return poses_reg, poses_cls, {"trajectory": target}, plan_anchor
+
+
+def test_temporal_loss_falls_back_to_original_best_mode_without_context():
+    LossComputer = _load_loss_computer()
+    loss_computer = LossComputer(_LossConfig())
+    poses_reg, poses_cls, targets, plan_anchor = _make_loss_inputs()
+
+    mode_idx = loss_computer._select_temporal_aware_mode(
+        torch.linalg.norm(targets["trajectory"].unsqueeze(1)[..., :2] - plan_anchor, dim=-1).mean(dim=-1),
+        temporal_context=None,
+    )
+
+    assert mode_idx.item() == 0
+    assert torch.is_tensor(loss_computer(poses_reg, poses_cls, targets, plan_anchor))
+
+
+def test_temporal_matching_can_choose_lower_cost_mode_inside_topk():
+    LossComputer = _load_loss_computer()
+    loss_computer = LossComputer(_LossConfig())
+    poses_reg, poses_cls, targets, plan_anchor = _make_loss_inputs()
+    temporal_context = {
+        "temporal_match_cost": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        "temporal_match_alpha": 1.0,
+        "temporal_match_topk": 2,
+        "pred_start_cost": torch.tensor([[1.5, 0.2, 0.0, 0.0]]),
+        "pred_path_cost": torch.tensor([[1.5, 0.2, 0.0, 0.0]]),
+        "pred_velocity_cost": torch.tensor([[1.5, 0.2, 0.0, 0.0]]),
+    }
+
+    _, loss_info = loss_computer(poses_reg, poses_cls, targets, plan_anchor, temporal_context)
+
+    assert loss_info["temporal_selected_mode_idx"].item() == 1.0
+    assert torch.allclose(loss_info["temporal_selected_start_cost"], torch.tensor(0.2))
+
+
+def test_temporal_matching_cannot_select_low_cost_mode_outside_topk():
+    LossComputer = _load_loss_computer()
+    loss_computer = LossComputer(_LossConfig())
+    poses_reg, poses_cls, targets, plan_anchor = _make_loss_inputs()
+    temporal_context = {
+        "temporal_match_cost": torch.tensor([[1.0, 0.5, 0.0, 0.0]]),
+        "temporal_match_alpha": 10.0,
+        "temporal_match_topk": 2,
+        "pred_start_cost": torch.zeros(1, 4),
+        "pred_path_cost": torch.zeros(1, 4),
+        "pred_velocity_cost": torch.zeros(1, 4),
+    }
+
+    _, loss_info = loss_computer(poses_reg, poses_cls, targets, plan_anchor, temporal_context)
+
+    assert loss_info["temporal_selected_mode_idx"].item() in (0.0, 1.0)

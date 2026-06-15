@@ -418,6 +418,15 @@ class TrajectoryHead(nn.Module):
         self.temporal_start_weight = 0.25
         self.temporal_path_weight = 0.40
         self.temporal_velocity_weight = 0.35
+        self.temporal_match_start_weight = 0.35
+        self.temporal_match_path_weight = 0.40
+        self.temporal_match_velocity_weight = 0.25
+        self.temporal_aux_start_weight = 0.45
+        self.temporal_aux_path_weight = 0.30
+        self.temporal_aux_velocity_weight = 0.25
+        self.temporal_match_alpha = 0.05
+        self.temporal_match_topk = 3
+        self.temporal_aux_loss_weight = 0.02
         self.temporal_reversal_threshold = 0.5
 
         self.diffusion_scheduler = DDIMScheduler(
@@ -618,6 +627,54 @@ class TrajectoryHead(nn.Module):
             + self.temporal_velocity_weight * velocity_cost.clamp(max=2.0)
         )
 
+    def _weighted_temporal_cost(
+        self,
+        start_cost,
+        path_cost,
+        velocity_cost,
+        start_weight,
+        path_weight,
+        velocity_weight,
+    ):
+        if start_cost is None or path_cost is None or velocity_cost is None:
+            return None
+
+        return (
+            start_weight * start_cost.clamp(max=2.0)
+            + path_weight * path_cost.clamp(max=2.0)
+            + velocity_weight * velocity_cost.clamp(max=2.0)
+        )
+
+    def _temporal_loss_context(self, candidates, previous_trajectory, previous_ego_delta=None):
+        start_cost, path_cost, velocity_cost = self._temporal_compatibility_components(
+            candidates,
+            previous_trajectory,
+            previous_ego_delta,
+        )
+        temporal_match_cost = self._weighted_temporal_cost(
+            start_cost,
+            path_cost,
+            velocity_cost,
+            self.temporal_match_start_weight,
+            self.temporal_match_path_weight,
+            self.temporal_match_velocity_weight,
+        )
+        if temporal_match_cost is None:
+            return None
+
+        return {
+            "pred_start_cost": start_cost,
+            "pred_path_cost": path_cost,
+            "pred_velocity_cost": velocity_cost,
+            "temporal_match_cost": temporal_match_cost.detach(),
+            "temporal_match_alpha": self.temporal_match_alpha,
+            "temporal_match_topk": self.temporal_match_topk,
+            "temporal_aux_loss_weight": self.temporal_aux_loss_weight,
+            "temporal_aux_start_weight": self.temporal_aux_start_weight,
+            "temporal_aux_path_weight": self.temporal_aux_path_weight,
+            "temporal_aux_velocity_weight": self.temporal_aux_velocity_weight,
+        }
+
     def _temporal_noise_scale(self, plan_anchor, previous_trajectory, previous_ego_delta=None):
         temporal_cost = self._temporal_compatibility_cost(plan_anchor, previous_trajectory, previous_ego_delta)
         if temporal_cost is None:
@@ -647,19 +704,13 @@ class TrajectoryHead(nn.Module):
             (bs,), device=device
         )
         noise = torch.randn(odo_info_fut.shape, device=device)
-        temporal_noise_scale = self._temporal_noise_scale(plan_anchor, previous_trajectory, previous_ego_delta)
+        anchor_temporal_context = self._temporal_loss_context(plan_anchor, previous_trajectory, previous_ego_delta)
         temporal_metrics = {}
-        if temporal_noise_scale is not None:
-            noise = noise * temporal_noise_scale
-            start_cost, path_cost, velocity_cost = self._temporal_compatibility_components(
-                plan_anchor,
-                previous_trajectory,
-                previous_ego_delta,
-            )
+        if anchor_temporal_context is not None:
             temporal_metrics = {
-                "temporal_start_cost": start_cost.mean().detach(),
-                "temporal_path_cost": path_cost.mean().detach(),
-                "temporal_velocity_cost": velocity_cost.mean().detach(),
+                "temporal_start_cost": anchor_temporal_context["pred_start_cost"].mean().detach(),
+                "temporal_path_cost": anchor_temporal_context["pred_path_cost"].mean().detach(),
+                "temporal_velocity_cost": anchor_temporal_context["pred_velocity_cost"].mean().detach(),
             }
         noisy_traj_points = self.diffusion_scheduler.add_noise(
             original_samples=odo_info_fut,
@@ -686,7 +737,32 @@ class TrajectoryHead(nn.Module):
         trajectory_loss_dict = {}
         ret_traj_loss = 0
         for idx, (poses_reg, poses_cls) in enumerate(zip(poses_reg_list, poses_cls_list)):
-            trajectory_loss = self.loss_computer(poses_reg, poses_cls, targets, plan_anchor)
+            temporal_context = None
+            if anchor_temporal_context is not None:
+                pred_temporal_context = self._temporal_loss_context(
+                    poses_reg[..., :2],
+                    previous_trajectory,
+                    previous_ego_delta,
+                )
+                if pred_temporal_context is not None:
+                    temporal_context = dict(pred_temporal_context)
+                    temporal_context["temporal_match_cost"] = anchor_temporal_context[
+                        "temporal_match_cost"
+                    ]
+            trajectory_loss_output = self.loss_computer(
+                poses_reg,
+                poses_cls,
+                targets,
+                plan_anchor,
+                temporal_context=temporal_context,
+            )
+            if isinstance(trajectory_loss_output, tuple):
+                trajectory_loss, temporal_loss_dict = trajectory_loss_output
+                for key, value in temporal_loss_dict.items():
+                    if key != "trajectory_scaled_temporal_aux_loss":
+                        trajectory_loss_dict[f"{key}_{idx}"] = value
+            else:
+                trajectory_loss = trajectory_loss_output
             trajectory_loss_dict[f"trajectory_loss_{idx}"] = trajectory_loss
             ret_traj_loss += trajectory_loss
 

@@ -298,3 +298,35 @@ CHANGELOG.txt
 
 与论文撰写的关系：
 该修复用于保证 3.5 验证流程正确反映 temporal reference 机制，不作为新的训练实验变量。
+
+修改主题：3.6 Connection-Aware Auxiliary Temporal Loss
+修改日期：2026-06-15
+
+修改目的：
+基于 3.5 loss-aware mixed-reference temporal training，保留训练阶段的相邻帧 pair 和 mixed reference 逻辑，但将 temporal connection 从“主要调制 diffusion noise”改为“轻量 auxiliary temporal loss + temporal-aware best mode matching”。该版本不修改 eval / PDM 验证流程，验证阶段仍使用真实 historical ego motion + 上一帧模型预测 p0,p1,p2。
+
+涉及文件：
+navsim/agents/diffusiondrive/transfuser_model_v2.py
+navsim/agents/diffusiondrive/modules/multimodal_loss.py
+tests/test_diffusiondrive_factorized_temporal_compat.py
+CHANGELOG.txt
+
+核心改动：
+1. 保留 3.5 的 temporal pair training 与 loss-aware mixed reference。训练早期仍以 GT p0,p1,p2 为主，loss EMA 改善后逐步混入上一帧模型预测 reference。
+2. 统一 connection cost 语义：executed_delta 对 q0，p1-p0 对 q1-q0，p2-p1 对 q2-q1。
+3. 训练阶段默认关闭 temporal noise modulation，不再使用 noise_strength=0.2 干扰原 DiffusionDrive 训练噪声分布；forward_test / eval 行为保持不变。
+4. 新增 temporal-aware best mode matching：先按 GT distance 找 top-K mode，K=3；再在 top-K 内用 GT distance + alpha_match * temporal_cost 选择监督 mode。
+5. matching cost 使用独立参数：alpha_match=0.05，start/path/velocity 权重为 0.35/0.40/0.25。
+6. 新增轻量 auxiliary temporal loss，只作用于选中的 best mode，不约束全部 20 个 mode，避免压制多模态。
+7. auxiliary loss 权重为 lambda_temporal=0.02，start/path/velocity 权重为 0.45/0.30/0.25。
+8. temporal 输入无效时完全回退原始训练逻辑：原 GT mode assignment、原 trajectory loss、无 auxiliary temporal loss。
+9. 训练日志新增 temporal_aux_loss、temporal_match_cost、temporal_selected_start/path/velocity_cost 等辅助指标，便于服务器端判断 temporal connection 是否真实参与训练。
+
+预期影响：
+3.6 试图避免 3.4/3.5 中直接调制 diffusion noise 带来的训练分布扰动。模型仍按原 DiffusionDrive 噪声分布学习主任务，同时通过小权重 temporal auxiliary loss 学习近端连接自然性，并通过 top-K temporal-aware matching 在多个接近 GT 的候选中偏向历史连接更合理的 mode。
+
+测试/验证结果：
+本地不运行测试、pytest、manual runner 或 smoke。轻量测试文件已更新，等待服务器 smoke/full validation。
+
+与论文撰写的关系：
+3.6 可作为“connection-aware auxiliary temporal supervision”版本，用于论证 temporal connection 更适合作为轻量训练监督和 mode matching 偏好，而不是直接大幅改变 diffusion noise 分布。该版本保留真实 executed ego motion 作为 start 因子的主参考，同时保留 p0,p1,p2 近端预测趋势作为 path/velocity 辅助参考。
