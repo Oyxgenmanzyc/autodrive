@@ -413,8 +413,8 @@ class TrajectoryHead(nn.Module):
         self.diff_loss_weight = 2.0
         self.ego_fut_mode = 20
         self.temporal_noise_strength = 0.2
-        self.temporal_noise_min_scale = 0.85
-        self.temporal_noise_max_scale = 1.25
+        self.temporal_noise_min_scale = 0.88
+        self.temporal_noise_max_scale = 1.35
         self.temporal_start_weight = 0.25
         self.temporal_path_weight = 0.40
         self.temporal_velocity_weight = 0.35

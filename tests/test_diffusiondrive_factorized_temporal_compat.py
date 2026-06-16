@@ -48,8 +48,8 @@ def _make_head():
     TrajectoryHead = _load_trajectory_head()
     head = TrajectoryHead.__new__(TrajectoryHead)
     head.temporal_noise_strength = 0.2
-    head.temporal_noise_min_scale = 0.85
-    head.temporal_noise_max_scale = 1.25
+    head.temporal_noise_min_scale = 0.88
+    head.temporal_noise_max_scale = 1.35
     head.temporal_start_weight = 0.25
     head.temporal_path_weight = 0.40
     head.temporal_velocity_weight = 0.35

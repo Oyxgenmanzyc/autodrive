@@ -261,3 +261,31 @@ CHANGELOG.txt
 
 与论文撰写的关系：
 该修复用于保证 3.4 验证流程正确反映 temporal reference 机制，不作为新的训练实验变量。
+
+修改主题：3.7 Enhanced GT-guided Temporal Noise Scale
+修改日期：2026-06-16
+
+修改目的：
+在 3.4 GT-guided connection-aligned temporal training 的基础上，单独放大 test-time temporal noise modulation 的作用强度，用于验证此前保守噪声范围是否导致 temporal 模块对 PDM 结果影响过弱。
+
+涉及文件：
+navsim/agents/diffusiondrive/transfuser_model_v2.py
+tests/test_diffusiondrive_factorized_temporal_compat.py
+CHANGELOG.txt
+
+核心改动：
+1. 基于 3.4 分支创建 3.7 实验分支，不叠加 3.5 mixed reference、3.6 auxiliary temporal loss 或 4.1 distribution-aware noise。
+2. 将 TrajectoryHead 的 temporal_noise_min_scale 从 0.85 调整为 0.88。
+3. 将 TrajectoryHead 的 temporal_noise_max_scale 从 1.25 调整为 1.35。
+4. 采用非对称增强：高兼容 anchor 只小幅降低噪声，低兼容 anchor 更明显提高噪声。
+5. 不删除、不屏蔽、不新增 anchor；不修改训练路径、loss、decoder mode、分类头或 PDM scoring 流程。
+6. 更新轻量测试中的 noise scale 设定，使测试约束与 3.7 参数一致。
+
+预期影响：
+3.7 用于判断 3.4 的 temporal reference 与 connection cost 是否因为 test-time noise modulation 过保守而难以影响最终轨迹。如果 3.7 相比 3.4 出现明显 PDM 波动，说明噪声调制强度是关键变量；如果仍基本不变，则说明仅靠 inference-time noise modulation 的影响有限，需要更多依赖 train-time auxiliary loss 或 mode matching。
+
+测试/验证结果：
+本地不运行测试、pytest、manual runner 或 smoke。轻量测试文件已同步参数，等待服务器 smoke/full validation。
+
+与论文撰写的关系：
+3.7 可作为 3.4 的 test-time noise strength 消融实验，用于说明 temporal compatibility 作为推理期噪声调制项时，保守范围与增强范围对最终 PDM 的影响差异。
