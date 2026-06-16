@@ -44,6 +44,15 @@ def _load_trajectory_head():
     return TrajectoryHead
 
 
+def _load_loss_computer():
+    sys.modules.pop("navsim.agents.diffusiondrive.modules.multimodal_loss", None)
+    _stub_module("navsim.agents.diffusiondrive.transfuser_config", TransfuserConfig=object)
+
+    from navsim.agents.diffusiondrive.modules.multimodal_loss import LossComputer
+
+    return LossComputer
+
+
 def _make_head():
     TrajectoryHead = _load_trajectory_head()
     head = TrajectoryHead.__new__(TrajectoryHead)
@@ -55,6 +64,17 @@ def _make_head():
     head.temporal_velocity_weight = 0.35
     head.temporal_reversal_threshold = 0.5
     return head
+
+
+def _make_loss_computer():
+    LossComputer = _load_loss_computer()
+
+    class _Config:
+        trajectory_cls_weight = 1.0
+        trajectory_reg_weight = 1.0
+        trajectory_weight = 12.0
+
+    return LossComputer(_Config())
 
 
 def _straight_x(scale=1.0, steps=8):
@@ -214,3 +234,108 @@ def test_low_speed_turn_segments_do_not_create_false_turn_cost():
     reference_delta = torch.tensor([[[[0.0, 0.0], [0.0, 0.0], [0.0, 1.0]]]])
 
     assert torch.all(head._turn_cost(anchor_delta, reference_delta) == 0)
+
+
+def _energy_test_inputs():
+    poses_reg = torch.zeros(1, 5, 8, 3)
+    plan_anchor = torch.zeros(1, 5, 8, 2)
+    target = {"trajectory": torch.zeros(1, 8, 3)}
+    for mode_idx, offset in enumerate([0.0, 0.2, 0.4, 4.0, 5.0]):
+        plan_anchor[:, mode_idx, :, 0] = offset
+        poses_reg[:, mode_idx, :, 0] = offset
+    poses_cls = torch.zeros(1, 5)
+    return poses_reg, poses_cls, target, plan_anchor
+
+
+def _energy_context(epoch, temporal_cost=None):
+    if temporal_cost is None:
+        temporal_cost = torch.tensor([[2.0, 0.0, 1.0, 0.0, 0.0]])
+    return {
+        "energy_temporal_cost": temporal_cost,
+        "energy_comfort_cost": torch.zeros_like(temporal_cost),
+        "energy_speed_cost": torch.zeros_like(temporal_cost),
+        "energy_training_epoch": epoch,
+        "energy_topk": 3,
+        "energy_temperature": 0.5,
+        "energy_start_epoch": 70,
+        "energy_full_epoch": 85,
+        "energy_target_gamma_max": 0.5,
+        "energy_aux_weight_max": 0.12,
+        "energy_gt_weight": 0.60,
+        "energy_temporal_weight": 0.30,
+        "energy_comfort_weight": 0.10,
+        "energy_aux_temporal_weight": 0.50,
+        "energy_aux_comfort_weight": 0.30,
+        "energy_aux_speed_weight": 0.20,
+    }
+
+
+def test_energy_supervision_inactive_before_late_epoch_matches_original_loss():
+    loss_computer = _make_loss_computer()
+    poses_reg, poses_cls, target, plan_anchor = _energy_test_inputs()
+
+    original_loss = loss_computer(poses_reg, poses_cls, target, plan_anchor)
+    early_loss = loss_computer(
+        poses_reg,
+        poses_cls,
+        target,
+        plan_anchor,
+        temporal_context=_energy_context(epoch=69),
+    )
+
+    assert torch.allclose(original_loss, early_loss)
+
+
+def test_energy_soft_target_prefers_low_energy_mode_inside_gt_topk():
+    loss_computer = _make_loss_computer()
+    poses_reg, poses_cls, target, plan_anchor = _energy_test_inputs()
+    dist = torch.linalg.norm(target["trajectory"].unsqueeze(1)[..., :2] - plan_anchor, dim=-1).mean(dim=-1)
+    cls_target = torch.argmin(dist, dim=-1)
+
+    energy_info = loss_computer._energy_supervision(
+        poses_reg,
+        target["trajectory"],
+        dist,
+        cls_target,
+        _energy_context(epoch=85),
+    )
+    cls_soft_target = energy_info["cls_soft_target"]
+
+    assert cls_soft_target[0, 1] > 0.0
+    assert cls_soft_target[0, 1] > cls_soft_target[0, 2]
+
+
+def test_energy_supervision_does_not_reward_mode_outside_gt_topk():
+    loss_computer = _make_loss_computer()
+    poses_reg, poses_cls, target, plan_anchor = _energy_test_inputs()
+    dist = torch.linalg.norm(target["trajectory"].unsqueeze(1)[..., :2] - plan_anchor, dim=-1).mean(dim=-1)
+    cls_target = torch.argmin(dist, dim=-1)
+    temporal_cost = torch.tensor([[2.0, 2.0, 2.0, 2.0, -10.0]])
+
+    energy_info = loss_computer._energy_supervision(
+        poses_reg,
+        target["trajectory"],
+        dist,
+        cls_target,
+        _energy_context(epoch=85, temporal_cost=temporal_cost),
+    )
+
+    assert energy_info["cls_soft_target"][0, 4] == 0.0
+
+
+def test_energy_soft_weights_are_detached_from_backprop_target():
+    loss_computer = _make_loss_computer()
+    poses_reg, poses_cls, target, plan_anchor = _energy_test_inputs()
+    poses_reg.requires_grad_(True)
+    dist = torch.linalg.norm(target["trajectory"].unsqueeze(1)[..., :2] - plan_anchor, dim=-1).mean(dim=-1)
+    cls_target = torch.argmin(dist, dim=-1)
+
+    energy_info = loss_computer._energy_supervision(
+        poses_reg,
+        target["trajectory"],
+        dist,
+        cls_target,
+        _energy_context(epoch=85),
+    )
+
+    assert not energy_info["cls_soft_target"].requires_grad

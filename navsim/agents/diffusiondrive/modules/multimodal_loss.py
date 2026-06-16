@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import functools
-from typing import Callable, Optional
+from typing import Callable, Dict, Optional
 from torch import Tensor
 from navsim.agents.diffusiondrive.transfuser_config import TransfuserConfig
 # from mmcv.ops import sigmoid_focal_loss as _sigmoid_focal_loss
@@ -121,7 +121,133 @@ class LossComputer(nn.Module):
         # self.focal_loss = FocalLoss(use_sigmoid=True, gamma=2.0, alpha=0.25, reduction='mean', loss_weight=1.0, activated=False)
         self.cls_loss_weight = config.trajectory_cls_weight
         self.reg_loss_weight = config.trajectory_reg_weight
-    def forward(self, poses_reg, poses_cls, targets, plan_anchor):
+        self.energy_topk = 3
+        self.energy_temperature = 0.5
+        self.energy_start_epoch = 70
+        self.energy_full_epoch = 85
+        self.energy_target_gamma_max = 0.5
+        self.energy_aux_weight_max = 0.12
+        self.energy_gt_weight = 0.60
+        self.energy_temporal_weight = 0.30
+        self.energy_comfort_weight = 0.10
+        self.energy_aux_temporal_weight = 0.50
+        self.energy_aux_comfort_weight = 0.30
+        self.energy_aux_speed_weight = 0.20
+
+    @staticmethod
+    def _as_schedule_tensor(value, device, dtype):
+        if value is None:
+            return None
+        if torch.is_tensor(value):
+            return value.to(device=device, dtype=dtype)
+        return torch.tensor(float(value), device=device, dtype=dtype)
+
+    @staticmethod
+    def _standardize_topk(values: Tensor) -> Tensor:
+        mean = values.mean(dim=1, keepdim=True)
+        std = values.std(dim=1, unbiased=False, keepdim=True)
+        return (values - mean) / (std + 1e-6)
+
+    @staticmethod
+    def _gather_topk(values: Tensor, topk_idx: Tensor) -> Tensor:
+        return torch.gather(values, 1, topk_idx)
+
+    def _energy_ramp(self, temporal_context: Dict[str, Tensor], device, dtype) -> Tensor:
+        epoch = self._as_schedule_tensor(temporal_context.get("energy_training_epoch"), device, dtype)
+        if epoch is None:
+            return torch.zeros((), device=device, dtype=dtype)
+        start_epoch = float(temporal_context.get("energy_start_epoch", self.energy_start_epoch))
+        full_epoch = float(temporal_context.get("energy_full_epoch", self.energy_full_epoch))
+        return ((epoch - start_epoch) / (full_epoch - start_epoch + 1e-6)).clamp(0.0, 1.0)
+
+    def _energy_supervision(
+        self,
+        poses_reg: Tensor,
+        target_traj: Tensor,
+        dist: Tensor,
+        cls_target: Tensor,
+        temporal_context: Optional[Dict[str, Tensor]],
+    ) -> Optional[Dict[str, Tensor]]:
+        if temporal_context is None:
+            return None
+
+        required_keys = ("energy_temporal_cost", "energy_comfort_cost", "energy_speed_cost")
+        if any(key not in temporal_context for key in required_keys):
+            return None
+
+        device = poses_reg.device
+        dtype = poses_reg.dtype
+        ramp = self._energy_ramp(temporal_context, device, dtype)
+        if ramp.item() <= 0.0:
+            return None
+
+        temporal_cost = temporal_context["energy_temporal_cost"].to(device=device, dtype=dtype)
+        comfort_cost = temporal_context["energy_comfort_cost"].to(device=device, dtype=dtype)
+        speed_cost = temporal_context["energy_speed_cost"].to(device=device, dtype=dtype)
+        if temporal_cost.shape != dist.shape or comfort_cost.shape != dist.shape or speed_cost.shape != dist.shape:
+            return None
+        if not (torch.isfinite(temporal_cost).all() and torch.isfinite(comfort_cost).all() and torch.isfinite(speed_cost).all()):
+            return None
+
+        topk = int(temporal_context.get("energy_topk", self.energy_topk))
+        topk = max(1, min(topk, dist.shape[1]))
+        _, topk_idx = torch.topk(dist, k=topk, dim=-1, largest=False)
+
+        gt_distance = torch.linalg.norm(target_traj.unsqueeze(1)[..., :2] - poses_reg[..., :2], dim=-1).mean(dim=-1)
+        topk_gt = self._gather_topk(gt_distance, topk_idx)
+        topk_temporal = self._gather_topk(temporal_cost, topk_idx)
+        topk_comfort = self._gather_topk(comfort_cost, topk_idx)
+        topk_speed = self._gather_topk(speed_cost, topk_idx)
+
+        gt_weight = float(temporal_context.get("energy_gt_weight", self.energy_gt_weight))
+        temporal_weight = float(temporal_context.get("energy_temporal_weight", self.energy_temporal_weight))
+        comfort_weight = float(temporal_context.get("energy_comfort_weight", self.energy_comfort_weight))
+        energy = (
+            gt_weight * self._standardize_topk(topk_gt)
+            + temporal_weight * self._standardize_topk(topk_temporal)
+            + comfort_weight * self._standardize_topk(topk_comfort)
+        )
+        temperature = max(float(temporal_context.get("energy_temperature", self.energy_temperature)), 1e-3)
+        topk_prob = torch.softmax(-energy / temperature, dim=1).detach()
+
+        bs, num_mode = dist.shape
+        energy_target = torch.zeros([bs, num_mode], dtype=dtype, device=device)
+        energy_target.scatter_(1, topk_idx, topk_prob)
+        one_hot_target = torch.zeros([bs, num_mode], dtype=dtype, device=device)
+        one_hot_target.scatter_(1, cls_target.unsqueeze(1), 1)
+        target_gamma = ramp * float(temporal_context.get("energy_target_gamma_max", self.energy_target_gamma_max))
+        cls_soft_target = (1.0 - target_gamma) * one_hot_target + target_gamma * energy_target
+
+        reg_per_mode = torch.abs(poses_reg - target_traj.unsqueeze(1)).mean(dim=(-1, -2))
+        topk_reg = self._gather_topk(reg_per_mode, topk_idx)
+        aux_temporal_weight = float(temporal_context.get("energy_aux_temporal_weight", self.energy_aux_temporal_weight))
+        aux_comfort_weight = float(temporal_context.get("energy_aux_comfort_weight", self.energy_aux_comfort_weight))
+        aux_speed_weight = float(temporal_context.get("energy_aux_speed_weight", self.energy_aux_speed_weight))
+        weighted_quality = (
+            topk_reg
+            + aux_temporal_weight * topk_temporal.clamp(max=2.0)
+            + aux_comfort_weight * topk_comfort.clamp(max=2.0)
+            + aux_speed_weight * topk_speed.clamp(max=2.0)
+        )
+        aux_raw = (topk_prob * weighted_quality).sum(dim=1).mean()
+        aux_weight = ramp * float(temporal_context.get("energy_aux_weight_max", self.energy_aux_weight_max))
+        aux_loss = aux_weight * aux_raw
+
+        entropy = -(topk_prob * torch.log(topk_prob + 1e-6)).sum(dim=1).mean()
+        return {
+            "cls_soft_target": cls_soft_target,
+            "energy_aux_loss": aux_loss,
+            "energy_aux_raw": aux_raw.detach(),
+            "energy_supervision_weight": aux_weight.detach(),
+            "energy_target_gamma": target_gamma.detach(),
+            "energy_soft_entropy": entropy.detach(),
+            "energy_selected_cost": (topk_prob * energy).sum(dim=1).mean().detach(),
+            "energy_weighted_temporal_cost": (topk_prob * topk_temporal).sum(dim=1).mean().detach(),
+            "energy_weighted_comfort_cost": (topk_prob * topk_comfort).sum(dim=1).mean().detach(),
+            "energy_weighted_speed_cost": (topk_prob * topk_speed).sum(dim=1).mean().detach(),
+        }
+
+    def forward(self, poses_reg, poses_cls, targets, plan_anchor, temporal_context: Optional[Dict[str, Tensor]]=None):
         """
         pred_traj: (bs, 20, 8, 3)
         pred_cls: (bs, 20)
@@ -136,6 +262,7 @@ class LossComputer(nn.Module):
         cls_target = mode_idx
         mode_idx = mode_idx[...,None,None,None].repeat(1,1,ts,d)
         best_reg = torch.gather(poses_reg, 1, mode_idx).squeeze(1)
+        mode_idx_flat = cls_target
         # import ipdb; ipdb.set_trace()
         # Calculate cls loss using focal loss
         target_classes_onehot = torch.zeros([bs, num_mode],
@@ -143,11 +270,19 @@ class LossComputer(nn.Module):
                                             layout=poses_cls.layout,
                                             device=poses_cls.device)
         target_classes_onehot.scatter_(1, cls_target.unsqueeze(1), 1)
+        energy_info = self._energy_supervision(
+            poses_reg,
+            target_traj,
+            dist,
+            mode_idx_flat,
+            temporal_context,
+        )
+        cls_target_tensor = target_classes_onehot if energy_info is None else energy_info["cls_soft_target"]
 
         # Use py_sigmoid_focal_loss function for focal loss calculation
         loss_cls = self.cls_loss_weight * py_sigmoid_focal_loss(
             poses_cls,
-            target_classes_onehot,
+            cls_target_tensor,
             weight=None,
             gamma=2.0,
             alpha=0.25,
@@ -160,4 +295,12 @@ class LossComputer(nn.Module):
         # import ipdb; ipdb.set_trace()
         # Combine classification and regression losses
         ret_loss = loss_cls + reg_loss
+        if energy_info is not None:
+            ret_loss = ret_loss + energy_info["energy_aux_loss"]
+            logged_energy_info = {
+                key: value.detach() if torch.is_tensor(value) else value
+                for key, value in energy_info.items()
+                if key != "cls_soft_target"
+            }
+            return ret_loss, logged_energy_info
         return ret_loss

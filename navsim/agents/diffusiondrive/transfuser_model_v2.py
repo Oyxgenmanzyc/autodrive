@@ -98,6 +98,7 @@ class V2TransfuserModel(nn.Module):
         targets: Dict[str, torch.Tensor]=None,
         previous_trajectory: Optional[torch.Tensor]=None,
         previous_ego_delta: Optional[torch.Tensor]=None,
+        training_epoch: Optional[int]=None,
     ) -> Dict[str, torch.Tensor]:
         """Torch module forward pass."""
 
@@ -145,6 +146,7 @@ class V2TransfuserModel(nn.Module):
             global_img=None,
             previous_trajectory=previous_trajectory,
             previous_ego_delta=previous_ego_delta,
+            training_epoch=training_epoch,
         )
         output.update(trajectory)
 
@@ -419,6 +421,18 @@ class TrajectoryHead(nn.Module):
         self.temporal_path_weight = 0.40
         self.temporal_velocity_weight = 0.35
         self.temporal_reversal_threshold = 0.5
+        self.energy_topk = 3
+        self.energy_temperature = 0.5
+        self.energy_start_epoch = 70
+        self.energy_full_epoch = 85
+        self.energy_target_gamma_max = 0.5
+        self.energy_aux_weight_max = 0.12
+        self.energy_gt_weight = 0.60
+        self.energy_temporal_weight = 0.30
+        self.energy_comfort_weight = 0.10
+        self.energy_aux_temporal_weight = 0.50
+        self.energy_aux_comfort_weight = 0.30
+        self.energy_aux_speed_weight = 0.20
 
         self.diffusion_scheduler = DDIMScheduler(
             num_train_timesteps=1000,
@@ -618,6 +632,81 @@ class TrajectoryHead(nn.Module):
             + self.temporal_velocity_weight * velocity_cost.clamp(max=2.0)
         )
 
+    def _trajectory_comfort_cost(self, candidates):
+        xy = candidates[..., :2]
+        deltas = self._point_deltas(xy)
+        speed = torch.linalg.norm(deltas, dim=-1)
+        if speed.shape[-1] >= 4:
+            accel = speed[..., 1:] - speed[..., :-1]
+            jerk = accel[..., 1:] - accel[..., :-1]
+            jerk_cost = jerk.abs().mean(dim=-1)
+        else:
+            jerk_cost = torch.zeros_like(speed[..., 0])
+
+        if deltas.shape[-2] >= 4:
+            eps = 1e-6
+            heading = torch.atan2(deltas[..., 1], deltas[..., 0])
+            turn = torch.atan2(
+                torch.sin(heading[..., 1:] - heading[..., :-1]),
+                torch.cos(heading[..., 1:] - heading[..., :-1]),
+            )
+            turn_delta = torch.atan2(
+                torch.sin(turn[..., 1:] - turn[..., :-1]),
+                torch.cos(turn[..., 1:] - turn[..., :-1]),
+            ).abs() / np.pi
+            valid = (speed[..., 2:] > eps) & (speed[..., 1:-1] > eps) & (speed[..., :-2] > eps)
+            turn_delta = torch.where(valid, turn_delta, torch.zeros_like(turn_delta))
+            turn_smooth_cost = turn_delta.mean(dim=-1)
+        else:
+            turn_smooth_cost = torch.zeros_like(speed[..., 0])
+
+        return 0.5 * jerk_cost.clamp(max=2.0) + 0.5 * turn_smooth_cost.clamp(max=2.0)
+
+    def _trajectory_speed_profile_cost(self, candidates):
+        xy = candidates[..., :2]
+        deltas = self._point_deltas(xy)
+        speed = torch.linalg.norm(deltas, dim=-1)
+        if speed.shape[-1] < 2:
+            return torch.zeros_like(speed[..., 0])
+        accel = speed[..., 1:] - speed[..., :-1]
+        return accel.abs().mean(dim=-1).clamp(max=2.0)
+
+    def _energy_loss_context(self, candidates, previous_trajectory, previous_ego_delta=None, training_epoch=None):
+        start_cost, path_cost, velocity_cost = self._temporal_compatibility_components(
+            candidates,
+            previous_trajectory,
+            previous_ego_delta,
+        )
+        if start_cost is None:
+            return None
+
+        temporal_cost = (
+            self.temporal_start_weight * start_cost.clamp(max=2.0)
+            + self.temporal_path_weight * path_cost.clamp(max=2.0)
+            + self.temporal_velocity_weight * velocity_cost.clamp(max=2.0)
+        )
+        return {
+            "energy_temporal_cost": temporal_cost,
+            "energy_start_cost": start_cost,
+            "energy_path_cost": path_cost,
+            "energy_velocity_cost": velocity_cost,
+            "energy_comfort_cost": self._trajectory_comfort_cost(candidates),
+            "energy_speed_cost": self._trajectory_speed_profile_cost(candidates),
+            "energy_training_epoch": training_epoch,
+            "energy_topk": self.energy_topk,
+            "energy_temperature": self.energy_temperature,
+            "energy_start_epoch": self.energy_start_epoch,
+            "energy_full_epoch": self.energy_full_epoch,
+            "energy_target_gamma_max": self.energy_target_gamma_max,
+            "energy_aux_weight_max": self.energy_aux_weight_max,
+            "energy_gt_weight": self.energy_gt_weight,
+            "energy_temporal_weight": self.energy_temporal_weight,
+            "energy_comfort_weight": self.energy_comfort_weight,
+            "energy_aux_temporal_weight": self.energy_aux_temporal_weight,
+            "energy_aux_comfort_weight": self.energy_aux_comfort_weight,
+            "energy_aux_speed_weight": self.energy_aux_speed_weight,
+        }
+
     def _temporal_noise_scale(self, plan_anchor, previous_trajectory, previous_ego_delta=None):
         temporal_cost = self._temporal_compatibility_cost(plan_anchor, previous_trajectory, previous_ego_delta)
         if temporal_cost is None:
@@ -628,15 +717,15 @@ class TrajectoryHead(nn.Module):
         noise_scale = noise_scale.clamp(self.temporal_noise_min_scale, self.temporal_noise_max_scale)
         return noise_scale[:, :, None, None]
 
-    def forward(self, ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None,previous_trajectory=None,previous_ego_delta=None) -> Dict[str, torch.Tensor]:
+    def forward(self, ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None,previous_trajectory=None,previous_ego_delta=None,training_epoch=None) -> Dict[str, torch.Tensor]:
         """Torch module forward pass."""
         if self.training:
-            return self.forward_train(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,targets,global_img,previous_trajectory,previous_ego_delta)
+            return self.forward_train(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,targets,global_img,previous_trajectory,previous_ego_delta,training_epoch)
         else:
             return self.forward_test(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,global_img,previous_trajectory,previous_ego_delta)
 
 
-    def forward_train(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None,previous_trajectory=None,previous_ego_delta=None) -> Dict[str, torch.Tensor]:
+    def forward_train(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None,previous_trajectory=None,previous_ego_delta=None,training_epoch=None) -> Dict[str, torch.Tensor]:
         bs = ego_query.shape[0]
         device = ego_query.device
         # 1. add truncated noise to the plan anchor
@@ -686,7 +775,26 @@ class TrajectoryHead(nn.Module):
         trajectory_loss_dict = {}
         ret_traj_loss = 0
         for idx, (poses_reg, poses_cls) in enumerate(zip(poses_reg_list, poses_cls_list)):
-            trajectory_loss = self.loss_computer(poses_reg, poses_cls, targets, plan_anchor)
+            energy_context = self._energy_loss_context(
+                poses_reg[..., :2],
+                previous_trajectory,
+                previous_ego_delta,
+                training_epoch,
+            )
+            trajectory_loss_output = self.loss_computer(
+                poses_reg,
+                poses_cls,
+                targets,
+                plan_anchor,
+                temporal_context=energy_context,
+            )
+            if isinstance(trajectory_loss_output, tuple):
+                trajectory_loss, energy_loss_dict = trajectory_loss_output
+                for key, value in energy_loss_dict.items():
+                    if key != "trajectory_scaled_energy_aux_loss":
+                        trajectory_loss_dict[f"{key}_{idx}"] = value
+            else:
+                trajectory_loss = trajectory_loss_output
             trajectory_loss_dict[f"trajectory_loss_{idx}"] = trajectory_loss
             ret_traj_loss += trajectory_loss
 

@@ -1,5 +1,6 @@
 import pytorch_lightning as pl
 import torch
+import inspect
 
 from torch import Tensor
 from typing import Any, Dict, Tuple
@@ -18,6 +19,11 @@ class AgentLightningModule(pl.LightningModule):
         super().__init__()
         self.agent = agent
 
+    def _agent_forward(self, features: Dict[str, Tensor], targets: Dict[str, Tensor], **kwargs) -> Dict[str, Tensor]:
+        forward_signature = inspect.signature(self.agent.forward)
+        supported_kwargs = {key: value for key, value in kwargs.items() if key in forward_signature.parameters}
+        return self.agent.forward(features, targets, **supported_kwargs)
+
     def _step(self, batch: Tuple[Dict[str, Tensor], Dict[str, Tensor]], logging_prefix: str) -> Tensor:
         """
         Propagates the model forward and backwards and computes/logs losses and metrics.
@@ -26,7 +32,7 @@ class AgentLightningModule(pl.LightningModule):
         :return: scalar loss
         """
         features, targets = batch
-        prediction = self.agent.forward(features, targets)
+        prediction = self._agent_forward(features, targets, training_epoch=self.current_epoch)
         # loss = self.agent.compute_loss(features, targets, prediction)
         # self.log(f"{logging_prefix}/loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         # return loss
@@ -116,11 +122,12 @@ class TemporalPairAgentLightningModule(AgentLightningModule):
             previous_ego_pose,
         )
 
-        curr_prediction = self.agent.forward(
+        curr_prediction = self._agent_forward(
             curr_features,
             curr_targets,
             previous_trajectory=previous_trajectory,
             previous_ego_delta=previous_ego_delta,
+            training_epoch=self.current_epoch,
         )
         loss_dict = self.agent.compute_loss(curr_features, curr_targets, curr_prediction)
         batch_size = self._batch_size(curr_features)

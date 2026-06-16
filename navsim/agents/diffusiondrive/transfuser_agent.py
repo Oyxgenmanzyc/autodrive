@@ -115,6 +115,7 @@ class TransfuserAgent(AbstractAgent):
         targets: Dict[str, torch.Tensor]=None,
         previous_trajectory: Optional[torch.Tensor]=None,
         previous_ego_delta: Optional[torch.Tensor]=None,
+        training_epoch: Optional[int]=None,
     ) -> Dict[str, torch.Tensor]:
         """Inherited, see superclass."""
         return self._transfuser_model(
@@ -122,6 +123,7 @@ class TransfuserAgent(AbstractAgent):
             targets=targets,
             previous_trajectory=previous_trajectory,
             previous_ego_delta=previous_ego_delta,
+            training_epoch=training_epoch,
         )
 
     def reset_temporal_context(self) -> None:

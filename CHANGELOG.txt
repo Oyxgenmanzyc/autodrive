@@ -289,3 +289,39 @@ CHANGELOG.txt
 
 与论文撰写的关系：
 3.7 可作为 3.4 的 test-time noise strength 消融实验，用于说明 temporal compatibility 作为推理期噪声调制项时，保守范围与增强范围对最终 PDM 的影响差异。
+修改主题：3.8 Late-stage Temporal Energy Weighted Supervision
+修改日期：2026-06-16
+
+修改目的：
+在 3.7 enhanced GT-guided temporal noise scale 基础上，将后期训练从单一 GT-nearest mode supervision 扩展为 GT top-K 内的 temporal-energy weighted multi-mode supervision。该版本用于验证：模型前期先学习 GT imitation 的基础驾驶能力，后期不再只把唯一 GT-nearest mode 当作绝对正样本，而是在 GT 合理候选范围内，根据历史连接、舒适性近似和速度节奏重新分配监督权重。
+
+涉及文件：
+navsim/planning/training/agent_lightning_module.py
+navsim/agents/diffusiondrive/transfuser_agent.py
+navsim/agents/diffusiondrive/transfuser_model_v2.py
+navsim/agents/diffusiondrive/modules/multimodal_loss.py
+tests/test_diffusiondrive_factorized_temporal_compat.py
+CHANGELOG.txt
+
+核心改动：
+1. 基于 3.7 分支创建 3.8，保留 temporal_noise_min_scale=0.88 和 temporal_noise_max_scale=1.35，不额外修改 temporal_noise_strength。
+2. 训练阶段继续使用 3.4/3.7 的 GT-guided temporal pair：上一帧 GT p0,p1,p2 作为 temporal reference，真实 executed_delta 始终连接当前 q0。
+3. 将 current_epoch 从 LightningModule 透传到 TransfuserAgent、TransfuserModel 和 TrajectoryHead，仅用于 late-stage energy schedule。
+4. 在 TrajectoryHead 中为 predicted trajectories 构造 energy context：temporal connection cost、comfort proxy cost 和 speed profile cost。
+5. 在 LossComputer 中新增 late-stage ramp：epoch 70 前保持原始 one-hot GT supervision；epoch 70-85 线性打开 energy supervision；epoch 85 后保持最大权重。
+6. Energy 只在 GT top-K=3 内计算，避免远离 GT 的 mode 因某个单项指标低而被错误鼓励。
+7. Energy 定义为 E_i = 0.60 C_gt_i + 0.30 C_temporal_i + 0.10 C_comfort_i，各分量在每个样本 top-K 内标准化后组合。
+8. 使用 p_i = softmax(-E_i / 0.5).detach() 作为监督分配权重。Energy 不直接作为普通 loss 最小化，而是作为 mode supervision allocator。
+9. 分类监督从 one-hot GT target 后期逐步过渡到 energy soft target，最大混合系数 gamma=0.5。
+10. 保留原始 best-mode GT regression，同时增加 energy-weighted top-K regression/quality 项，最大权重 0.12。
+11. quality 项由 L_gt_reg、L_temporal、L_comfort_proxy 和 L_speed_profile 组成；comfort proxy 仅使用 jerk 与 turn-smoothness，不加入完整 safety/PDM reward。
+12. eval/PDM 选择逻辑不改，仍由训练后的 poses_cls.argmax() 选择最终轨迹；本版本不使用强化学习、不使用 3.5 self-pred reference、不引入 DiffusionDriveV2 GRPO pipeline。
+
+预期影响：
+3.8 的核心变量不是简单增加 auxiliary loss，而是改变后期 20 个固定 mode 的监督分配方式。低 energy 的 GT top-K mode 会获得更高分类 soft target 和更多回归/质量梯度，使模型在不脱离 GT 合理范围的情况下，倾向学习历史连接更自然、轨迹更平滑、速度节奏更稳定的候选模式。如果 3.8 相比 3.7 改善或产生明显波动，说明 temporal energy 作为 mode supervision allocator 能实质影响训练决策；如果下降，则说明后期 energy 权重或 top-K 分配仍需更保守调节。
+
+测试/验证结果：
+本地不运行测试、pytest、manual runner 或 smoke。轻量测试文件已更新，覆盖 epoch 70 前回退原始 loss、epoch 85 后 low-energy top-K mode 获得更高 soft target、top-K 外 mode 不被奖励、energy soft weights detach、连接逻辑和 3.7 noise scale 参数保留。等待服务器 smoke/full validation。
+
+与论文撰写的关系：
+3.8 可作为“Late-stage Temporal Energy Weighted Supervision”实验。论文表述重点是：energy 不是普通轨迹惩罚项，而是后期在 GT top-K 内重新定义 mode 正样本分布的监督分配机制；它区别于 DiffusionDriveV2 的 RL/GRPO reward 优化，也区别于 3.5 的 self-prediction teacher forcing。
