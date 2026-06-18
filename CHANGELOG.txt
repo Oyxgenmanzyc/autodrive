@@ -325,3 +325,40 @@ CHANGELOG.txt
 
 与论文撰写的关系：
 3.8 可作为“Late-stage Temporal Energy Weighted Supervision”实验。论文表述重点是：energy 不是普通轨迹惩罚项，而是后期在 GT top-K 内重新定义 mode 正样本分布的监督分配机制；它区别于 DiffusionDriveV2 的 RL/GRPO reward 优化，也区别于 3.5 的 self-prediction teacher forcing。
+
+修改主题：3.9 Tolerance-Based Temporal Energy Supervision With Loss-Aware Start
+修改日期：2026-06-18
+
+修改目的：
+基于 3.8 late-stage temporal energy weighted supervision，修正 temporal connection cost 的语义。3.8 中 start/path/velocity 仍然偏向 raw difference，容易把正常的速度变化、方向变化和加减速都当作不兼容。3.9 将 temporal cost 改为 tolerance-based violation：合理容忍区间内不惩罚，只有超过 NAVSIM/nuPlan comfort 阈值换算出的范围后才增加 cost。同时将 energy auxiliary loss 中独立的 speed profile 项删除，避免速度在 temporal 和 speed proxy 中重复计权。后期 energy loss 的启动也不再固定为 epoch 70，而是由训练 trajectory loss 是否已经稳定来决定。
+
+涉及文件：
+navsim/planning/training/agent_lightning_module.py
+navsim/agents/diffusiondrive/transfuser_agent.py
+navsim/agents/diffusiondrive/transfuser_model_v2.py
+navsim/agents/diffusiondrive/modules/multimodal_loss.py
+tests/test_diffusiondrive_factorized_temporal_compat.py
+CHANGELOG.txt
+
+核心改动：
+1. 基于 3.8 创建 3.9 分支，保留 3.8 的 GT top-K energy supervision、test-time temporal noise modulation、eval/PDM 逻辑。
+2. temporal connection 仍采用 delta-based 对齐：executed_delta -> q0-origin，p1-p0 -> q1-q0，p2-p1 -> q2-q1；不强制 p0=origin，不强制 p1 与 q0 位置重合。
+3. 新增 tolerance-based violation helper，cost 不再等于 raw difference，而是 max(raw_error - tolerance, 0) / scale。
+4. 使用 NAVSIM/nuPlan comfort 阈值换算到 dt=0.5s 的 waypoint delta 表达：低速方向屏蔽 0.20m、加速容忍 0.60m、刹车容忍 1.00m、基础方向容忍 0.45rad、turn-change 容忍 0.48rad、jerk 容忍 0.50m。
+5. 重构三因子：C_start 只衡量真实历史运动到 q0 的方向/速度超限；C_path 衡量 executed->q0->q1 的连接折转超限与 p1-p0/p2-p1 到 q1-q0/q2-q1 的转向趋势超限；C_velocity 衡量加减速超限与加速-急刹反复超限。
+6. reversal 改为非对称阈值：加速后急刹使用 accel > 0.60 且 next_accel < -1.00，惩罚 1.0；急刹后恢复加速惩罚 0.5。
+7. comfort proxy 也改为超限式 jerk / turn smoothness cost，正常范围内的轨迹平滑变化不再被额外惩罚。
+8. Energy auxiliary loss 删除独立 L_speed_i，改为 L_gt_reg_i + 0.60 L_temporal_i + 0.40 L_comfort_i；energy 评分仍为 0.60 C_gt_i + 0.30 C_temporal_i + 0.10 C_comfort_i。
+9. LossComputer 支持 energy_ramp_override，若训练 wrapper 提供动态 ramp，则优先使用动态 ramp；否则回退到旧 epoch schedule。
+10. TemporalPairAgentLightningModule 维护每个 epoch 的原始 trajectory loss 均值。仅当最近一个已完成 epoch 的 trajectory loss < 15 且最近两轮相对变化 < 5% 时，才启动 energy loss；若一直未满足，则 epoch 85 强制启动。
+11. 动态启动后 ramp 仍线性增长 15 个 epoch，避免 energy auxiliary loss 突然打开。
+12. 新增 trajectory_original_loss 日志项，用于动态 schedule，避免使用包含 energy auxiliary 的 total loss 造成自我触发。
+
+预期影响：
+3.9 的 temporal 模块不再试图让当前轨迹机械复制历史速度和方向，而是只惩罚超出驾驶舒适性/连续性合理范围的断裂。这样可以保留正常加速、刹车、转向和新观测导致的合理修正，同时让明显的短时横跳、过度折转、加速后急刹反复在 energy supervision 与 test-time noise modulation 中承担更高 cost。loss-aware start 让后期 energy supervision 在基础 imitation 已经稳定后再介入，避免训练早期过早引入多目标监督。
+
+测试/验证结果：
+本地不运行测试、pytest、manual runner 或 smoke。轻量测试文件已更新，覆盖容忍范围内不罚、超出阈值才提高 cost、删除 energy_speed_cost 后仍可计算 energy supervision、top-K 外 mode 不被奖励、energy soft weights detach 等语义。等待服务器 smoke/full validation。
+
+与论文撰写的关系：
+3.9 可作为 3.8 的语义修正版，用于说明本文的 temporal compatibility 不是简单的轨迹相似性约束，而是基于专家驾驶舒适性阈值的历史连接 violation cost。该版本也让 energy supervision 的表述更清晰：energy 负责在 GT top-K 内分配监督权重，真正反传的 auxiliary 只包含 GT regression、temporal violation 和 comfort violation，不再重复引入独立 speed loss。

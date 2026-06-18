@@ -62,7 +62,14 @@ def _make_head():
     head.temporal_start_weight = 0.25
     head.temporal_path_weight = 0.40
     head.temporal_velocity_weight = 0.35
-    head.temporal_reversal_threshold = 0.5
+    head.temporal_dt = 0.5
+    head.temporal_low_speed_delta = 0.20
+    head.temporal_accel_delta_tolerance = 0.60
+    head.temporal_brake_delta_tolerance = 1.00
+    head.temporal_direction_tolerance = 0.45
+    head.temporal_lateral_accel_tolerance = 4.89
+    head.temporal_turn_change_tolerance = 0.48
+    head.temporal_jerk_delta_tolerance = 0.50
     return head
 
 
@@ -103,12 +110,12 @@ def test_temporal_noise_scale_keeps_anchor_noise_shape():
     assert noise_scale.shape == (1, 20, 1, 1)
 
 
-def test_start_component_penalizes_same_direction_with_different_speed():
+def test_start_speed_penalizes_only_beyond_tolerance():
     head = _make_head()
     executed_delta = torch.tensor([[1.0, 0.0]])
     plan_anchor = torch.zeros(1, 20, 8, 2)
-    plan_anchor[:, 0, 0] = torch.tensor([1.0, 0.0])
-    plan_anchor[:, 1, 0] = torch.tensor([2.0, 0.0])
+    plan_anchor[:, 0, :3] = torch.tensor([[1.5, 0.0], [3.0, 0.0], [4.5, 0.0]])
+    plan_anchor[:, 1, :3] = torch.tensor([[1.8, 0.0], [3.6, 0.0], [5.4, 0.0]])
 
     start_cost, path_cost, velocity_cost = head._temporal_compatibility_components(
         plan_anchor,
@@ -118,15 +125,15 @@ def test_start_component_penalizes_same_direction_with_different_speed():
 
     assert start_cost[0, 1] > start_cost[0, 0]
     assert torch.allclose(path_cost[0, 1], path_cost[0, 0], atol=1e-6)
-    assert velocity_cost[0, 1] > velocity_cost[0, 0]
+    assert torch.allclose(velocity_cost[0, 1], velocity_cost[0, 0], atol=1e-6)
 
 
 def test_start_and_path_penalize_abrupt_direction_change_from_executed_motion():
     head = _make_head()
     executed_delta = torch.tensor([[1.0, 0.0]])
     plan_anchor = torch.zeros(1, 20, 8, 2)
-    plan_anchor[:, 0, 0] = torch.tensor([1.0, 0.0])
-    plan_anchor[:, 1, 0] = torch.tensor([0.0, 1.0])
+    plan_anchor[:, 0, :3] = torch.tensor([[1.0, 0.0], [2.0, 0.0], [3.0, 0.0]])
+    plan_anchor[:, 1, :3] = torch.tensor([[0.0, 1.0], [0.0, 2.0], [0.0, 3.0]])
 
     start_cost, path_cost, velocity_cost = head._temporal_compatibility_components(
         plan_anchor,
@@ -222,8 +229,8 @@ def test_terminal_absolute_position_no_longer_changes_cost():
 
 def test_accelerate_then_brake_has_larger_reversal_cost_than_recover_after_brake():
     head = _make_head()
-    accel_then_brake = torch.tensor([[[1.0, 2.0, 1.0]]])
-    brake_then_accel = torch.tensor([[[2.0, 1.0, 2.0]]])
+    accel_then_brake = torch.tensor([[[1.0, 1.7, 0.5]]])
+    brake_then_accel = torch.tensor([[[2.0, 0.8, 1.5]]])
 
     assert head._reversal_cost(accel_then_brake)[0, 0] > head._reversal_cost(brake_then_accel)[0, 0]
 
@@ -253,7 +260,6 @@ def _energy_context(epoch, temporal_cost=None):
     return {
         "energy_temporal_cost": temporal_cost,
         "energy_comfort_cost": torch.zeros_like(temporal_cost),
-        "energy_speed_cost": torch.zeros_like(temporal_cost),
         "energy_training_epoch": epoch,
         "energy_topk": 3,
         "energy_temperature": 0.5,
@@ -264,9 +270,8 @@ def _energy_context(epoch, temporal_cost=None):
         "energy_gt_weight": 0.60,
         "energy_temporal_weight": 0.30,
         "energy_comfort_weight": 0.10,
-        "energy_aux_temporal_weight": 0.50,
-        "energy_aux_comfort_weight": 0.30,
-        "energy_aux_speed_weight": 0.20,
+        "energy_aux_temporal_weight": 0.60,
+        "energy_aux_comfort_weight": 0.40,
     }
 
 

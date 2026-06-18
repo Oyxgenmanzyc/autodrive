@@ -130,9 +130,8 @@ class LossComputer(nn.Module):
         self.energy_gt_weight = 0.60
         self.energy_temporal_weight = 0.30
         self.energy_comfort_weight = 0.10
-        self.energy_aux_temporal_weight = 0.50
-        self.energy_aux_comfort_weight = 0.30
-        self.energy_aux_speed_weight = 0.20
+        self.energy_aux_temporal_weight = 0.60
+        self.energy_aux_comfort_weight = 0.40
 
     @staticmethod
     def _as_schedule_tensor(value, device, dtype):
@@ -153,6 +152,10 @@ class LossComputer(nn.Module):
         return torch.gather(values, 1, topk_idx)
 
     def _energy_ramp(self, temporal_context: Dict[str, Tensor], device, dtype) -> Tensor:
+        ramp_override = temporal_context.get("energy_ramp_override")
+        if ramp_override is not None:
+            return self._as_schedule_tensor(ramp_override, device, dtype).clamp(0.0, 1.0)
+
         epoch = self._as_schedule_tensor(temporal_context.get("energy_training_epoch"), device, dtype)
         if epoch is None:
             return torch.zeros((), device=device, dtype=dtype)
@@ -171,7 +174,7 @@ class LossComputer(nn.Module):
         if temporal_context is None:
             return None
 
-        required_keys = ("energy_temporal_cost", "energy_comfort_cost", "energy_speed_cost")
+        required_keys = ("energy_temporal_cost", "energy_comfort_cost")
         if any(key not in temporal_context for key in required_keys):
             return None
 
@@ -183,10 +186,9 @@ class LossComputer(nn.Module):
 
         temporal_cost = temporal_context["energy_temporal_cost"].to(device=device, dtype=dtype)
         comfort_cost = temporal_context["energy_comfort_cost"].to(device=device, dtype=dtype)
-        speed_cost = temporal_context["energy_speed_cost"].to(device=device, dtype=dtype)
-        if temporal_cost.shape != dist.shape or comfort_cost.shape != dist.shape or speed_cost.shape != dist.shape:
+        if temporal_cost.shape != dist.shape or comfort_cost.shape != dist.shape:
             return None
-        if not (torch.isfinite(temporal_cost).all() and torch.isfinite(comfort_cost).all() and torch.isfinite(speed_cost).all()):
+        if not (torch.isfinite(temporal_cost).all() and torch.isfinite(comfort_cost).all()):
             return None
 
         topk = int(temporal_context.get("energy_topk", self.energy_topk))
@@ -197,7 +199,6 @@ class LossComputer(nn.Module):
         topk_gt = self._gather_topk(gt_distance, topk_idx)
         topk_temporal = self._gather_topk(temporal_cost, topk_idx)
         topk_comfort = self._gather_topk(comfort_cost, topk_idx)
-        topk_speed = self._gather_topk(speed_cost, topk_idx)
 
         gt_weight = float(temporal_context.get("energy_gt_weight", self.energy_gt_weight))
         temporal_weight = float(temporal_context.get("energy_temporal_weight", self.energy_temporal_weight))
@@ -222,12 +223,10 @@ class LossComputer(nn.Module):
         topk_reg = self._gather_topk(reg_per_mode, topk_idx)
         aux_temporal_weight = float(temporal_context.get("energy_aux_temporal_weight", self.energy_aux_temporal_weight))
         aux_comfort_weight = float(temporal_context.get("energy_aux_comfort_weight", self.energy_aux_comfort_weight))
-        aux_speed_weight = float(temporal_context.get("energy_aux_speed_weight", self.energy_aux_speed_weight))
         weighted_quality = (
             topk_reg
             + aux_temporal_weight * topk_temporal.clamp(max=2.0)
             + aux_comfort_weight * topk_comfort.clamp(max=2.0)
-            + aux_speed_weight * topk_speed.clamp(max=2.0)
         )
         aux_raw = (topk_prob * weighted_quality).sum(dim=1).mean()
         aux_weight = ramp * float(temporal_context.get("energy_aux_weight_max", self.energy_aux_weight_max))
@@ -244,7 +243,6 @@ class LossComputer(nn.Module):
             "energy_selected_cost": (topk_prob * energy).sum(dim=1).mean().detach(),
             "energy_weighted_temporal_cost": (topk_prob * topk_temporal).sum(dim=1).mean().detach(),
             "energy_weighted_comfort_cost": (topk_prob * topk_comfort).sum(dim=1).mean().detach(),
-            "energy_weighted_speed_cost": (topk_prob * topk_speed).sum(dim=1).mean().detach(),
         }
 
     def forward(self, poses_reg, poses_cls, targets, plan_anchor, temporal_context: Optional[Dict[str, Tensor]]=None):
@@ -302,5 +300,6 @@ class LossComputer(nn.Module):
                 for key, value in energy_info.items()
                 if key != "cls_soft_target"
             }
+            logged_energy_info["trajectory_original_loss"] = (loss_cls + reg_loss).detach()
             return ret_loss, logged_energy_info
         return ret_loss

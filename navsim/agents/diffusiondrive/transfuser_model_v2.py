@@ -99,6 +99,7 @@ class V2TransfuserModel(nn.Module):
         previous_trajectory: Optional[torch.Tensor]=None,
         previous_ego_delta: Optional[torch.Tensor]=None,
         training_epoch: Optional[int]=None,
+        energy_ramp_override: Optional[torch.Tensor]=None,
     ) -> Dict[str, torch.Tensor]:
         """Torch module forward pass."""
 
@@ -147,6 +148,7 @@ class V2TransfuserModel(nn.Module):
             previous_trajectory=previous_trajectory,
             previous_ego_delta=previous_ego_delta,
             training_epoch=training_epoch,
+            energy_ramp_override=energy_ramp_override,
         )
         output.update(trajectory)
 
@@ -420,7 +422,14 @@ class TrajectoryHead(nn.Module):
         self.temporal_start_weight = 0.25
         self.temporal_path_weight = 0.40
         self.temporal_velocity_weight = 0.35
-        self.temporal_reversal_threshold = 0.5
+        self.temporal_dt = 0.5
+        self.temporal_low_speed_delta = 0.20
+        self.temporal_accel_delta_tolerance = 0.60
+        self.temporal_brake_delta_tolerance = 1.00
+        self.temporal_direction_tolerance = 0.45
+        self.temporal_lateral_accel_tolerance = 4.89
+        self.temporal_turn_change_tolerance = 0.48
+        self.temporal_jerk_delta_tolerance = 0.50
         self.energy_topk = 3
         self.energy_temperature = 0.5
         self.energy_start_epoch = 70
@@ -430,9 +439,8 @@ class TrajectoryHead(nn.Module):
         self.energy_gt_weight = 0.60
         self.energy_temporal_weight = 0.30
         self.energy_comfort_weight = 0.10
-        self.energy_aux_temporal_weight = 0.50
-        self.energy_aux_comfort_weight = 0.30
-        self.energy_aux_speed_weight = 0.20
+        self.energy_aux_temporal_weight = 0.60
+        self.energy_aux_comfort_weight = 0.40
 
         self.diffusion_scheduler = DDIMScheduler(
             num_train_timesteps=1000,
@@ -496,6 +504,36 @@ class TrajectoryHead(nn.Module):
             torch.cos(anchor_angle - previous_angle),
         ).abs() / np.pi
 
+    def _angle_error_rad(self, anchor_angle, reference_angle):
+        return torch.atan2(
+            torch.sin(anchor_angle - reference_angle),
+            torch.cos(anchor_angle - reference_angle),
+        ).abs()
+
+    def _positive_violation(self, value, tolerance, scale=None):
+        if scale is None:
+            scale = tolerance
+        return (torch.relu(value - tolerance) / (scale + 1e-6)).clamp(max=2.0)
+
+    def _signed_delta_violation(self, delta):
+        accel_tol = self.temporal_accel_delta_tolerance
+        brake_tol = self.temporal_brake_delta_tolerance
+        accel_excess = self._positive_violation(delta, accel_tol)
+        brake_excess = self._positive_violation(-delta, brake_tol)
+        return torch.where(delta >= 0, accel_excess, brake_excess)
+
+    def _dynamic_direction_tolerance(self, reference_speed):
+        speed_mps = reference_speed / self.temporal_dt
+        dynamic_tolerance = (
+            self.temporal_dt
+            * self.temporal_lateral_accel_tolerance
+            / torch.clamp(speed_mps, min=1.0)
+        )
+        return torch.minimum(
+            torch.full_like(reference_speed, self.temporal_direction_tolerance),
+            dynamic_tolerance,
+        )
+
     def _cosine_direction_cost(self, anchor_delta, reference_delta):
         eps = 1e-6
         anchor_speed = torch.linalg.norm(anchor_delta, dim=-1)
@@ -506,6 +544,28 @@ class TrajectoryHead(nn.Module):
             (anchor_speed > eps) & (reference_speed > eps),
             direction_cost,
             torch.zeros_like(direction_cost),
+        )
+
+    def _direction_violation_cost(self, anchor_delta, reference_delta):
+        eps = 1e-6
+        anchor_speed = torch.linalg.norm(anchor_delta, dim=-1)
+        reference_speed = torch.linalg.norm(reference_delta, dim=-1)
+        anchor_heading = torch.atan2(anchor_delta[..., 1], anchor_delta[..., 0])
+        reference_heading = torch.atan2(reference_delta[..., 1], reference_delta[..., 0])
+        angle_error = self._angle_error_rad(anchor_heading, reference_heading)
+        tolerance = self._dynamic_direction_tolerance(reference_speed)
+        direction_violation = self._positive_violation(angle_error, tolerance)
+        valid = (
+            (anchor_speed > self.temporal_low_speed_delta)
+            & (reference_speed > self.temporal_low_speed_delta)
+        )
+        return torch.where(valid, direction_violation, torch.zeros_like(direction_violation))
+
+    def _turn_values(self, deltas):
+        heading = torch.atan2(deltas[..., 1], deltas[..., 0])
+        return torch.atan2(
+            torch.sin(heading[..., 1:] - heading[..., :-1]),
+            torch.cos(heading[..., 1:] - heading[..., :-1]),
         )
 
     def _turn_cost(self, anchor_delta, reference_delta):
@@ -535,16 +595,53 @@ class TrajectoryHead(nn.Module):
         turn_error = torch.where(turn_valid, turn_error, torch.zeros_like(turn_error))
         return turn_error.mean(dim=-1)
 
+    def _turn_violation_cost(self, anchor_delta, reference_delta):
+        anchor_speed = torch.linalg.norm(anchor_delta, dim=-1)
+        reference_speed = torch.linalg.norm(reference_delta, dim=-1)
+        if anchor_delta.shape[-2] < 2:
+            return torch.zeros_like(anchor_speed[..., 0])
+
+        anchor_turn = self._turn_values(anchor_delta)
+        reference_turn = self._turn_values(reference_delta)
+        turn_error = self._angle_error_rad(anchor_turn, reference_turn)
+        turn_violation = self._positive_violation(turn_error, self.temporal_turn_change_tolerance)
+        turn_valid = (
+            (anchor_speed[..., 1:] > self.temporal_low_speed_delta)
+            & (anchor_speed[..., :-1] > self.temporal_low_speed_delta)
+            & (reference_speed[..., 1:] > self.temporal_low_speed_delta)
+            & (reference_speed[..., :-1] > self.temporal_low_speed_delta)
+        )
+        turn_violation = torch.where(turn_valid, turn_violation, torch.zeros_like(turn_violation))
+        return turn_violation.mean(dim=-1)
+
+    def _connection_turn_violation(self, executed_delta, anchor_delta):
+        anchor_speed = torch.linalg.norm(anchor_delta, dim=-1)
+        executed_speed = torch.linalg.norm(executed_delta, dim=-1)
+        if anchor_delta.shape[-2] < 2:
+            return torch.zeros_like(anchor_speed[..., 0])
+
+        executed_expanded = executed_delta.unsqueeze(1).expand(*anchor_delta.shape[:-2], 1, 2)
+        connection_deltas = torch.cat([executed_expanded, anchor_delta[..., :2, :]], dim=-2)
+        connection_turn = self._turn_values(connection_deltas)
+        turn_change = self._angle_error_rad(connection_turn[..., 1:], connection_turn[..., :-1])
+        turn_violation = self._positive_violation(turn_change, self.temporal_turn_change_tolerance).mean(dim=-1)
+        valid = (
+            (executed_speed.unsqueeze(1).expand_as(anchor_speed[..., :1]) > self.temporal_low_speed_delta)
+            & (anchor_speed[..., :1] > self.temporal_low_speed_delta)
+            & (anchor_speed[..., 1:2] > self.temporal_low_speed_delta)
+        ).squeeze(-1)
+        return torch.where(valid, turn_violation, torch.zeros_like(turn_violation))
+
     def _reversal_cost(self, anchor_speed):
         if anchor_speed.shape[-1] < 3:
             return torch.zeros_like(anchor_speed[..., 0])
 
         accel = anchor_speed[..., 1:] - anchor_speed[..., :-1]
-        accel_then_brake = (accel[..., :-1] > self.temporal_reversal_threshold) & (
-            accel[..., 1:] < -self.temporal_reversal_threshold
+        accel_then_brake = (accel[..., :-1] > self.temporal_accel_delta_tolerance) & (
+            accel[..., 1:] < -self.temporal_brake_delta_tolerance
         )
-        brake_then_accel = (accel[..., :-1] < -self.temporal_reversal_threshold) & (
-            accel[..., 1:] > self.temporal_reversal_threshold
+        brake_then_accel = (accel[..., :-1] < -self.temporal_brake_delta_tolerance) & (
+            accel[..., 1:] > self.temporal_accel_delta_tolerance
         )
         reversal = accel_then_brake.to(anchor_speed.dtype) + 0.5 * brake_then_accel.to(anchor_speed.dtype)
         return reversal.mean(dim=-1)
@@ -553,38 +650,40 @@ class TrajectoryHead(nn.Module):
         start_cost = None
         path_cost = None
         velocity_cost = None
-        eps = 1e-6
-        start_direction_cost = None
-        start_speed_cost = None
+        previous_delta = None
+        anchor_delta = None
+        accel_cost_terms = []
+        path_cost_terms = []
+
+        if plan_anchor.shape[-2] >= 3:
+            anchor_xy = plan_anchor[..., :3, :2]
+            anchor_delta = self._point_deltas(anchor_xy)
+            anchor_speed = torch.linalg.norm(anchor_delta, dim=-1)
+            if anchor_speed.shape[-1] >= 2:
+                start_accel = anchor_speed[..., 1] - anchor_speed[..., 0]
+                accel_cost_terms.append(self._signed_delta_violation(start_accel))
+            reversal_cost = self._reversal_cost(anchor_speed)
+        else:
+            reversal_cost = None
 
         if previous_trajectory is not None:
             previous_trajectory = previous_trajectory.to(device=plan_anchor.device, dtype=plan_anchor.dtype)
             if torch.isfinite(previous_trajectory).all() and previous_trajectory.shape[-2] >= 3 and plan_anchor.shape[-2] >= 3:
                 previous_xy = previous_trajectory[..., :3, :2]
-                anchor_xy = plan_anchor[..., :3, :2]
                 previous_delta = (previous_xy[..., 1:, :] - previous_xy[..., :-1, :]).unsqueeze(1)
-                anchor_delta = self._point_deltas(anchor_xy)
                 anchor_ref_delta = anchor_delta[..., 1:3, :]
 
-                anchor_speed = torch.linalg.norm(anchor_delta, dim=-1)
                 anchor_ref_speed = torch.linalg.norm(anchor_ref_delta, dim=-1)
                 previous_speed = torch.linalg.norm(previous_delta, dim=-1)
 
-                direction_cost = self._cosine_direction_cost(anchor_ref_delta, previous_delta).mean(dim=-1)
-                turn_cost = self._turn_cost(anchor_ref_delta, previous_delta)
-                path_ref_cost = 0.3 * direction_cost + 0.7 * turn_cost
+                ref_turn_cost = self._turn_violation_cost(anchor_ref_delta, previous_delta)
+                path_cost_terms.append(("ref", ref_turn_cost))
 
                 if previous_delta.shape[-2] > 1:
                     anchor_speed_delta = anchor_ref_speed[..., 1:] - anchor_ref_speed[..., :-1]
                     previous_speed_delta = previous_speed[..., 1:] - previous_speed[..., :-1]
-                    speed_delta_error = torch.abs(anchor_speed_delta - previous_speed_delta) / (previous_speed_delta.abs() + 1.0)
-                    accel_cost = speed_delta_error.clamp(max=2.0).mean(dim=-1)
-                else:
-                    accel_cost = torch.zeros_like(anchor_ref_speed[..., 0])
-                reversal_cost = self._reversal_cost(anchor_speed)
-                velocity_ref_cost = 0.40 * accel_cost + 0.25 * reversal_cost
-                path_cost = path_ref_cost
-                velocity_cost = velocity_ref_cost
+                    accel_delta_error = anchor_speed_delta - previous_speed_delta
+                    accel_cost_terms.append(self._signed_delta_violation(accel_delta_error).mean(dim=-1))
 
         if previous_ego_delta is not None:
             previous_ego_delta = previous_ego_delta.to(device=plan_anchor.device, dtype=plan_anchor.dtype)
@@ -596,18 +695,37 @@ class TrajectoryHead(nn.Module):
                 anchor_start_delta = plan_anchor[..., 0, :2]
                 anchor_start_speed = torch.linalg.norm(anchor_start_delta, dim=-1)
                 executed_speed = torch.linalg.norm(executed_delta, dim=-1)
-                start_direction_cost = self._cosine_direction_cost(anchor_start_delta, executed_delta)
-                start_speed_cost = torch.abs(anchor_start_speed - executed_speed) / (executed_speed + 1.0)
-                start_speed_cost = start_speed_cost.clamp(max=2.0)
+                start_direction_cost = self._direction_violation_cost(anchor_start_delta, executed_delta)
+                start_speed_cost = self._signed_delta_violation(anchor_start_speed - executed_speed)
                 start_cost = 0.6 * start_direction_cost + 0.4 * start_speed_cost
-                if path_cost is None:
-                    path_cost = start_direction_cost
-                else:
-                    path_cost = 0.6 * start_direction_cost + 0.4 * path_cost
-                if velocity_cost is None:
-                    velocity_cost = start_speed_cost
-                else:
-                    velocity_cost = 0.35 * start_speed_cost + velocity_cost
+
+                if anchor_delta is not None:
+                    connection_turn_cost = self._connection_turn_violation(executed_delta, anchor_delta)
+                    path_cost_terms.append(("connection", connection_turn_cost))
+
+        connection_path_cost = None
+        ref_path_cost = None
+        for name, value in path_cost_terms:
+            if name == "connection":
+                connection_path_cost = value if connection_path_cost is None else 0.5 * (connection_path_cost + value)
+            elif name == "ref":
+                ref_path_cost = value if ref_path_cost is None else 0.5 * (ref_path_cost + value)
+
+        if connection_path_cost is not None and ref_path_cost is not None:
+            path_cost = 0.6 * connection_path_cost + 0.4 * ref_path_cost
+        elif connection_path_cost is not None:
+            path_cost = connection_path_cost
+        elif ref_path_cost is not None:
+            path_cost = ref_path_cost
+
+        if accel_cost_terms:
+            accel_cost = torch.stack(accel_cost_terms, dim=0).mean(dim=0)
+            if reversal_cost is None:
+                velocity_cost = accel_cost
+            else:
+                velocity_cost = 0.7 * accel_cost + 0.3 * reversal_cost
+        elif reversal_cost is not None:
+            velocity_cost = reversal_cost
 
         if start_cost is None and path_cost is not None:
             start_cost = torch.zeros_like(path_cost)
@@ -639,7 +757,7 @@ class TrajectoryHead(nn.Module):
         if speed.shape[-1] >= 4:
             accel = speed[..., 1:] - speed[..., :-1]
             jerk = accel[..., 1:] - accel[..., :-1]
-            jerk_cost = jerk.abs().mean(dim=-1)
+            jerk_cost = self._positive_violation(jerk.abs(), self.temporal_jerk_delta_tolerance).mean(dim=-1)
         else:
             jerk_cost = torch.zeros_like(speed[..., 0])
 
@@ -653,8 +771,9 @@ class TrajectoryHead(nn.Module):
             turn_delta = torch.atan2(
                 torch.sin(turn[..., 1:] - turn[..., :-1]),
                 torch.cos(turn[..., 1:] - turn[..., :-1]),
-            ).abs() / np.pi
+            ).abs()
             valid = (speed[..., 2:] > eps) & (speed[..., 1:-1] > eps) & (speed[..., :-2] > eps)
+            turn_delta = self._positive_violation(turn_delta, self.temporal_turn_change_tolerance)
             turn_delta = torch.where(valid, turn_delta, torch.zeros_like(turn_delta))
             turn_smooth_cost = turn_delta.mean(dim=-1)
         else:
@@ -662,16 +781,14 @@ class TrajectoryHead(nn.Module):
 
         return 0.5 * jerk_cost.clamp(max=2.0) + 0.5 * turn_smooth_cost.clamp(max=2.0)
 
-    def _trajectory_speed_profile_cost(self, candidates):
-        xy = candidates[..., :2]
-        deltas = self._point_deltas(xy)
-        speed = torch.linalg.norm(deltas, dim=-1)
-        if speed.shape[-1] < 2:
-            return torch.zeros_like(speed[..., 0])
-        accel = speed[..., 1:] - speed[..., :-1]
-        return accel.abs().mean(dim=-1).clamp(max=2.0)
-
-    def _energy_loss_context(self, candidates, previous_trajectory, previous_ego_delta=None, training_epoch=None):
+    def _energy_loss_context(
+        self,
+        candidates,
+        previous_trajectory,
+        previous_ego_delta=None,
+        training_epoch=None,
+        energy_ramp_override=None,
+    ):
         start_cost, path_cost, velocity_cost = self._temporal_compatibility_components(
             candidates,
             previous_trajectory,
@@ -691,8 +808,8 @@ class TrajectoryHead(nn.Module):
             "energy_path_cost": path_cost,
             "energy_velocity_cost": velocity_cost,
             "energy_comfort_cost": self._trajectory_comfort_cost(candidates),
-            "energy_speed_cost": self._trajectory_speed_profile_cost(candidates),
             "energy_training_epoch": training_epoch,
+            "energy_ramp_override": energy_ramp_override,
             "energy_topk": self.energy_topk,
             "energy_temperature": self.energy_temperature,
             "energy_start_epoch": self.energy_start_epoch,
@@ -704,7 +821,6 @@ class TrajectoryHead(nn.Module):
             "energy_comfort_weight": self.energy_comfort_weight,
             "energy_aux_temporal_weight": self.energy_aux_temporal_weight,
             "energy_aux_comfort_weight": self.energy_aux_comfort_weight,
-            "energy_aux_speed_weight": self.energy_aux_speed_weight,
         }
 
     def _temporal_noise_scale(self, plan_anchor, previous_trajectory, previous_ego_delta=None):
@@ -717,15 +833,15 @@ class TrajectoryHead(nn.Module):
         noise_scale = noise_scale.clamp(self.temporal_noise_min_scale, self.temporal_noise_max_scale)
         return noise_scale[:, :, None, None]
 
-    def forward(self, ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None,previous_trajectory=None,previous_ego_delta=None,training_epoch=None) -> Dict[str, torch.Tensor]:
+    def forward(self, ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None,previous_trajectory=None,previous_ego_delta=None,training_epoch=None,energy_ramp_override=None) -> Dict[str, torch.Tensor]:
         """Torch module forward pass."""
         if self.training:
-            return self.forward_train(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,targets,global_img,previous_trajectory,previous_ego_delta,training_epoch)
+            return self.forward_train(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,targets,global_img,previous_trajectory,previous_ego_delta,training_epoch,energy_ramp_override)
         else:
             return self.forward_test(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,global_img,previous_trajectory,previous_ego_delta)
 
 
-    def forward_train(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None,previous_trajectory=None,previous_ego_delta=None,training_epoch=None) -> Dict[str, torch.Tensor]:
+    def forward_train(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None,previous_trajectory=None,previous_ego_delta=None,training_epoch=None,energy_ramp_override=None) -> Dict[str, torch.Tensor]:
         bs = ego_query.shape[0]
         device = ego_query.device
         # 1. add truncated noise to the plan anchor
@@ -774,12 +890,14 @@ class TrajectoryHead(nn.Module):
 
         trajectory_loss_dict = {}
         ret_traj_loss = 0
+        ret_original_traj_loss = 0
         for idx, (poses_reg, poses_cls) in enumerate(zip(poses_reg_list, poses_cls_list)):
             energy_context = self._energy_loss_context(
                 poses_reg[..., :2],
                 previous_trajectory,
                 previous_ego_delta,
                 training_epoch,
+                energy_ramp_override,
             )
             trajectory_loss_output = self.loss_computer(
                 poses_reg,
@@ -790,17 +908,25 @@ class TrajectoryHead(nn.Module):
             )
             if isinstance(trajectory_loss_output, tuple):
                 trajectory_loss, energy_loss_dict = trajectory_loss_output
+                original_trajectory_loss = energy_loss_dict.get(
+                    "trajectory_original_loss",
+                    trajectory_loss.detach(),
+                )
                 for key, value in energy_loss_dict.items():
                     if key != "trajectory_scaled_energy_aux_loss":
                         trajectory_loss_dict[f"{key}_{idx}"] = value
             else:
                 trajectory_loss = trajectory_loss_output
+                original_trajectory_loss = trajectory_loss.detach()
+            trajectory_loss_dict[f"trajectory_original_loss_{idx}"] = original_trajectory_loss.detach()
             trajectory_loss_dict[f"trajectory_loss_{idx}"] = trajectory_loss
             ret_traj_loss += trajectory_loss
+            ret_original_traj_loss += original_trajectory_loss
 
         mode_idx = poses_cls_list[-1].argmax(dim=-1)
         mode_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
         best_reg = torch.gather(poses_reg_list[-1], 1, mode_idx).squeeze(1)
+        trajectory_loss_dict["trajectory_original_loss"] = ret_original_traj_loss.detach()
         output = {"trajectory": best_reg,"trajectory_loss":ret_traj_loss,"trajectory_loss_dict":trajectory_loss_dict}
         output.update(temporal_metrics)
         return output

@@ -112,3 +112,11 @@ def test_temporal_pair_reference_keeps_connection_points_p0_to_p2():
         temporal_reference,
         torch.tensor([[[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]]),
     )
+
+
+def test_energy_schedule_requires_loss_below_threshold_and_stable_change():
+    should_start = TemporalPairAgentLightningModule._should_start_energy_from_history
+
+    assert not should_start([16.0, 15.5])
+    assert not should_start([14.0, 13.0])
+    assert should_start([14.2, 13.8])
