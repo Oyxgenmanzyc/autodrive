@@ -441,6 +441,9 @@ class TrajectoryHead(nn.Module):
         self.energy_comfort_weight = 0.10
         self.energy_aux_temporal_weight = 0.60
         self.energy_aux_comfort_weight = 0.40
+        self.temporal_rescore_topk = 5
+        self.temporal_rescore_alpha = 0.05
+        self.temporal_rescore_cost_clamp = 2.0
 
         self.diffusion_scheduler = DDIMScheduler(
             num_train_timesteps=1000,
@@ -833,6 +836,54 @@ class TrajectoryHead(nn.Module):
         noise_scale = noise_scale.clamp(self.temporal_noise_min_scale, self.temporal_noise_max_scale)
         return noise_scale[:, :, None, None]
 
+    def _select_mode_with_temporal_rescore(self, poses_reg, poses_cls, previous_trajectory=None, previous_ego_delta=None):
+        base_mode_idx = poses_cls.argmax(dim=-1)
+        diagnostics = {
+            "temporal_rescore_active": torch.zeros((), device=poses_cls.device, dtype=poses_cls.dtype),
+            "temporal_rescore_changed": torch.zeros((), device=poses_cls.device, dtype=poses_cls.dtype),
+        }
+
+        temporal_cost = self._temporal_compatibility_cost(
+            poses_reg[..., :2],
+            previous_trajectory,
+            previous_ego_delta,
+        )
+        if temporal_cost is None:
+            return base_mode_idx, diagnostics
+
+        if temporal_cost.shape != poses_cls.shape or not torch.isfinite(temporal_cost).all():
+            return base_mode_idx, diagnostics
+
+        topk = max(1, min(int(self.temporal_rescore_topk), poses_cls.shape[1]))
+        topk_cls, topk_idx = torch.topk(poses_cls, k=topk, dim=-1, largest=True)
+        topk_cost = torch.gather(temporal_cost, 1, topk_idx).clamp(max=self.temporal_rescore_cost_clamp)
+        cost_mean = topk_cost.mean(dim=1, keepdim=True)
+        cost_std = topk_cost.std(dim=1, unbiased=False, keepdim=True)
+        normalized_cost = ((topk_cost - cost_mean) / (cost_std + 1e-6)).clamp(-2.0, 2.0)
+        rescored_logits = topk_cls - float(self.temporal_rescore_alpha) * normalized_cost
+        selected_topk_pos = rescored_logits.argmax(dim=-1, keepdim=True)
+        mode_idx = torch.gather(topk_idx, 1, selected_topk_pos).squeeze(1)
+
+        if poses_cls.shape[1] >= 2:
+            top2_cls = torch.topk(poses_cls, k=2, dim=-1, largest=True).values
+            cls_margin = top2_cls[:, 0] - top2_cls[:, 1]
+        else:
+            cls_margin = torch.zeros_like(base_mode_idx, dtype=poses_cls.dtype)
+
+        selected_cost = torch.gather(temporal_cost, 1, mode_idx.unsqueeze(1)).squeeze(1)
+        base_cost = torch.gather(temporal_cost, 1, base_mode_idx.unsqueeze(1)).squeeze(1)
+        diagnostics = {
+            "temporal_rescore_active": torch.ones((), device=poses_cls.device, dtype=poses_cls.dtype),
+            "temporal_rescore_changed": (mode_idx != base_mode_idx).to(poses_cls.dtype).mean().detach(),
+            "temporal_rescore_selected_cost": selected_cost.mean().detach(),
+            "temporal_rescore_base_cost": base_cost.mean().detach(),
+            "temporal_rescore_topk_min_cost": topk_cost.min(dim=1).values.mean().detach(),
+            "temporal_rescore_cls_margin": cls_margin.mean().detach(),
+            "temporal_rescore_selected_mode": mode_idx.to(poses_cls.dtype).mean().detach(),
+            "temporal_rescore_base_mode": base_mode_idx.to(poses_cls.dtype).mean().detach(),
+        }
+        return mode_idx, diagnostics
+
     def forward(self, ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None,previous_trajectory=None,previous_ego_delta=None,training_epoch=None,energy_ramp_override=None) -> Dict[str, torch.Tensor]:
         """Torch module forward pass."""
         if self.training:
@@ -852,20 +903,7 @@ class TrajectoryHead(nn.Module):
             (bs,), device=device
         )
         noise = torch.randn(odo_info_fut.shape, device=device)
-        temporal_noise_scale = self._temporal_noise_scale(plan_anchor, previous_trajectory, previous_ego_delta)
         temporal_metrics = {}
-        if temporal_noise_scale is not None:
-            noise = noise * temporal_noise_scale
-            start_cost, path_cost, velocity_cost = self._temporal_compatibility_components(
-                plan_anchor,
-                previous_trajectory,
-                previous_ego_delta,
-            )
-            temporal_metrics = {
-                "temporal_start_cost": start_cost.mean().detach(),
-                "temporal_path_cost": path_cost.mean().detach(),
-                "temporal_velocity_cost": velocity_cost.mean().detach(),
-            }
         noisy_traj_points = self.diffusion_scheduler.add_noise(
             original_samples=odo_info_fut,
             noise=noise,
@@ -892,19 +930,12 @@ class TrajectoryHead(nn.Module):
         ret_traj_loss = 0
         ret_original_traj_loss = 0
         for idx, (poses_reg, poses_cls) in enumerate(zip(poses_reg_list, poses_cls_list)):
-            energy_context = self._energy_loss_context(
-                poses_reg[..., :2],
-                previous_trajectory,
-                previous_ego_delta,
-                training_epoch,
-                energy_ramp_override,
-            )
             trajectory_loss_output = self.loss_computer(
                 poses_reg,
                 poses_cls,
                 targets,
                 plan_anchor,
-                temporal_context=energy_context,
+                temporal_context=None,
             )
             if isinstance(trajectory_loss_output, tuple):
                 trajectory_loss, energy_loss_dict = trajectory_loss_output
@@ -945,9 +976,6 @@ class TrajectoryHead(nn.Module):
         plan_anchor = self.plan_anchor.unsqueeze(0).repeat(bs,1,1,1)
         img = self.norm_odo(plan_anchor)
         noise = torch.randn(img.shape, device=device)
-        temporal_noise_scale = self._temporal_noise_scale(plan_anchor, previous_trajectory, previous_ego_delta)
-        if temporal_noise_scale is not None:
-            noise = noise * temporal_noise_scale
         trunc_timesteps = torch.ones((bs,), device=device, dtype=torch.long) * 8
         img = self.diffusion_scheduler.add_noise(original_samples=img, noise=noise, timesteps=trunc_timesteps)
         noisy_trajs = self.denorm_odo(img)
@@ -985,7 +1013,14 @@ class TrajectoryHead(nn.Module):
                 timestep=k,
                 sample=img
             ).prev_sample
-        mode_idx = poses_cls.argmax(dim=-1)
+        mode_idx, temporal_diagnostics = self._select_mode_with_temporal_rescore(
+            poses_reg,
+            poses_cls,
+            previous_trajectory,
+            previous_ego_delta,
+        )
         mode_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
         best_reg = torch.gather(poses_reg, 1, mode_idx).squeeze(1)
-        return {"trajectory": best_reg}
+        output = {"trajectory": best_reg}
+        output.update(temporal_diagnostics)
+        return output

@@ -56,6 +56,14 @@ class TransfuserAgent(AbstractAgent):
         self._temporal_reset_distance = 5.0
         self._last_temporal_reference_active = False
         self._last_previous_ego_delta_active = False
+        self._last_temporal_rescore_active = 0.0
+        self._last_temporal_rescore_changed = 0.0
+        self._last_temporal_rescore_selected_cost = 0.0
+        self._last_temporal_rescore_base_cost = 0.0
+        self._last_temporal_rescore_topk_min_cost = 0.0
+        self._last_temporal_rescore_cls_margin = 0.0
+        self._last_temporal_rescore_selected_mode = 0.0
+        self._last_temporal_rescore_base_mode = 0.0
         self.init_from_pretrained()
 
     def init_from_pretrained(self):
@@ -133,6 +141,14 @@ class TransfuserAgent(AbstractAgent):
         self._previous_trajectory = None
         self._last_temporal_reference_active = False
         self._last_previous_ego_delta_active = False
+        self._last_temporal_rescore_active = 0.0
+        self._last_temporal_rescore_changed = 0.0
+        self._last_temporal_rescore_selected_cost = 0.0
+        self._last_temporal_rescore_base_cost = 0.0
+        self._last_temporal_rescore_topk_min_cost = 0.0
+        self._last_temporal_rescore_cls_margin = 0.0
+        self._last_temporal_rescore_selected_mode = 0.0
+        self._last_temporal_rescore_base_mode = 0.0
 
     def _build_temporal_reference(self, agent_input: AgentInput) -> Optional[np.ndarray]:
         if self._previous_trajectory is None or len(agent_input.ego_statuses) < 2:
@@ -161,11 +177,28 @@ class TransfuserAgent(AbstractAgent):
         previous_ego_pose = agent_input.ego_statuses[-2].ego_pose
         return (-previous_ego_pose[:2]).astype(np.float32)
 
-    def get_temporal_debug_info(self) -> Dict[str, bool]:
+    def get_temporal_debug_info(self) -> Dict[str, Any]:
         return {
             "temporal_reference_active": self._last_temporal_reference_active,
             "previous_ego_delta_active": self._last_previous_ego_delta_active,
+            "temporal_rescore_active": self._last_temporal_rescore_active,
+            "temporal_rescore_changed": self._last_temporal_rescore_changed,
+            "temporal_rescore_selected_cost": self._last_temporal_rescore_selected_cost,
+            "temporal_rescore_base_cost": self._last_temporal_rescore_base_cost,
+            "temporal_rescore_topk_min_cost": self._last_temporal_rescore_topk_min_cost,
+            "temporal_rescore_cls_margin": self._last_temporal_rescore_cls_margin,
+            "temporal_rescore_selected_mode": self._last_temporal_rescore_selected_mode,
+            "temporal_rescore_base_mode": self._last_temporal_rescore_base_mode,
         }
+
+    @staticmethod
+    def _prediction_scalar(predictions: Dict[str, torch.Tensor], key: str) -> float:
+        value = predictions.get(key)
+        if value is None:
+            return 0.0
+        if torch.is_tensor(value):
+            return float(value.detach().float().mean().cpu().item())
+        return float(value)
 
     def compute_trajectory(self, agent_input: AgentInput) -> Trajectory:
         """
@@ -194,6 +227,14 @@ class TransfuserAgent(AbstractAgent):
                 previous_trajectory=previous_trajectory_tensor,
                 previous_ego_delta=previous_ego_delta_tensor,
             )
+            self._last_temporal_rescore_active = self._prediction_scalar(predictions, "temporal_rescore_active")
+            self._last_temporal_rescore_changed = self._prediction_scalar(predictions, "temporal_rescore_changed")
+            self._last_temporal_rescore_selected_cost = self._prediction_scalar(predictions, "temporal_rescore_selected_cost")
+            self._last_temporal_rescore_base_cost = self._prediction_scalar(predictions, "temporal_rescore_base_cost")
+            self._last_temporal_rescore_topk_min_cost = self._prediction_scalar(predictions, "temporal_rescore_topk_min_cost")
+            self._last_temporal_rescore_cls_margin = self._prediction_scalar(predictions, "temporal_rescore_cls_margin")
+            self._last_temporal_rescore_selected_mode = self._prediction_scalar(predictions, "temporal_rescore_selected_mode")
+            self._last_temporal_rescore_base_mode = self._prediction_scalar(predictions, "temporal_rescore_base_mode")
             poses = predictions["trajectory"].squeeze(0).numpy()
 
         self._previous_trajectory = poses.copy()

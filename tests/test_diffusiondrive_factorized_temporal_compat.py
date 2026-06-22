@@ -70,6 +70,9 @@ def _make_head():
     head.temporal_lateral_accel_tolerance = 4.89
     head.temporal_turn_change_tolerance = 0.48
     head.temporal_jerk_delta_tolerance = 0.50
+    head.temporal_rescore_topk = 5
+    head.temporal_rescore_alpha = 0.05
+    head.temporal_rescore_cost_clamp = 2.0
     return head
 
 
@@ -177,6 +180,37 @@ def test_matching_anchor_gets_lower_noise_than_mismatched_anchor():
     noise_scale = head._temporal_noise_scale(plan_anchor, previous, executed_delta)
 
     assert noise_scale[0, 0, 0, 0] < noise_scale[0, 1, 0, 0]
+
+
+def test_temporal_rescore_can_change_selection_inside_cls_topk():
+    head = _make_head()
+    head.temporal_rescore_topk = 3
+    head.temporal_rescore_alpha = 1.0
+    poses_reg = torch.zeros(1, 5, 8, 3)
+    poses_cls = torch.tensor([[1.0, 0.95, 0.90, 0.1, 0.0]])
+    temporal_cost = torch.tensor([[2.0, 0.0, 1.0, 0.0, 0.0]])
+    head._temporal_compatibility_cost = lambda *args, **kwargs: temporal_cost
+
+    mode_idx, diagnostics = head._select_mode_with_temporal_rescore(poses_reg, poses_cls)
+
+    assert mode_idx.item() == 1
+    assert diagnostics["temporal_rescore_active"].item() == 1.0
+    assert diagnostics["temporal_rescore_changed"].item() == 1.0
+
+
+def test_temporal_rescore_does_not_allow_outside_topk_to_win():
+    head = _make_head()
+    head.temporal_rescore_topk = 3
+    head.temporal_rescore_alpha = 1.0
+    poses_reg = torch.zeros(1, 5, 8, 3)
+    poses_cls = torch.tensor([[1.0, 0.95, 0.90, 0.1, 0.0]])
+    temporal_cost = torch.tensor([[2.0, 1.5, 1.0, -10.0, -10.0]])
+    head._temporal_compatibility_cost = lambda *args, **kwargs: temporal_cost
+
+    mode_idx, diagnostics = head._select_mode_with_temporal_rescore(poses_reg, poses_cls)
+
+    assert mode_idx.item() in {0, 1, 2}
+    assert diagnostics["temporal_rescore_active"].item() == 1.0
 
 
 def test_near_horizon_reference_ignores_far_anchor_points():

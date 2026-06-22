@@ -362,3 +362,36 @@ CHANGELOG.txt
 
 与论文撰写的关系：
 3.9 可作为 3.8 的语义修正版，用于说明本文的 temporal compatibility 不是简单的轨迹相似性约束，而是基于专家驾驶舒适性阈值的历史连接 violation cost。该版本也让 energy supervision 的表述更清晰：energy 负责在 GT top-K 内分配监督权重，真正反传的 auxiliary 只包含 GT regression、temporal violation 和 comfort violation，不再重复引入独立 speed loss。
+修改主题：3.11 Temporal Rescoring Diagnostic
+修改日期：2026-06-22
+
+修改目的：
+基于 3.9 的 tolerance-based temporal compatibility cost，重新收敛实验变量。此前 3.1-3.4 基本不涨不降，说明仅靠 temporal noise modulation 很难稳定影响最终 PDM；3.5 以后改动训练 loss 后出现明显下降，说明 temporal 信号直接进入训练主目标风险较高。3.11 因此不再改训练 loss、不再改训练阶段噪声、不再用 temporal energy 反传，而是只在测试/验证阶段对模型已经生成的 20 个候选轨迹做轻量 top-K rescoring，用来判断历史连接性是否能作为最终 mode selection 的辅助信号。
+
+涉及文件：
+navsim/agents/diffusiondrive/transfuser_model_v2.py
+navsim/agents/diffusiondrive/transfuser_agent.py
+navsim/planning/script/run_pdm_score.py
+tests/test_diffusiondrive_factorized_temporal_compat.py
+CHANGELOG.txt
+
+核心改动：
+1. 基于 3.9 新建 3.11 分支，保留 executed_delta -> q0、p1-p0 -> q1-q0、p2-p1 -> q2-q1 的 tolerance-based temporal cost。
+2. 训练阶段关闭 temporal noise modulation，forward_train 使用原始 DiffusionDrive 的随机噪声分布。
+3. 训练阶段关闭 energy auxiliary supervision，LossComputer 不再接收 temporal_context，训练 loss 回到原始 trajectory classification/regression 逻辑。
+4. 测试阶段关闭 temporal noise modulation，denoising 生成过程不再被 temporal cost 改写。
+5. 测试阶段新增 top-K temporal rescoring：先按 poses_cls 取 top-5，再在 top-5 内计算 score_i = cls_i - alpha * normalized_temporal_cost_i，默认 alpha=0.05。
+6. normalized_temporal_cost 只在当前样本 top-K 内标准化并 clamp 到 [-2, 2]，避免绝对 cost 尺度直接支配分类分数。
+7. top-K 外 mode 即使 temporal cost 很低也不能逆袭，避免历史连接性错误奖励远离模型高置信候选的轨迹。
+8. 新增诊断字段：temporal_rescore_active、temporal_rescore_changed、temporal_rescore_selected_cost、temporal_rescore_base_cost、temporal_rescore_topk_min_cost、temporal_rescore_cls_margin、temporal_rescore_selected_mode、temporal_rescore_base_mode。
+9. TransfuserAgent 缓存上述诊断字段，run_pdm_score.py 将 get_temporal_debug_info() 返回的数值字段自动写入 CSV。
+10. 更新轻量测试，覆盖 top-K 内可重排、top-K 外不能逆袭等行为。
+
+预期影响：
+3.11 的目标不是直接训练出新的 temporal 能力，而是用最小侵入方式回答一个关键问题：在原始 DiffusionDrive 已经生成的候选轨迹中，历史连接性是否能帮助最终 mode selection。如果 3.11 的 PDM 有提升，说明 temporal compatibility 更适合作为选择校准器，再考虑后续把该偏好蒸馏进分类头；如果 3.11 没有提升或下降，说明当前 temporal cost 与 PDM 相关性不足，继续加训练 loss 不应作为优先方向。
+
+测试/验证结果：
+本地不运行测试、pytest、manual runner 或 smoke。轻量测试文件已更新，等待服务器 smoke/full validation。
+
+与论文撰写的关系：
+3.11 可作为“Temporal Rescoring Diagnostic”消融实验，用于区分 temporal idea 本身是否有选择价值，以及此前训练侧 auxiliary loss 下降是否来自过强梯度干扰。该版本强调 Energy/Temporal cost 先作为 inference-time mode selection signal，而不是直接作为 trajectory regression penalty。

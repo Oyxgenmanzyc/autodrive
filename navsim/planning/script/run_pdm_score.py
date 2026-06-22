@@ -42,14 +42,21 @@ def _get_agent_temporal_flags(agent: AbstractAgent) -> Dict[str, float]:
     """Read optional temporal debug flags for CSV output."""
     if hasattr(agent, "get_temporal_debug_info"):
         debug_info = agent.get_temporal_debug_info()
-        return {
-            "temporal_reference_active": float(bool(debug_info.get("temporal_reference_active", False))),
-            "previous_ego_delta_active": float(bool(debug_info.get("previous_ego_delta_active", False))),
-        }
+        flags = {}
+        for key, value in debug_info.items():
+            if isinstance(value, bool):
+                flags[key] = float(value)
+            elif isinstance(value, (int, float)):
+                flags[key] = float(value)
+        flags.setdefault("temporal_reference_active", 0.0)
+        flags.setdefault("previous_ego_delta_active", 0.0)
+        return flags
 
     return {
         "temporal_reference_active": float(bool(getattr(agent, "_last_temporal_reference_active", False))),
         "previous_ego_delta_active": float(bool(getattr(agent, "_last_previous_ego_delta_active", False))),
+        "temporal_rescore_active": float(getattr(agent, "_last_temporal_rescore_active", 0.0)),
+        "temporal_rescore_changed": float(getattr(agent, "_last_temporal_rescore_changed", 0.0)),
     }
 
 
@@ -120,6 +127,14 @@ def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[D
                 "valid": True,
                 "temporal_reference_active": 0.0,
                 "previous_ego_delta_active": 0.0,
+                "temporal_rescore_active": 0.0,
+                "temporal_rescore_changed": 0.0,
+                "temporal_rescore_selected_cost": 0.0,
+                "temporal_rescore_base_cost": 0.0,
+                "temporal_rescore_topk_min_cost": 0.0,
+                "temporal_rescore_cls_margin": 0.0,
+                "temporal_rescore_selected_mode": 0.0,
+                "temporal_rescore_base_mode": 0.0,
             }
             try:
                 metric_cache_path = metric_cache_loader.metric_cache_paths[token]
