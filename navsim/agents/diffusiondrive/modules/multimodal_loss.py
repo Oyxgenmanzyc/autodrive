@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import functools
+import math
 from typing import Callable, Dict, Optional
 from torch import Tensor
 from navsim.agents.diffusiondrive.transfuser_config import TransfuserConfig
@@ -125,13 +126,10 @@ class LossComputer(nn.Module):
         self.energy_temperature = 0.5
         self.energy_start_epoch = 70
         self.energy_full_epoch = 85
-        self.energy_target_gamma_max = 0.5
-        self.energy_aux_weight_max = 0.12
+        self.energy_target_gamma_max = 0.35
         self.energy_gt_weight = 0.60
         self.energy_temporal_weight = 0.30
         self.energy_comfort_weight = 0.10
-        self.energy_aux_temporal_weight = 0.60
-        self.energy_aux_comfort_weight = 0.40
 
     @staticmethod
     def _as_schedule_tensor(value, device, dtype):
@@ -151,17 +149,23 @@ class LossComputer(nn.Module):
     def _gather_topk(values: Tensor, topk_idx: Tensor) -> Tensor:
         return torch.gather(values, 1, topk_idx)
 
+    @staticmethod
+    def _smooth_ramp(ramp: Tensor) -> Tensor:
+        ramp = ramp.clamp(0.0, 1.0)
+        return 0.5 - 0.5 * torch.cos(ramp * math.pi)
+
     def _energy_ramp(self, temporal_context: Dict[str, Tensor], device, dtype) -> Tensor:
         ramp_override = temporal_context.get("energy_ramp_override")
         if ramp_override is not None:
-            return self._as_schedule_tensor(ramp_override, device, dtype).clamp(0.0, 1.0)
+            return self._smooth_ramp(self._as_schedule_tensor(ramp_override, device, dtype))
 
         epoch = self._as_schedule_tensor(temporal_context.get("energy_training_epoch"), device, dtype)
         if epoch is None:
             return torch.zeros((), device=device, dtype=dtype)
         start_epoch = float(temporal_context.get("energy_start_epoch", self.energy_start_epoch))
         full_epoch = float(temporal_context.get("energy_full_epoch", self.energy_full_epoch))
-        return ((epoch - start_epoch) / (full_epoch - start_epoch + 1e-6)).clamp(0.0, 1.0)
+        linear_ramp = (epoch - start_epoch) / (full_epoch - start_epoch + 1e-6)
+        return self._smooth_ramp(linear_ramp)
 
     def _energy_supervision(
         self,
@@ -219,25 +223,10 @@ class LossComputer(nn.Module):
         target_gamma = ramp * float(temporal_context.get("energy_target_gamma_max", self.energy_target_gamma_max))
         cls_soft_target = (1.0 - target_gamma) * one_hot_target + target_gamma * energy_target
 
-        reg_per_mode = torch.abs(poses_reg - target_traj.unsqueeze(1)).mean(dim=(-1, -2))
-        topk_reg = self._gather_topk(reg_per_mode, topk_idx)
-        aux_temporal_weight = float(temporal_context.get("energy_aux_temporal_weight", self.energy_aux_temporal_weight))
-        aux_comfort_weight = float(temporal_context.get("energy_aux_comfort_weight", self.energy_aux_comfort_weight))
-        weighted_quality = (
-            topk_reg
-            + aux_temporal_weight * topk_temporal.clamp(max=2.0)
-            + aux_comfort_weight * topk_comfort.clamp(max=2.0)
-        )
-        aux_raw = (topk_prob * weighted_quality).sum(dim=1).mean()
-        aux_weight = ramp * float(temporal_context.get("energy_aux_weight_max", self.energy_aux_weight_max))
-        aux_loss = aux_weight * aux_raw
-
         entropy = -(topk_prob * torch.log(topk_prob + 1e-6)).sum(dim=1).mean()
         return {
             "cls_soft_target": cls_soft_target,
-            "energy_aux_loss": aux_loss,
-            "energy_aux_raw": aux_raw.detach(),
-            "energy_supervision_weight": aux_weight.detach(),
+            "energy_supervision_weight": target_gamma.detach(),
             "energy_target_gamma": target_gamma.detach(),
             "energy_soft_entropy": entropy.detach(),
             "energy_selected_cost": (topk_prob * energy).sum(dim=1).mean().detach(),
@@ -294,7 +283,6 @@ class LossComputer(nn.Module):
         # Combine classification and regression losses
         ret_loss = loss_cls + reg_loss
         if energy_info is not None:
-            ret_loss = ret_loss + energy_info["energy_aux_loss"]
             logged_energy_info = {
                 key: value.detach() if torch.is_tensor(value) else value
                 for key, value in energy_info.items()

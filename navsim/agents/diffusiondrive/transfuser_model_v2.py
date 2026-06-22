@@ -434,13 +434,10 @@ class TrajectoryHead(nn.Module):
         self.energy_temperature = 0.5
         self.energy_start_epoch = 70
         self.energy_full_epoch = 85
-        self.energy_target_gamma_max = 0.5
-        self.energy_aux_weight_max = 0.12
+        self.energy_target_gamma_max = 0.35
         self.energy_gt_weight = 0.60
         self.energy_temporal_weight = 0.30
         self.energy_comfort_weight = 0.10
-        self.energy_aux_temporal_weight = 0.60
-        self.energy_aux_comfort_weight = 0.40
 
         self.diffusion_scheduler = DDIMScheduler(
             num_train_timesteps=1000,
@@ -815,12 +812,9 @@ class TrajectoryHead(nn.Module):
             "energy_start_epoch": self.energy_start_epoch,
             "energy_full_epoch": self.energy_full_epoch,
             "energy_target_gamma_max": self.energy_target_gamma_max,
-            "energy_aux_weight_max": self.energy_aux_weight_max,
             "energy_gt_weight": self.energy_gt_weight,
             "energy_temporal_weight": self.energy_temporal_weight,
             "energy_comfort_weight": self.energy_comfort_weight,
-            "energy_aux_temporal_weight": self.energy_aux_temporal_weight,
-            "energy_aux_comfort_weight": self.energy_aux_comfort_weight,
         }
 
     def _temporal_noise_scale(self, plan_anchor, previous_trajectory, previous_ego_delta=None):
@@ -913,8 +907,7 @@ class TrajectoryHead(nn.Module):
                     trajectory_loss.detach(),
                 )
                 for key, value in energy_loss_dict.items():
-                    if key != "trajectory_scaled_energy_aux_loss":
-                        trajectory_loss_dict[f"{key}_{idx}"] = value
+                    trajectory_loss_dict[f"{key}_{idx}"] = value
             else:
                 trajectory_loss = trajectory_loss_output
                 original_trajectory_loss = trajectory_loss.detach()

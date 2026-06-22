@@ -265,13 +265,10 @@ def _energy_context(epoch, temporal_cost=None):
         "energy_temperature": 0.5,
         "energy_start_epoch": 70,
         "energy_full_epoch": 85,
-        "energy_target_gamma_max": 0.5,
-        "energy_aux_weight_max": 0.12,
+        "energy_target_gamma_max": 0.35,
         "energy_gt_weight": 0.60,
         "energy_temporal_weight": 0.30,
         "energy_comfort_weight": 0.10,
-        "energy_aux_temporal_weight": 0.60,
-        "energy_aux_comfort_weight": 0.40,
     }
 
 
@@ -308,6 +305,7 @@ def test_energy_soft_target_prefers_low_energy_mode_inside_gt_topk():
 
     assert cls_soft_target[0, 1] > 0.0
     assert cls_soft_target[0, 1] > cls_soft_target[0, 2]
+    assert "energy_aux_loss" not in energy_info
 
 
 def test_energy_supervision_does_not_reward_mode_outside_gt_topk():
@@ -344,3 +342,15 @@ def test_energy_soft_weights_are_detached_from_backprop_target():
     )
 
     assert not energy_info["cls_soft_target"].requires_grad
+
+
+def test_energy_ramp_uses_smooth_cosine_schedule():
+    loss_computer = _make_loss_computer()
+
+    ramp_start = loss_computer._energy_ramp(_energy_context(epoch=70), torch.device("cpu"), torch.float32)
+    ramp_mid = loss_computer._energy_ramp(_energy_context(epoch=77.5), torch.device("cpu"), torch.float32)
+    ramp_full = loss_computer._energy_ramp(_energy_context(epoch=85), torch.device("cpu"), torch.float32)
+
+    assert torch.allclose(ramp_start, torch.tensor(0.0), atol=1e-5)
+    assert torch.allclose(ramp_mid, torch.tensor(0.5), atol=1e-4)
+    assert torch.allclose(ramp_full, torch.tensor(1.0), atol=1e-5)

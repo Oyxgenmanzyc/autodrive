@@ -362,3 +362,37 @@ CHANGELOG.txt
 
 与论文撰写的关系：
 3.9 可作为 3.8 的语义修正版，用于说明本文的 temporal compatibility 不是简单的轨迹相似性约束，而是基于专家驾驶舒适性阈值的历史连接 violation cost。该版本也让 energy supervision 的表述更清晰：energy 负责在 GT top-K 内分配监督权重，真正反传的 auxiliary 只包含 GT regression、temporal violation 和 comfort violation，不再重复引入独立 speed loss。
+修改主题：3.10 Energy Ranking-Only Temporal Supervision
+修改日期：2026-06-22
+
+修改目的：
+基于 3.9 tolerance-based temporal energy supervision，进一步降低 temporal loss 对原始轨迹回归和 mode 分工的干扰。3.6 的服务器结果明显下降，说明直接把 temporal auxiliary regression/quality loss 加进训练目标可能会破坏 DiffusionDrive 原有的 imitation、classification 和 regression 平衡。3.10 将 temporal energy 降级为 GT top-K 内的分类排序信号，只负责告诉分类头在多个接近 GT 的候选中更偏向连接自然、动态合理的 mode，不再直接对候选轨迹坐标施加额外 regression auxiliary loss。
+
+涉及文件：
+navsim/agents/diffusiondrive/modules/multimodal_loss.py
+navsim/agents/diffusiondrive/transfuser_model_v2.py
+navsim/planning/script/config/common/agent/diffusiondrive_agent.yaml
+navsim/planning/script/config/training/default_training.yaml
+tests/test_diffusiondrive_factorized_temporal_compat.py
+CHANGELOG.txt
+
+核心改动：
+1. 基于 3.9 新建 3.10 分支，保留 tolerance-based temporal violation cost、loss-aware energy start、GT top-K energy ranking、test-time temporal noise modulation 和 eval/PDM 流程。
+2. 删除训练阶段的 energy-weighted top-K regression/quality auxiliary loss，不再将 L_gt_reg_i、L_temporal_i、L_comfort_i 作为额外加和项加入总 loss。
+3. Energy 仍在 GT top-K 内计算：E_i = 0.60 C_gt_i + 0.30 C_temporal_i + 0.10 C_comfort_i，各分量在样本 top-K 内标准化。
+4. p_i = softmax(-E_i / temperature).detach() 仍作为监督分配目标，detach 保证 energy 本身不反传，避免模型通过轨迹坐标直接“钻 energy 公式的空子”。
+5. 分类监督保留 one-hot GT target 与 energy soft target 的混合，但最大混合系数从 0.50 下调为 0.35，降低对原始 mode assignment 的冲击。
+6. energy ramp 从线性 ramp 改为 cosine smooth ramp：0.5 - 0.5 * cos(pi * progress)，减少启动和达到最大权重时的目标突变。
+7. LossComputer 返回的 energy_supervision_weight 现在表示实际分类 soft target 混合强度 target_gamma，不再表示 auxiliary loss 权重。
+8. TrajectoryHead 的 energy context 删除 energy_aux_weight_max、energy_aux_temporal_weight、energy_aux_comfort_weight 等旧字段，避免误解为仍然存在 regression auxiliary loss。
+9. 训练配置同步服务器实验设置：diffusiondrive_agent.yaml 的 lr 改为 6e-4；default_training.yaml 的 batch_size 改为 128，并保留 DDP、16-mixed、max_epochs=100、use_cache_without_dataset=true、force_cache_computation=false。
+10. 更新轻量测试文件，验证 energy supervision 只产生分类 soft target，不再包含 energy_aux_loss，并覆盖 cosine ramp 的基本行为。
+
+预期影响：
+3.10 的核心假设是：历史连接性更适合作为 mode ranking / classification calibration 信号，而不是直接作为强回归约束改变轨迹形状。这样可以保留原始 DiffusionDrive 学到的轨迹生成能力，同时在 GT top-K 候选内部让分类头更偏向 temporal violation 和 comfort violation 更低的候选。如果 3.10 相比 3.9 更稳定，说明此前性能下降主要来自 auxiliary regression 对主任务梯度的干扰；如果仍然下降，则需要进一步考虑只在 eval selection 或单独 ranking head 中使用 temporal energy，而不是改训练主 loss。
+
+测试/验证结果：
+本地不运行测试、pytest、manual runner 或 smoke。轻量测试文件已随语义更新，等待服务器 smoke/full validation。
+
+与论文撰写的关系：
+3.10 可作为“Energy Ranking-Only Temporal Supervision”实验，用于论证 temporal energy 不是普通轨迹惩罚项，而是 GT top-K 内的监督分配器。论文表述重点可以放在：为了避免多目标 auxiliary loss 破坏原有轨迹回归，本实验只让 energy 影响 mode classification target，从而更贴近 metric learning / ranking loss 的思想。
