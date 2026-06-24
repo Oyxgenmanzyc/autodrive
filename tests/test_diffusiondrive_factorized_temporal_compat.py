@@ -309,6 +309,21 @@ def _energy_context(epoch, temporal_cost=None):
     }
 
 
+def _comfort_energy_context(epoch, temporal_cost=None, comfort_cost=None):
+    context = _energy_context(epoch, temporal_cost)
+    if comfort_cost is None:
+        comfort_cost = torch.tensor([[0.0, 2.0, 0.0, 0.0, 0.0]])
+    context.update(
+        {
+            "energy_comfort_cost": comfort_cost,
+            "energy_temporal_weight": 0.80,
+            "energy_comfort_weight": 0.20,
+            "temporal_rank_use_comfort": True,
+        }
+    )
+    return context
+
+
 def test_temporal_rank_inactive_before_min_epoch_matches_original_loss():
     loss_computer = _make_loss_computer()
     poses_reg, poses_cls, target, plan_anchor = _energy_test_inputs()
@@ -383,3 +398,25 @@ def test_temporal_rank_uses_detached_energy_but_backprops_to_logits():
 
     assert poses_cls.grad is not None
     assert poses_reg.grad is None
+
+
+def test_temporal_comfort_rank_can_use_comfort_inside_gt_topk():
+    loss_computer = _make_loss_computer()
+    poses_reg, poses_cls, target, plan_anchor = _energy_test_inputs()
+    poses_cls[:, 0] = 0.5
+    poses_cls[:, 1] = -0.5
+    dist = torch.linalg.norm(target["trajectory"].unsqueeze(1)[..., :2] - plan_anchor, dim=-1).mean(dim=-1)
+    cls_target = torch.argmin(dist, dim=-1)
+    temporal_cost = torch.tensor([[0.0, 0.0, 0.0, 5.0, 5.0]])
+    comfort_cost = torch.tensor([[0.0, 2.0, 0.0, 0.0, 0.0]])
+
+    energy_info = loss_computer._energy_supervision(
+        poses_reg,
+        target["trajectory"],
+        dist,
+        cls_target,
+        _comfort_energy_context(epoch=80, temporal_cost=temporal_cost, comfort_cost=comfort_cost),
+    )
+
+    assert energy_info["temporal_rank_active_ratio"] == 1.0
+    assert energy_info["temporal_rank_bad_cost"] == 0.0

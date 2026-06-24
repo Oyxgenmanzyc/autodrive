@@ -127,14 +127,14 @@ class LossComputer(nn.Module):
         self.energy_start_epoch = 70
         self.energy_full_epoch = 85
         self.energy_gt_weight = 0.60
-        self.energy_temporal_weight = 1.00
-        self.energy_comfort_weight = 0.00
+        self.energy_temporal_weight = 0.80
+        self.energy_comfort_weight = 0.20
         self.temporal_rank_weight_max = 0.01
         self.temporal_rank_margin = 0.10
         self.temporal_rank_energy_gap = 0.20
         self.temporal_rank_min_epoch = 50.0
         self.temporal_rank_ramp_epochs = 30.0
-        self.temporal_rank_use_comfort = False
+        self.temporal_rank_use_comfort = True
         self.temporal_aux_weight_max = 0.0
 
     @staticmethod

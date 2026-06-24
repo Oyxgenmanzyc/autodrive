@@ -395,6 +395,34 @@ CHANGELOG.txt
 
 与论文撰写的关系：
 3.11 可作为“Temporal Rescoring Diagnostic”消融实验，用于区分 temporal idea 本身是否有选择价值，以及此前训练侧 auxiliary loss 下降是否来自过强梯度干扰。该版本强调 Energy/Temporal cost 先作为 inference-time mode selection signal，而不是直接作为 trajectory regression penalty。
+修改主题：3.13 Temporal + Comfort Pairwise Ranking Loss
+修改日期：2026-06-24
+
+修改目的：
+基于 3.12 temporal pairwise ranking loss，单独加入 comfort proxy 作为第二个排序因子，用于验证“历史连接性 + 轨迹内生舒适性”是否比纯 temporal ranking 更接近最终 PDM 评价。该版本仍不改原始分类 one-hot target，不改 best-mode regression，不引入 energy soft target。
+
+涉及文件：
+navsim/agents/diffusiondrive/transfuser_model_v2.py
+navsim/agents/diffusiondrive/modules/multimodal_loss.py
+tests/test_diffusiondrive_factorized_temporal_compat.py
+CHANGELOG.txt
+
+核心改动：
+1. ranking energy 从 3.12 的纯 temporal cost 改为 temporal + comfort 组合。
+2. 默认权重为 temporal=0.80、comfort=0.20；GT 仍只用于 top-K 候选筛选，不作为排序 energy 的主要项。
+3. comfort proxy 继续使用 3.9 的 tolerance-based jerk / turn-smoothness violation，正常舒适变化不惩罚。
+4. 保持 lambda_max=0.01、margin=0.10、energy_gap=0.20、min_epoch=50、ramp_epochs=30。
+5. 保持分类 one-hot target 和 best-mode regression 完全不变，comfort 只影响 top-K 内 good/bad pair 的选择。
+
+预期影响：
+若 3.13 相比 3.12 更稳定或 PDM 更高，说明 comfort proxy 对 mode ranking 有增益；若 3.13 下降而 3.12 稳定，则说明 comfort proxy 与 PDM 或原模型分类分工不够一致，应优先保留 temporal-only ranking。
+
+测试/验证结果：
+本地不运行 pytest、manual runner 或 smoke。轻量测试增加 comfort 参与 top-K ranking 的覆盖，等待服务器 smoke/full validation。
+
+与论文撰写的关系：
+3.13 可作为 “Temporal-Comfort Pairwise Ranking” 消融，用于说明 comfort proxy 是否应当进入最终训练目标。它和 3.12 的差异只有排序 energy 是否加入 comfort，便于论文中做 ablation 分析。
+
 修改主题：3.12 Temporal Pairwise Ranking Loss
 修改日期：2026-06-24
 
