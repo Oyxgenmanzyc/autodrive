@@ -395,3 +395,34 @@ CHANGELOG.txt
 
 与论文撰写的关系：
 3.11 可作为“Temporal Rescoring Diagnostic”消融实验，用于区分 temporal idea 本身是否有选择价值，以及此前训练侧 auxiliary loss 下降是否来自过强梯度干扰。该版本强调 Energy/Temporal cost 先作为 inference-time mode selection signal，而不是直接作为 trajectory regression penalty。
+修改主题：3.12 Temporal Pairwise Ranking Loss
+修改日期：2026-06-24
+
+修改目的：
+基于 3.11 temporal rescoring diagnostic，将历史连接性重新引入训练，但不再采用 3.9/3.10 的 energy soft target，也不修改原始 best-mode regression。3.12 只验证一个最小问题：在 GT top-K 合理候选内部，temporal violation 更低的 mode 是否应当获得略高的分类 logit 排序。
+
+涉及文件：
+navsim/agents/diffusiondrive/transfuser_model_v2.py
+navsim/agents/diffusiondrive/modules/multimodal_loss.py
+navsim/agents/diffusiondrive/modules/scheduler.py
+tests/test_diffusiondrive_factorized_temporal_compat.py
+CHANGELOG.txt
+
+核心改动：
+1. 训练阶段重新向 LossComputer 传入 temporal context，但只用于 pairwise ranking loss。
+2. 删除训练阶段对 cls_soft_target 的使用，分类监督始终保持原始 one-hot GT best mode。
+3. 删除 energy-weighted top-K regression/quality auxiliary，不再把 temporal cost 直接作为轨迹坐标回归惩罚。
+4. 在 GT top-K=3 内选 temporal cost 最低的 good mode 和最高的 bad mode，若 cost gap 大于 0.20，则使用 softplus(margin - (logit_good - logit_bad))。
+5. ranking loss 权重极小，lambda_max=0.01；margin=0.10；min_epoch=50；ramp_epochs=30，使用 cosine smooth ramp，避免早期开启和突然跳变。
+6. Energy/temporal cost 在排序时 detach，只决定 good/bad pair，不让模型通过轨迹坐标反向优化 cost 公式。
+7. 新增日志：temporal_rank_loss、temporal_rank_raw、temporal_rank_weight、temporal_rank_ramp、temporal_rank_active_ratio、temporal_rank_energy_gap、temporal_rank_logit_margin、temporal_rank_good_cost、temporal_rank_bad_cost。
+8. 同步加入 WarmupCosLR 的 PyTorch 版本兼容修复，避免云端新版 LRScheduler 不接受 verbose positional 参数导致训练启动失败；该补丁不改变学习率曲线。
+
+预期影响：
+3.12 将 temporal signal 限制为“分类排序正则”，不改主标签、不改主回归、不作用 top-K 外 mode。若 loss 曲线稳定且 PDM 或 3.11 rescoring 诊断改善，说明历史连接性适合被蒸馏为 mode ranking 偏好；若仍下降，则说明当前 temporal cost 与最终驾驶质量相关性不足，应优先继续改 cost 而不是加大训练 loss。
+
+测试/验证结果：
+本地不运行 pytest、manual runner 或 smoke。轻量测试文件已更新，覆盖 ranking 在 min_epoch 前不生效、rank loss 不生成 cls_soft_target、top-K 外 mode 不参与 ranking、energy detach 但 logits 可反传。等待服务器 smoke/full validation。
+
+与论文撰写的关系：
+3.12 可表述为 “Temporal Pairwise Ranking Distillation”。它把历史连接性从直接轨迹惩罚改为 GT top-K 内的弱排序监督，更接近 metric learning / ranking loss 思想，避免 3.9 中 soft target 和 auxiliary regression 对原始 DiffusionDrive 监督造成强干扰。

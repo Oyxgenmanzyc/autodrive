@@ -434,13 +434,16 @@ class TrajectoryHead(nn.Module):
         self.energy_temperature = 0.5
         self.energy_start_epoch = 70
         self.energy_full_epoch = 85
-        self.energy_target_gamma_max = 0.5
-        self.energy_aux_weight_max = 0.12
-        self.energy_gt_weight = 0.60
-        self.energy_temporal_weight = 0.30
-        self.energy_comfort_weight = 0.10
-        self.energy_aux_temporal_weight = 0.60
-        self.energy_aux_comfort_weight = 0.40
+        self.energy_gt_weight = 0.00
+        self.energy_temporal_weight = 1.00
+        self.energy_comfort_weight = 0.00
+        self.temporal_rank_weight_max = 0.01
+        self.temporal_rank_margin = 0.10
+        self.temporal_rank_energy_gap = 0.20
+        self.temporal_rank_min_epoch = 50.0
+        self.temporal_rank_ramp_epochs = 30.0
+        self.temporal_rank_use_comfort = False
+        self.temporal_aux_weight_max = 0.0
         self.temporal_rescore_topk = 5
         self.temporal_rescore_alpha = 0.05
         self.temporal_rescore_cost_clamp = 2.0
@@ -817,13 +820,16 @@ class TrajectoryHead(nn.Module):
             "energy_temperature": self.energy_temperature,
             "energy_start_epoch": self.energy_start_epoch,
             "energy_full_epoch": self.energy_full_epoch,
-            "energy_target_gamma_max": self.energy_target_gamma_max,
-            "energy_aux_weight_max": self.energy_aux_weight_max,
             "energy_gt_weight": self.energy_gt_weight,
             "energy_temporal_weight": self.energy_temporal_weight,
             "energy_comfort_weight": self.energy_comfort_weight,
-            "energy_aux_temporal_weight": self.energy_aux_temporal_weight,
-            "energy_aux_comfort_weight": self.energy_aux_comfort_weight,
+            "temporal_rank_weight_max": self.temporal_rank_weight_max,
+            "temporal_rank_margin": self.temporal_rank_margin,
+            "temporal_rank_energy_gap": self.temporal_rank_energy_gap,
+            "temporal_rank_min_epoch": self.temporal_rank_min_epoch,
+            "temporal_rank_ramp_epochs": self.temporal_rank_ramp_epochs,
+            "temporal_rank_use_comfort": self.temporal_rank_use_comfort,
+            "temporal_aux_weight_max": self.temporal_aux_weight_max,
         }
 
     def _temporal_noise_scale(self, plan_anchor, previous_trajectory, previous_ego_delta=None):
@@ -925,6 +931,13 @@ class TrajectoryHead(nn.Module):
 
         # 4. begin the stacked decoder
         poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)
+        temporal_context = self._energy_loss_context(
+            poses_reg_list[-1][..., :2],
+            previous_trajectory,
+            previous_ego_delta,
+            training_epoch,
+            energy_ramp_override,
+        )
 
         trajectory_loss_dict = {}
         ret_traj_loss = 0
@@ -935,7 +948,7 @@ class TrajectoryHead(nn.Module):
                 poses_cls,
                 targets,
                 plan_anchor,
-                temporal_context=None,
+                temporal_context=temporal_context,
             )
             if isinstance(trajectory_loss_output, tuple):
                 trajectory_loss, energy_loss_dict = trajectory_loss_output

@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import functools
+import math
 from typing import Callable, Dict, Optional
 from torch import Tensor
 from navsim.agents.diffusiondrive.transfuser_config import TransfuserConfig
@@ -125,13 +126,16 @@ class LossComputer(nn.Module):
         self.energy_temperature = 0.5
         self.energy_start_epoch = 70
         self.energy_full_epoch = 85
-        self.energy_target_gamma_max = 0.5
-        self.energy_aux_weight_max = 0.12
         self.energy_gt_weight = 0.60
-        self.energy_temporal_weight = 0.30
-        self.energy_comfort_weight = 0.10
-        self.energy_aux_temporal_weight = 0.60
-        self.energy_aux_comfort_weight = 0.40
+        self.energy_temporal_weight = 1.00
+        self.energy_comfort_weight = 0.00
+        self.temporal_rank_weight_max = 0.01
+        self.temporal_rank_margin = 0.10
+        self.temporal_rank_energy_gap = 0.20
+        self.temporal_rank_min_epoch = 50.0
+        self.temporal_rank_ramp_epochs = 30.0
+        self.temporal_rank_use_comfort = False
+        self.temporal_aux_weight_max = 0.0
 
     @staticmethod
     def _as_schedule_tensor(value, device, dtype):
@@ -152,16 +156,13 @@ class LossComputer(nn.Module):
         return torch.gather(values, 1, topk_idx)
 
     def _energy_ramp(self, temporal_context: Dict[str, Tensor], device, dtype) -> Tensor:
-        ramp_override = temporal_context.get("energy_ramp_override")
-        if ramp_override is not None:
-            return self._as_schedule_tensor(ramp_override, device, dtype).clamp(0.0, 1.0)
-
         epoch = self._as_schedule_tensor(temporal_context.get("energy_training_epoch"), device, dtype)
         if epoch is None:
             return torch.zeros((), device=device, dtype=dtype)
-        start_epoch = float(temporal_context.get("energy_start_epoch", self.energy_start_epoch))
-        full_epoch = float(temporal_context.get("energy_full_epoch", self.energy_full_epoch))
-        return ((epoch - start_epoch) / (full_epoch - start_epoch + 1e-6)).clamp(0.0, 1.0)
+        start_epoch = float(temporal_context.get("temporal_rank_min_epoch", self.temporal_rank_min_epoch))
+        ramp_epochs = max(float(temporal_context.get("temporal_rank_ramp_epochs", self.temporal_rank_ramp_epochs)), 1.0)
+        progress = ((epoch - start_epoch) / ramp_epochs).clamp(0.0, 1.0)
+        return 0.5 - 0.5 * torch.cos(progress * math.pi)
 
     def _energy_supervision(
         self,
@@ -174,7 +175,7 @@ class LossComputer(nn.Module):
         if temporal_context is None:
             return None
 
-        required_keys = ("energy_temporal_cost", "energy_comfort_cost")
+        required_keys = ("energy_temporal_cost",)
         if any(key not in temporal_context for key in required_keys):
             return None
 
@@ -185,64 +186,86 @@ class LossComputer(nn.Module):
             return None
 
         temporal_cost = temporal_context["energy_temporal_cost"].to(device=device, dtype=dtype)
-        comfort_cost = temporal_context["energy_comfort_cost"].to(device=device, dtype=dtype)
-        if temporal_cost.shape != dist.shape or comfort_cost.shape != dist.shape:
+        if temporal_cost.shape != dist.shape:
             return None
-        if not (torch.isfinite(temporal_cost).all() and torch.isfinite(comfort_cost).all()):
+        if not torch.isfinite(temporal_cost).all():
             return None
 
+        if dist.shape[1] < 2:
+            return None
         topk = int(temporal_context.get("energy_topk", self.energy_topk))
-        topk = max(1, min(topk, dist.shape[1]))
+        topk = min(max(2, topk), dist.shape[1])
         _, topk_idx = torch.topk(dist, k=topk, dim=-1, largest=False)
 
         gt_distance = torch.linalg.norm(target_traj.unsqueeze(1)[..., :2] - poses_reg[..., :2], dim=-1).mean(dim=-1)
         topk_gt = self._gather_topk(gt_distance, topk_idx)
         topk_temporal = self._gather_topk(temporal_cost, topk_idx)
-        topk_comfort = self._gather_topk(comfort_cost, topk_idx)
+        use_comfort = bool(temporal_context.get("temporal_rank_use_comfort", self.temporal_rank_use_comfort))
+        if use_comfort and "energy_comfort_cost" in temporal_context:
+            comfort_cost = temporal_context["energy_comfort_cost"].to(device=device, dtype=dtype)
+            if comfort_cost.shape != dist.shape or not torch.isfinite(comfort_cost).all():
+                return None
+            topk_comfort = self._gather_topk(comfort_cost, topk_idx)
+        else:
+            topk_comfort = torch.zeros_like(topk_temporal)
 
         gt_weight = float(temporal_context.get("energy_gt_weight", self.energy_gt_weight))
         temporal_weight = float(temporal_context.get("energy_temporal_weight", self.energy_temporal_weight))
         comfort_weight = float(temporal_context.get("energy_comfort_weight", self.energy_comfort_weight))
-        energy = (
-            gt_weight * self._standardize_topk(topk_gt)
-            + temporal_weight * self._standardize_topk(topk_temporal)
-            + comfort_weight * self._standardize_topk(topk_comfort)
-        )
-        temperature = max(float(temporal_context.get("energy_temperature", self.energy_temperature)), 1e-3)
-        topk_prob = torch.softmax(-energy / temperature, dim=1).detach()
+        if use_comfort:
+            energy = (
+                gt_weight * self._standardize_topk(topk_gt)
+                + temporal_weight * self._standardize_topk(topk_temporal)
+                + comfort_weight * self._standardize_topk(topk_comfort)
+            )
+        else:
+            energy = topk_temporal
+        energy = energy.detach()
 
-        bs, num_mode = dist.shape
-        energy_target = torch.zeros([bs, num_mode], dtype=dtype, device=device)
-        energy_target.scatter_(1, topk_idx, topk_prob)
-        one_hot_target = torch.zeros([bs, num_mode], dtype=dtype, device=device)
-        one_hot_target.scatter_(1, cls_target.unsqueeze(1), 1)
-        target_gamma = ramp * float(temporal_context.get("energy_target_gamma_max", self.energy_target_gamma_max))
-        cls_soft_target = (1.0 - target_gamma) * one_hot_target + target_gamma * energy_target
+        good_pos = energy.argmin(dim=1, keepdim=True)
+        bad_pos = energy.argmax(dim=1, keepdim=True)
+        good_idx = torch.gather(topk_idx, 1, good_pos)
+        bad_idx = torch.gather(topk_idx, 1, bad_pos)
+        good_energy = torch.gather(energy, 1, good_pos).squeeze(1)
+        bad_energy = torch.gather(energy, 1, bad_pos).squeeze(1)
+        energy_gap = bad_energy - good_energy
 
-        reg_per_mode = torch.abs(poses_reg - target_traj.unsqueeze(1)).mean(dim=(-1, -2))
-        topk_reg = self._gather_topk(reg_per_mode, topk_idx)
-        aux_temporal_weight = float(temporal_context.get("energy_aux_temporal_weight", self.energy_aux_temporal_weight))
-        aux_comfort_weight = float(temporal_context.get("energy_aux_comfort_weight", self.energy_aux_comfort_weight))
-        weighted_quality = (
-            topk_reg
-            + aux_temporal_weight * topk_temporal.clamp(max=2.0)
-            + aux_comfort_weight * topk_comfort.clamp(max=2.0)
-        )
-        aux_raw = (topk_prob * weighted_quality).sum(dim=1).mean()
-        aux_weight = ramp * float(temporal_context.get("energy_aux_weight_max", self.energy_aux_weight_max))
-        aux_loss = aux_weight * aux_raw
+        min_gap = float(temporal_context.get("temporal_rank_energy_gap", self.temporal_rank_energy_gap))
+        active = (energy_gap > min_gap) & torch.isfinite(energy_gap)
+        if not active.any():
+            zero = poses_cls.sum() * 0.0
+            return {
+                "temporal_rank_loss": zero,
+                "temporal_rank_raw": zero.detach(),
+                "temporal_rank_weight": zero.detach(),
+                "temporal_rank_ramp": ramp.detach(),
+                "temporal_rank_active_ratio": torch.zeros((), device=device, dtype=dtype),
+                "temporal_rank_energy_gap": energy_gap.mean().detach(),
+                "temporal_rank_logit_margin": torch.zeros((), device=device, dtype=dtype),
+            }
 
-        entropy = -(topk_prob * torch.log(topk_prob + 1e-6)).sum(dim=1).mean()
+        good_logit = torch.gather(poses_cls, 1, good_idx).squeeze(1)
+        bad_logit = torch.gather(poses_cls, 1, bad_idx).squeeze(1)
+        logit_margin = good_logit - bad_logit
+        margin = float(temporal_context.get("temporal_rank_margin", self.temporal_rank_margin))
+        rank_per_sample = F.softplus(margin - logit_margin)
+        rank_raw = rank_per_sample[active].mean()
+        rank_weight = ramp * float(temporal_context.get("temporal_rank_weight_max", self.temporal_rank_weight_max))
+        rank_loss = rank_weight * rank_raw
+
+        if not torch.isfinite(rank_loss):
+            return None
+
         return {
-            "cls_soft_target": cls_soft_target,
-            "energy_aux_loss": aux_loss,
-            "energy_aux_raw": aux_raw.detach(),
-            "energy_supervision_weight": aux_weight.detach(),
-            "energy_target_gamma": target_gamma.detach(),
-            "energy_soft_entropy": entropy.detach(),
-            "energy_selected_cost": (topk_prob * energy).sum(dim=1).mean().detach(),
-            "energy_weighted_temporal_cost": (topk_prob * topk_temporal).sum(dim=1).mean().detach(),
-            "energy_weighted_comfort_cost": (topk_prob * topk_comfort).sum(dim=1).mean().detach(),
+            "temporal_rank_loss": rank_loss,
+            "temporal_rank_raw": rank_raw.detach(),
+            "temporal_rank_weight": rank_weight.detach(),
+            "temporal_rank_ramp": ramp.detach(),
+            "temporal_rank_active_ratio": active.to(dtype=dtype).mean().detach(),
+            "temporal_rank_energy_gap": energy_gap[active].mean().detach(),
+            "temporal_rank_logit_margin": logit_margin[active].mean().detach(),
+            "temporal_rank_good_cost": torch.gather(topk_temporal, 1, good_pos).squeeze(1)[active].mean().detach(),
+            "temporal_rank_bad_cost": torch.gather(topk_temporal, 1, bad_pos).squeeze(1)[active].mean().detach(),
         }
 
     def forward(self, poses_reg, poses_cls, targets, plan_anchor, temporal_context: Optional[Dict[str, Tensor]]=None):
@@ -275,12 +298,10 @@ class LossComputer(nn.Module):
             mode_idx_flat,
             temporal_context,
         )
-        cls_target_tensor = target_classes_onehot if energy_info is None else energy_info["cls_soft_target"]
-
         # Use py_sigmoid_focal_loss function for focal loss calculation
         loss_cls = self.cls_loss_weight * py_sigmoid_focal_loss(
             poses_cls,
-            cls_target_tensor,
+            target_classes_onehot,
             weight=None,
             gamma=2.0,
             alpha=0.25,
@@ -294,11 +315,10 @@ class LossComputer(nn.Module):
         # Combine classification and regression losses
         ret_loss = loss_cls + reg_loss
         if energy_info is not None:
-            ret_loss = ret_loss + energy_info["energy_aux_loss"]
+            ret_loss = ret_loss + energy_info["temporal_rank_loss"]
             logged_energy_info = {
                 key: value.detach() if torch.is_tensor(value) else value
                 for key, value in energy_info.items()
-                if key != "cls_soft_target"
             }
             logged_energy_info["trajectory_original_loss"] = (loss_cls + reg_loss).detach()
             return ret_loss, logged_energy_info

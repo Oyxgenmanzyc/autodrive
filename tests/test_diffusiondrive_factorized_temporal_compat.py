@@ -296,20 +296,20 @@ def _energy_context(epoch, temporal_cost=None):
         "energy_comfort_cost": torch.zeros_like(temporal_cost),
         "energy_training_epoch": epoch,
         "energy_topk": 3,
-        "energy_temperature": 0.5,
-        "energy_start_epoch": 70,
-        "energy_full_epoch": 85,
-        "energy_target_gamma_max": 0.5,
-        "energy_aux_weight_max": 0.12,
-        "energy_gt_weight": 0.60,
-        "energy_temporal_weight": 0.30,
-        "energy_comfort_weight": 0.10,
-        "energy_aux_temporal_weight": 0.60,
-        "energy_aux_comfort_weight": 0.40,
+        "energy_gt_weight": 0.00,
+        "energy_temporal_weight": 1.00,
+        "energy_comfort_weight": 0.00,
+        "temporal_rank_weight_max": 0.01,
+        "temporal_rank_margin": 0.10,
+        "temporal_rank_energy_gap": 0.20,
+        "temporal_rank_min_epoch": 50.0,
+        "temporal_rank_ramp_epochs": 30.0,
+        "temporal_rank_use_comfort": False,
+        "temporal_aux_weight_max": 0.0,
     }
 
 
-def test_energy_supervision_inactive_before_late_epoch_matches_original_loss():
+def test_temporal_rank_inactive_before_min_epoch_matches_original_loss():
     loss_computer = _make_loss_computer()
     poses_reg, poses_cls, target, plan_anchor = _energy_test_inputs()
 
@@ -319,15 +319,17 @@ def test_energy_supervision_inactive_before_late_epoch_matches_original_loss():
         poses_cls,
         target,
         plan_anchor,
-        temporal_context=_energy_context(epoch=69),
+        temporal_context=_energy_context(epoch=49),
     )
 
     assert torch.allclose(original_loss, early_loss)
 
 
-def test_energy_soft_target_prefers_low_energy_mode_inside_gt_topk():
+def test_temporal_rank_adds_loss_without_changing_classification_target():
     loss_computer = _make_loss_computer()
     poses_reg, poses_cls, target, plan_anchor = _energy_test_inputs()
+    poses_cls[:, 1] = -1.0
+    poses_cls[:, 0] = 1.0
     dist = torch.linalg.norm(target["trajectory"].unsqueeze(1)[..., :2] - plan_anchor, dim=-1).mean(dim=-1)
     cls_target = torch.argmin(dist, dim=-1)
 
@@ -336,15 +338,15 @@ def test_energy_soft_target_prefers_low_energy_mode_inside_gt_topk():
         target["trajectory"],
         dist,
         cls_target,
-        _energy_context(epoch=85),
+        _energy_context(epoch=80),
     )
-    cls_soft_target = energy_info["cls_soft_target"]
 
-    assert cls_soft_target[0, 1] > 0.0
-    assert cls_soft_target[0, 1] > cls_soft_target[0, 2]
+    assert "cls_soft_target" not in energy_info
+    assert energy_info["temporal_rank_loss"] > 0.0
+    assert energy_info["temporal_rank_active_ratio"] == 1.0
 
 
-def test_energy_supervision_does_not_reward_mode_outside_gt_topk():
+def test_temporal_rank_does_not_use_mode_outside_gt_topk():
     loss_computer = _make_loss_computer()
     poses_reg, poses_cls, target, plan_anchor = _energy_test_inputs()
     dist = torch.linalg.norm(target["trajectory"].unsqueeze(1)[..., :2] - plan_anchor, dim=-1).mean(dim=-1)
@@ -356,16 +358,17 @@ def test_energy_supervision_does_not_reward_mode_outside_gt_topk():
         target["trajectory"],
         dist,
         cls_target,
-        _energy_context(epoch=85, temporal_cost=temporal_cost),
+        _energy_context(epoch=80, temporal_cost=temporal_cost),
     )
 
-    assert energy_info["cls_soft_target"][0, 4] == 0.0
+    assert energy_info["temporal_rank_active_ratio"] == 0.0
 
 
-def test_energy_soft_weights_are_detached_from_backprop_target():
+def test_temporal_rank_uses_detached_energy_but_backprops_to_logits():
     loss_computer = _make_loss_computer()
     poses_reg, poses_cls, target, plan_anchor = _energy_test_inputs()
     poses_reg.requires_grad_(True)
+    poses_cls.requires_grad_(True)
     dist = torch.linalg.norm(target["trajectory"].unsqueeze(1)[..., :2] - plan_anchor, dim=-1).mean(dim=-1)
     cls_target = torch.argmin(dist, dim=-1)
 
@@ -374,7 +377,9 @@ def test_energy_soft_weights_are_detached_from_backprop_target():
         target["trajectory"],
         dist,
         cls_target,
-        _energy_context(epoch=85),
+        _energy_context(epoch=80),
     )
+    energy_info["temporal_rank_loss"].backward()
 
-    assert not energy_info["cls_soft_target"].requires_grad
+    assert poses_cls.grad is not None
+    assert poses_reg.grad is None
