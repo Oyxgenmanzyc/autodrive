@@ -395,6 +395,34 @@ CHANGELOG.txt
 
 与论文撰写的关系：
 3.11 可作为“Temporal Rescoring Diagnostic”消融实验，用于区分 temporal idea 本身是否有选择价值，以及此前训练侧 auxiliary loss 下降是否来自过强梯度干扰。该版本强调 Energy/Temporal cost 先作为 inference-time mode selection signal，而不是直接作为 trajectory regression penalty。
+修改主题：3.14 Ranking + Tiny Selected-Mode Temporal Auxiliary
+修改日期：2026-06-24
+
+修改目的：
+基于 3.13 temporal + comfort pairwise ranking，进一步测试一个极弱的坐标级 temporal 辅助项是否能在不破坏原始监督的情况下，让 GT best mode 自身学习更自然的历史连接。该版本用于回答：如果 ranking 只调分类排序不够，是否可以给原始选中 mode 增加非常小的 temporal violation 梯度。
+
+涉及文件：
+navsim/agents/diffusiondrive/transfuser_model_v2.py
+navsim/agents/diffusiondrive/modules/multimodal_loss.py
+tests/test_diffusiondrive_factorized_temporal_compat.py
+CHANGELOG.txt
+
+核心改动：
+1. 保留 3.13 的 temporal + comfort pairwise ranking，不改原始 one-hot 分类目标，不改 best-mode regression assignment。
+2. 新增 tiny selected-mode temporal auxiliary，只作用于原始 GT best mode 的 temporal violation cost，不作用所有 20 个 mode。
+3. auxiliary 权重极小，temporal_aux_weight_max=0.005，并与 ranking 共用 min_epoch=50、ramp_epochs=30 的 cosine ramp。
+4. ranking pair 仍需要 energy_gap > 0.20；selected-mode auxiliary 可在 temporal context 有效且 ramp 开启时独立生效。
+5. 新增日志：temporal_aux_loss、temporal_aux_raw、temporal_aux_weight、temporal_aux_selected_cost。
+
+预期影响：
+3.14 是三版中最接近“让轨迹形状本身学习连接性”的版本，但通过 selected-mode、tiny weight、late ramp 限制风险。如果 3.14 比 3.13 明显不稳，说明坐标级 temporal 梯度仍然容易干扰 DiffusionDrive 原始轨迹学习，应优先保留 ranking-only；如果稳定且提升，则说明可以在论文中把 tiny selected-mode auxiliary 作为温和蒸馏项。
+
+测试/验证结果：
+本地不运行 pytest、manual runner 或 smoke。轻量测试增加 selected-mode auxiliary 可独立生效的覆盖，等待服务器 smoke/full validation。
+
+与论文撰写的关系：
+3.14 可作为 “Ranking with Tiny Temporal Auxiliary” 消融。它帮助区分 temporal signal 更适合只做 mode ranking，还是也能以极弱形式进入轨迹坐标学习。
+
 修改主题：3.13 Temporal + Comfort Pairwise Ranking Loss
 修改日期：2026-06-24
 

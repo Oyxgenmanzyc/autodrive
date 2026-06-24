@@ -443,7 +443,7 @@ class TrajectoryHead(nn.Module):
         self.temporal_rank_min_epoch = 50.0
         self.temporal_rank_ramp_epochs = 30.0
         self.temporal_rank_use_comfort = True
-        self.temporal_aux_weight_max = 0.0
+        self.temporal_aux_weight_max = 0.005
         self.temporal_rescore_topk = 5
         self.temporal_rescore_alpha = 0.05
         self.temporal_rescore_cost_clamp = 2.0

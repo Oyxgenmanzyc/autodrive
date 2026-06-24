@@ -135,7 +135,7 @@ class LossComputer(nn.Module):
         self.temporal_rank_min_epoch = 50.0
         self.temporal_rank_ramp_epochs = 30.0
         self.temporal_rank_use_comfort = True
-        self.temporal_aux_weight_max = 0.0
+        self.temporal_aux_weight_max = 0.005
 
     @staticmethod
     def _as_schedule_tensor(value, device, dtype):
@@ -229,19 +229,30 @@ class LossComputer(nn.Module):
         good_energy = torch.gather(energy, 1, good_pos).squeeze(1)
         bad_energy = torch.gather(energy, 1, bad_pos).squeeze(1)
         energy_gap = bad_energy - good_energy
+        selected_temporal = torch.gather(temporal_cost.clamp(max=2.0), 1, cls_target.unsqueeze(1)).squeeze(1)
+        aux_weight = ramp * float(temporal_context.get("temporal_aux_weight_max", self.temporal_aux_weight_max))
+        aux_raw = selected_temporal.mean()
+        aux_loss = aux_weight * aux_raw
 
         min_gap = float(temporal_context.get("temporal_rank_energy_gap", self.temporal_rank_energy_gap))
         active = (energy_gap > min_gap) & torch.isfinite(energy_gap)
         if not active.any():
             zero = poses_cls.sum() * 0.0
+            total_loss = zero + aux_loss
+            if not torch.isfinite(total_loss):
+                return None
             return {
-                "temporal_rank_loss": zero,
+                "temporal_rank_loss": total_loss,
                 "temporal_rank_raw": zero.detach(),
                 "temporal_rank_weight": zero.detach(),
                 "temporal_rank_ramp": ramp.detach(),
                 "temporal_rank_active_ratio": torch.zeros((), device=device, dtype=dtype),
                 "temporal_rank_energy_gap": energy_gap.mean().detach(),
                 "temporal_rank_logit_margin": torch.zeros((), device=device, dtype=dtype),
+                "temporal_aux_loss": aux_loss.detach(),
+                "temporal_aux_raw": aux_raw.detach(),
+                "temporal_aux_weight": aux_weight.detach(),
+                "temporal_aux_selected_cost": selected_temporal.mean().detach(),
             }
 
         good_logit = torch.gather(poses_cls, 1, good_idx).squeeze(1)
@@ -253,11 +264,11 @@ class LossComputer(nn.Module):
         rank_weight = ramp * float(temporal_context.get("temporal_rank_weight_max", self.temporal_rank_weight_max))
         rank_loss = rank_weight * rank_raw
 
-        if not torch.isfinite(rank_loss):
+        if not (torch.isfinite(rank_loss) and torch.isfinite(aux_loss)):
             return None
 
         return {
-            "temporal_rank_loss": rank_loss,
+            "temporal_rank_loss": rank_loss + aux_loss,
             "temporal_rank_raw": rank_raw.detach(),
             "temporal_rank_weight": rank_weight.detach(),
             "temporal_rank_ramp": ramp.detach(),
@@ -266,6 +277,10 @@ class LossComputer(nn.Module):
             "temporal_rank_logit_margin": logit_margin[active].mean().detach(),
             "temporal_rank_good_cost": torch.gather(topk_temporal, 1, good_pos).squeeze(1)[active].mean().detach(),
             "temporal_rank_bad_cost": torch.gather(topk_temporal, 1, bad_pos).squeeze(1)[active].mean().detach(),
+            "temporal_aux_loss": aux_loss.detach(),
+            "temporal_aux_raw": aux_raw.detach(),
+            "temporal_aux_weight": aux_weight.detach(),
+            "temporal_aux_selected_cost": selected_temporal.mean().detach(),
         }
 
     def forward(self, poses_reg, poses_cls, targets, plan_anchor, temporal_context: Optional[Dict[str, Tensor]]=None):

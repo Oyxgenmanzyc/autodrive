@@ -420,3 +420,27 @@ def test_temporal_comfort_rank_can_use_comfort_inside_gt_topk():
 
     assert energy_info["temporal_rank_active_ratio"] == 1.0
     assert energy_info["temporal_rank_bad_cost"] == 0.0
+
+
+def test_tiny_temporal_aux_can_apply_to_selected_gt_mode():
+    loss_computer = _make_loss_computer()
+    poses_reg, poses_cls, target, plan_anchor = _energy_test_inputs()
+    dist = torch.linalg.norm(target["trajectory"].unsqueeze(1)[..., :2] - plan_anchor, dim=-1).mean(dim=-1)
+    cls_target = torch.argmin(dist, dim=-1)
+    context = _comfort_energy_context(
+        epoch=80,
+        temporal_cost=torch.tensor([[1.0, 1.0, 1.0, 0.0, 0.0]]),
+    )
+    context["temporal_aux_weight_max"] = 0.005
+    context["temporal_rank_energy_gap"] = 10.0
+
+    energy_info = loss_computer._energy_supervision(
+        poses_reg,
+        target["trajectory"],
+        dist,
+        cls_target,
+        context,
+    )
+
+    assert energy_info["temporal_rank_active_ratio"] == 0.0
+    assert energy_info["temporal_aux_loss"] > 0.0
