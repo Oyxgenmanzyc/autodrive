@@ -1,3 +1,37 @@
+修改主题：3.15 PDM-Style Progress/TTC Ranking
+修改日期：2026-06-29
+
+修改目的：
+基于 3.13.2 stable progress rank 的训练日志分析，修正 progress-aware ranking 几乎不生效的问题。3.13.2/3.13.3 中 progress_active 很高，但 good/bad progress_cost 基本为 0，说明原实现只看第 3 个点 x 位移和 GT-distance top-K，导致真正的低进度 hard negative 没有进入排序比较。3.15 改为更接近 NAVSIM/PDM 评价思想的全轨迹 progress ratio，并用前车 TTC proxy 避免把合理跟车减速误惩罚为低进度。
+
+涉及文件：
+navsim/agents/diffusiondrive/transfuser_features.py
+navsim/agents/diffusiondrive/modules/multimodal_loss.py
+tests/test_diffusiondrive_factorized_temporal_compat.py
+CHANGELOG.txt
+
+核心改动：
+1. 在 TransfuserTargetBuilder 中新增 front_ttc、front_ttc_valid、front_distance、front_relative_speed target。
+2. 当前帧从 annotation boxes 中筛选最近前车：vehicle、x > 0、abs(y) < 2.5、x < 50，并使用 box_x - 0.5 * box_length 近似到前车后缘距离。
+3. 1 秒前按 NAVSIM 2Hz 近似使用 frame_idx - 2，通过 track_token 匹配同一前车；relative_speed = d_prev - d_now，仅在相对距离缩小时生成有效 TTC。
+4. 将原 progress_cost 从第 3 个 waypoint 的 x 阈值改为全 8 点累计投影 progress ratio：candidate 在 target 方向上的累计投影越低，progress deficit 越大。
+5. 参考 NAVSIM progress_distance_threshold，只有 target_path_len > 5m 时启用 progress-cost。
+6. 增加近似 route-compatible gate：要求目标轨迹以纵向前进为主、侧向比例较低、局部 heading change 不大；明显转弯、掉头、大侧向场景不计算 progress-cost，避免 ego-frame x 与 route progress 不一致。
+7. 增加 TTC gate：如果 front_ttc_valid=True 且 front_ttc <= 2s，则不惩罚低 progress，避免在跟车接近风险中鼓励模型盲目前进。
+8. good candidate 仍从 GT-distance top-K 中按 temporal/comfort/progress energy 选择。
+9. bad candidate 优先从全部 mode 中选择 progress-risk 高且 classification logit 位于 top-K 的 hard negative；没有有效 hard negative 时回退到原 GT top-K 内 energy 最大候选。
+10. 保留原始 one-hot 分类监督、best-mode regression、20 个 anchor mode、rank ramp 和 temporal_rank_weight_max=0.30，不新增动态 anchor，不改推理阶段候选数。
+11. 新增日志 temporal_rank_hard_negative_ratio，用于观察 progress-risk hard negative 是否真正参与 ranking。
+
+预期影响：
+3.15 的核心变量不是加大 ranking 权重，而是让 progress-risk candidate 真正进入 pairwise ranking。相比 3.13.2 的单点 x proxy，新设计更接近 PDM 的整体 progress 语义，并用 TTC gate 避免误伤安全减速场景。如果训练日志中 temporal_rank_bad_progress_cost 和 temporal_rank_hard_negative_ratio 明显高于 0，说明 progress-aware ranking 开始真正影响分类排序；后续再看 PDM ego_progress 和 TTC 子项是否改善。
+
+测试/验证结果：
+本地不运行完整训练、pytest 或服务器 smoke。轻量测试已更新，覆盖短路径不启用、侧向/转弯不启用、直行低 progress 产生 cost、TTC 风险抑制 progress-cost、GT top-K 外 progress hard negative 可参与 ranking、无 hard negative 时回退 top-K、ranking loss 只对 logits 反传。等待服务器 smoke/full validation。
+
+与论文撰写的关系：
+3.15 可作为 “PDM-style Progress/TTC-aware Pairwise Ranking” 实验。论文表述重点是：progress supervision 不直接优化完整 PDM scorer，而是在训练可获得的信息内构造 PDM-inspired proxy；它用全轨迹 progress ratio、场景兼容门控、TTC 安全门控和 hard-negative mode selection，解决 3.13.2/3.13.3 中 progress-risk 候选没有被采到的问题。
+
 修改主题：第三版 factorized temporal compatibility 噪声调制
 修改日期：2026-05-27
 

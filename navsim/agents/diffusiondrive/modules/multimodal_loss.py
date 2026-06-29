@@ -127,9 +127,18 @@ class LossComputer(nn.Module):
         self.energy_start_epoch = 70
         self.energy_full_epoch = 85
         self.energy_gt_weight = 0.60
-        self.energy_temporal_weight = 0.80
-        self.energy_comfort_weight = 0.20
-        self.temporal_rank_weight_max = 0.01
+        self.energy_temporal_weight = 0.85
+        self.energy_comfort_weight = 0.05
+        self.energy_progress_weight = 0.10
+        self.progress_path_len_threshold = 5.0
+        self.progress_longitudinal_consistency = 0.70
+        self.progress_lateral_ratio = 0.50
+        self.progress_max_heading_change = 0.45
+        self.progress_hard_negative_threshold = 0.05
+        self.progress_hard_negative_cls_topk = 5
+        self.progress_hard_negative_logit_weight = 0.10
+        self.front_ttc_threshold = 2.0
+        self.temporal_rank_weight_max = 0.30
         self.temporal_rank_margin = 0.10
         self.temporal_rank_energy_gap = 0.20
         self.temporal_rank_min_epoch = 50.0
@@ -155,6 +164,94 @@ class LossComputer(nn.Module):
     def _gather_topk(values: Tensor, topk_idx: Tensor) -> Tensor:
         return torch.gather(values, 1, topk_idx)
 
+    @staticmethod
+    def _batch_vector(value, device, dtype, batch_size):
+        value = value.to(device=device)
+        if value.dtype == torch.bool:
+            value = value.bool()
+        else:
+            value = value.to(dtype=dtype)
+        value = value.reshape(-1)
+        if value.numel() == 1 and batch_size > 1:
+            value = value.expand(batch_size)
+        return value
+
+    def _front_ttc_safe_gate(self, temporal_context: Dict[str, Tensor], device, dtype, batch_size) -> Tensor:
+        if "front_ttc" not in temporal_context or "front_ttc_valid" not in temporal_context:
+            return torch.ones(batch_size, device=device, dtype=torch.bool)
+
+        front_ttc = self._batch_vector(temporal_context["front_ttc"], device, dtype, batch_size)
+        front_ttc_valid = self._batch_vector(
+            temporal_context["front_ttc_valid"],
+            device,
+            dtype,
+            batch_size,
+        ).bool()
+        ttc_threshold = float(temporal_context.get("front_ttc_threshold", self.front_ttc_threshold))
+        return (~front_ttc_valid) | (front_ttc > ttc_threshold)
+
+    def _pdm_progress_cost(
+        self,
+        poses_reg: Tensor,
+        target_traj: Tensor,
+        temporal_context: Dict[str, Tensor],
+    ):
+        device = poses_reg.device
+        dtype = poses_reg.dtype
+        batch_size = poses_reg.shape[0]
+        num_modes = poses_reg.shape[1]
+
+        if poses_reg.shape[-2] < 2 or target_traj.shape[-2] < 2:
+            zeros = torch.zeros(batch_size, num_modes, device=device, dtype=dtype)
+            inactive = torch.zeros(batch_size, device=device, dtype=torch.bool)
+            return zeros, inactive
+
+        target_xy = target_traj[..., :2]
+        candidate_xy = poses_reg[..., :2]
+        target_delta = target_xy[:, 1:] - target_xy[:, :-1]
+        candidate_delta = candidate_xy[:, :, 1:] - candidate_xy[:, :, :-1]
+
+        target_step = torch.linalg.norm(target_delta, dim=-1)
+        target_path_len = target_step.sum(dim=-1)
+        target_dir = target_delta / (target_step.unsqueeze(-1) + 1e-6)
+        candidate_progress = (candidate_delta * target_dir.unsqueeze(1)).sum(dim=-1).clamp(min=0.0).sum(dim=-1)
+        progress_ratio = candidate_progress / (target_path_len.unsqueeze(1) + 1e-6)
+        progress_cost = torch.relu(1.0 - progress_ratio).clamp(max=1.0)
+
+        path_len_threshold = float(
+            temporal_context.get("progress_path_len_threshold", self.progress_path_len_threshold)
+        )
+        longitudinal_threshold = float(
+            temporal_context.get("progress_longitudinal_consistency", self.progress_longitudinal_consistency)
+        )
+        lateral_threshold = float(temporal_context.get("progress_lateral_ratio", self.progress_lateral_ratio))
+        heading_threshold = float(
+            temporal_context.get("progress_max_heading_change", self.progress_max_heading_change)
+        )
+
+        target_displacement = target_xy[:, -1] - target_xy[:, 0]
+        longitudinal_consistency = target_displacement[:, 0] / (target_path_len + 1e-6)
+        lateral_ratio = target_displacement[:, 1].abs() / (target_path_len + 1e-6)
+        if target_delta.shape[1] >= 2:
+            heading = torch.atan2(target_delta[..., 1], target_delta[..., 0])
+            heading_change = torch.atan2(
+                torch.sin(heading[:, 1:] - heading[:, :-1]),
+                torch.cos(heading[:, 1:] - heading[:, :-1]),
+            ).abs()
+            max_heading_change = heading_change.max(dim=-1).values
+        else:
+            max_heading_change = torch.zeros(batch_size, device=device, dtype=dtype)
+
+        progress_active = (
+            (target_path_len > path_len_threshold)
+            & (longitudinal_consistency > longitudinal_threshold)
+            & (lateral_ratio < lateral_threshold)
+            & (max_heading_change < heading_threshold)
+            & self._front_ttc_safe_gate(temporal_context, device, dtype, batch_size)
+        )
+        progress_cost = torch.where(progress_active.unsqueeze(1), progress_cost, torch.zeros_like(progress_cost))
+        return progress_cost, progress_active
+
     def _energy_ramp(self, temporal_context: Dict[str, Tensor], device, dtype) -> Tensor:
         epoch = self._as_schedule_tensor(temporal_context.get("energy_training_epoch"), device, dtype)
         if epoch is None:
@@ -167,6 +264,7 @@ class LossComputer(nn.Module):
     def _energy_supervision(
         self,
         poses_reg: Tensor,
+        poses_cls: Tensor,
         target_traj: Tensor,
         dist: Tensor,
         cls_target: Tensor,
@@ -212,23 +310,66 @@ class LossComputer(nn.Module):
         gt_weight = float(temporal_context.get("energy_gt_weight", self.energy_gt_weight))
         temporal_weight = float(temporal_context.get("energy_temporal_weight", self.energy_temporal_weight))
         comfort_weight = float(temporal_context.get("energy_comfort_weight", self.energy_comfort_weight))
+        progress_weight = float(temporal_context.get("energy_progress_weight", self.energy_progress_weight))
+
+        progress_cost, progress_active = self._pdm_progress_cost(poses_reg, target_traj, temporal_context)
+        topk_progress = self._gather_topk(progress_cost, topk_idx)
+
         if use_comfort:
             energy = (
                 gt_weight * self._standardize_topk(topk_gt)
                 + temporal_weight * self._standardize_topk(topk_temporal)
                 + comfort_weight * self._standardize_topk(topk_comfort)
+                + progress_weight * self._standardize_topk(topk_progress)
             )
         else:
-            energy = topk_temporal
+            energy = (
+                temporal_weight * self._standardize_topk(topk_temporal)
+                + progress_weight * self._standardize_topk(topk_progress)
+            )
         energy = energy.detach()
 
         good_pos = energy.argmin(dim=1, keepdim=True)
-        bad_pos = energy.argmax(dim=1, keepdim=True)
+        fallback_bad_pos = energy.argmax(dim=1, keepdim=True)
         good_idx = torch.gather(topk_idx, 1, good_pos)
-        bad_idx = torch.gather(topk_idx, 1, bad_pos)
+        fallback_bad_idx = torch.gather(topk_idx, 1, fallback_bad_pos)
         good_energy = torch.gather(energy, 1, good_pos).squeeze(1)
-        bad_energy = torch.gather(energy, 1, bad_pos).squeeze(1)
-        energy_gap = bad_energy - good_energy
+        fallback_bad_energy = torch.gather(energy, 1, fallback_bad_pos).squeeze(1)
+
+        hard_threshold = float(
+            temporal_context.get("progress_hard_negative_threshold", self.progress_hard_negative_threshold)
+        )
+        hard_cls_topk = min(
+            max(1, int(temporal_context.get("progress_hard_negative_cls_topk", self.progress_hard_negative_cls_topk))),
+            poses_cls.shape[1],
+        )
+        _, cls_topk_idx = torch.topk(poses_cls.detach(), k=hard_cls_topk, dim=1, largest=True)
+        cls_topk_mask = torch.zeros_like(progress_cost, dtype=torch.bool)
+        cls_topk_mask.scatter_(1, cls_topk_idx, True)
+        mode_idx = torch.arange(progress_cost.shape[1], device=device).unsqueeze(0)
+        hard_mask = (
+            (progress_cost > hard_threshold)
+            & cls_topk_mask
+            & (mode_idx != good_idx)
+            & torch.isfinite(progress_cost)
+        )
+        hard_negative_available = hard_mask.any(dim=1)
+
+        logit_weight = float(
+            temporal_context.get("progress_hard_negative_logit_weight", self.progress_hard_negative_logit_weight)
+        )
+        hard_score = progress_cost.detach() + logit_weight * self._standardize_topk(poses_cls.detach())
+        hard_score = hard_score.masked_fill(~hard_mask, torch.finfo(dtype).min)
+        hard_bad_idx = hard_score.argmax(dim=1, keepdim=True)
+
+        good_progress = torch.gather(progress_cost, 1, good_idx).squeeze(1)
+        hard_progress = torch.gather(progress_cost, 1, hard_bad_idx).squeeze(1)
+        hard_progress_gap = hard_progress - good_progress
+        use_hard_negative = hard_negative_available & (hard_progress_gap > hard_threshold)
+
+        bad_idx = torch.where(use_hard_negative.unsqueeze(1), hard_bad_idx, fallback_bad_idx)
+        fallback_energy_gap = fallback_bad_energy - good_energy
+        energy_gap = torch.where(use_hard_negative, hard_progress_gap, fallback_energy_gap)
 
         min_gap = float(temporal_context.get("temporal_rank_energy_gap", self.temporal_rank_energy_gap))
         active = (energy_gap > min_gap) & torch.isfinite(energy_gap)
@@ -242,6 +383,10 @@ class LossComputer(nn.Module):
                 "temporal_rank_active_ratio": torch.zeros((), device=device, dtype=dtype),
                 "temporal_rank_energy_gap": energy_gap.mean().detach(),
                 "temporal_rank_logit_margin": torch.zeros((), device=device, dtype=dtype),
+                "temporal_rank_good_progress_cost": zero.detach(),
+                "temporal_rank_bad_progress_cost": zero.detach(),
+                "temporal_rank_progress_active_ratio": progress_active.to(dtype=dtype).mean().detach(),
+                "temporal_rank_hard_negative_ratio": torch.zeros((), device=device, dtype=dtype),
             }
 
         good_logit = torch.gather(poses_cls, 1, good_idx).squeeze(1)
@@ -264,8 +409,12 @@ class LossComputer(nn.Module):
             "temporal_rank_active_ratio": active.to(dtype=dtype).mean().detach(),
             "temporal_rank_energy_gap": energy_gap[active].mean().detach(),
             "temporal_rank_logit_margin": logit_margin[active].mean().detach(),
-            "temporal_rank_good_cost": torch.gather(topk_temporal, 1, good_pos).squeeze(1)[active].mean().detach(),
-            "temporal_rank_bad_cost": torch.gather(topk_temporal, 1, bad_pos).squeeze(1)[active].mean().detach(),
+            "temporal_rank_good_cost": torch.gather(temporal_cost, 1, good_idx).squeeze(1)[active].mean().detach(),
+            "temporal_rank_bad_cost": torch.gather(temporal_cost, 1, bad_idx).squeeze(1)[active].mean().detach(),
+            "temporal_rank_good_progress_cost": torch.gather(progress_cost, 1, good_idx).squeeze(1)[active].mean().detach(),
+            "temporal_rank_bad_progress_cost": torch.gather(progress_cost, 1, bad_idx).squeeze(1)[active].mean().detach(),
+            "temporal_rank_progress_active_ratio": progress_active.to(dtype=dtype).mean().detach(),
+            "temporal_rank_hard_negative_ratio": use_hard_negative[active].to(dtype=dtype).mean().detach(),
         }
 
     def forward(self, poses_reg, poses_cls, targets, plan_anchor, temporal_context: Optional[Dict[str, Tensor]]=None):
@@ -291,12 +440,20 @@ class LossComputer(nn.Module):
                                             layout=poses_cls.layout,
                                             device=poses_cls.device)
         target_classes_onehot.scatter_(1, cls_target.unsqueeze(1), 1)
+        energy_context = temporal_context
+        if temporal_context is not None:
+            energy_context = dict(temporal_context)
+            for key in ("front_ttc", "front_ttc_valid", "front_distance", "front_relative_speed"):
+                if key in targets:
+                    energy_context[key] = targets[key]
+
         energy_info = self._energy_supervision(
             poses_reg,
+            poses_cls,
             target_traj,
             dist,
             mode_idx_flat,
-            temporal_context,
+            energy_context,
         )
         # Use py_sigmoid_focal_loss function for focal loss calculation
         loss_cls = self.cls_loss_weight * py_sigmoid_focal_loss(

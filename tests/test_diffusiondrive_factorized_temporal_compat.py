@@ -350,6 +350,7 @@ def test_temporal_rank_adds_loss_without_changing_classification_target():
 
     energy_info = loss_computer._energy_supervision(
         poses_reg,
+        poses_cls,
         target["trajectory"],
         dist,
         cls_target,
@@ -370,6 +371,7 @@ def test_temporal_rank_does_not_use_mode_outside_gt_topk():
 
     energy_info = loss_computer._energy_supervision(
         poses_reg,
+        poses_cls,
         target["trajectory"],
         dist,
         cls_target,
@@ -389,6 +391,7 @@ def test_temporal_rank_uses_detached_energy_but_backprops_to_logits():
 
     energy_info = loss_computer._energy_supervision(
         poses_reg,
+        poses_cls,
         target["trajectory"],
         dist,
         cls_target,
@@ -412,6 +415,7 @@ def test_temporal_comfort_rank_can_use_comfort_inside_gt_topk():
 
     energy_info = loss_computer._energy_supervision(
         poses_reg,
+        poses_cls,
         target["trajectory"],
         dist,
         cls_target,
@@ -420,3 +424,129 @@ def test_temporal_comfort_rank_can_use_comfort_inside_gt_topk():
 
     assert energy_info["temporal_rank_active_ratio"] == 1.0
     assert energy_info["temporal_rank_bad_cost"] == 0.0
+
+
+def _progress_candidates(scales):
+    target_xy = _straight_x(scale=1.0, steps=8)
+    target_traj = torch.zeros(1, 8, 3)
+    target_traj[0, :, :2] = target_xy
+    poses_reg = torch.zeros(1, len(scales), 8, 3)
+    for mode_idx, scale in enumerate(scales):
+        poses_reg[0, mode_idx, :, :2] = target_xy * scale
+    return poses_reg, target_traj
+
+
+def test_pdm_progress_cost_inactive_for_short_target_path():
+    loss_computer = _make_loss_computer()
+    poses_reg, target_traj = _progress_candidates([0.2, 1.0])
+    target_traj[..., :2] = _straight_x(scale=0.5, steps=8)
+    poses_reg[..., :2] = target_traj[:, None, :, :2]
+
+    progress_cost, progress_active = loss_computer._pdm_progress_cost(
+        poses_reg,
+        target_traj,
+        _energy_context(epoch=80),
+    )
+
+    assert not progress_active.any()
+    assert torch.all(progress_cost == 0)
+
+
+def test_pdm_progress_cost_inactive_for_lateral_route_incompatible_scene():
+    loss_computer = _make_loss_computer()
+    poses_reg, target_traj = _progress_candidates([0.2, 1.0])
+    target_traj[..., :2] = _straight_y(scale=1.0, steps=8)
+    poses_reg[..., :2] = target_traj[:, None, :, :2]
+
+    progress_cost, progress_active = loss_computer._pdm_progress_cost(
+        poses_reg,
+        target_traj,
+        _energy_context(epoch=80),
+    )
+
+    assert not progress_active.any()
+    assert torch.all(progress_cost == 0)
+
+
+def test_pdm_progress_cost_penalizes_low_progress_ratio_on_straight_scene():
+    loss_computer = _make_loss_computer()
+    poses_reg, target_traj = _progress_candidates([1.0, 0.4])
+
+    progress_cost, progress_active = loss_computer._pdm_progress_cost(
+        poses_reg,
+        target_traj,
+        _energy_context(epoch=80),
+    )
+
+    assert progress_active.item()
+    assert progress_cost[0, 0] < 1e-5
+    assert progress_cost[0, 1] > 0.5
+
+
+def test_pdm_progress_cost_suppressed_by_front_ttc_risk():
+    loss_computer = _make_loss_computer()
+    poses_reg, target_traj = _progress_candidates([1.0, 0.2])
+    context = _energy_context(epoch=80)
+    context["front_ttc"] = torch.tensor([1.0])
+    context["front_ttc_valid"] = torch.tensor([True])
+
+    progress_cost, progress_active = loss_computer._pdm_progress_cost(
+        poses_reg,
+        target_traj,
+        context,
+    )
+
+    assert not progress_active.any()
+    assert torch.all(progress_cost == 0)
+
+
+def test_temporal_rank_can_use_progress_hard_negative_outside_gt_topk():
+    loss_computer = _make_loss_computer()
+    target_xy = _straight_x(scale=1.0, steps=8)
+    target = {"trajectory": torch.zeros(1, 8, 3)}
+    target["trajectory"][0, :, :2] = target_xy
+    poses_reg = torch.zeros(1, 5, 8, 3)
+    plan_anchor = torch.zeros(1, 5, 8, 2)
+    for mode_idx in range(5):
+        poses_reg[0, mode_idx, :, :2] = target_xy
+        plan_anchor[0, mode_idx, :, :] = target_xy
+    poses_reg[0, 4, :, :2] = target_xy * 0.2
+    plan_anchor[0, 3:, :, 0] = target_xy[:, 0] + 20.0
+    poses_cls = torch.tensor([[0.0, 0.0, 0.0, 0.0, 2.0]])
+    dist = torch.linalg.norm(target["trajectory"].unsqueeze(1)[..., :2] - plan_anchor, dim=-1).mean(dim=-1)
+    cls_target = torch.argmin(dist, dim=-1)
+    context = _energy_context(epoch=80, temporal_cost=torch.tensor([[0.0, 2.0, 2.0, 0.0, 0.0]]))
+
+    energy_info = loss_computer._energy_supervision(
+        poses_reg,
+        poses_cls,
+        target["trajectory"],
+        dist,
+        cls_target,
+        context,
+    )
+
+    assert energy_info["temporal_rank_active_ratio"] == 1.0
+    assert energy_info["temporal_rank_hard_negative_ratio"] == 1.0
+    assert energy_info["temporal_rank_bad_progress_cost"] > 0.5
+
+
+def test_temporal_rank_falls_back_to_topk_when_no_progress_hard_negative_exists():
+    loss_computer = _make_loss_computer()
+    poses_reg, poses_cls, target, plan_anchor = _energy_test_inputs()
+    poses_cls[:, 1] = -1.0
+    poses_cls[:, 0] = 1.0
+    dist = torch.linalg.norm(target["trajectory"].unsqueeze(1)[..., :2] - plan_anchor, dim=-1).mean(dim=-1)
+    cls_target = torch.argmin(dist, dim=-1)
+
+    energy_info = loss_computer._energy_supervision(
+        poses_reg,
+        poses_cls,
+        target["trajectory"],
+        dist,
+        cls_target,
+        _energy_context(epoch=80),
+    )
+
+    assert energy_info["temporal_rank_active_ratio"] == 1.0
+    assert energy_info["temporal_rank_hard_negative_ratio"] == 0.0

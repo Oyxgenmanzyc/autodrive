@@ -144,12 +144,75 @@ class TransfuserTargetBuilder(AbstractTargetBuilder):
 
         agent_states, agent_labels = self._compute_agent_targets(annotations)
         bev_semantic_map = self._compute_bev_semantic_map(annotations, scene.map_api, ego_pose)
+        front_ttc_targets = self._compute_front_ttc_targets(scene, frame_idx)
 
         return {
             "trajectory": trajectory,
             "agent_states": agent_states,
             "agent_labels": agent_labels,
             "bev_semantic_map": bev_semantic_map,
+            **front_ttc_targets,
+        }
+
+    @staticmethod
+    def _front_vehicle_candidate(annotations: Annotations):
+        best_candidate = None
+
+        for box, name, track_token in zip(annotations.boxes, annotations.names, annotations.track_tokens):
+            if name != "vehicle":
+                continue
+
+            box_x = float(box[BoundingBoxIndex.X])
+            box_y = float(box[BoundingBoxIndex.Y])
+            box_length = float(box[BoundingBoxIndex.LENGTH])
+            if box_x <= 0.0 or box_x >= 50.0 or abs(box_y) >= 2.5:
+                continue
+
+            distance = max(box_x - 0.5 * max(box_length, 0.0), 0.0)
+            if best_candidate is None or distance < best_candidate[1]:
+                best_candidate = (track_token, distance)
+
+        return best_candidate
+
+    @staticmethod
+    def _track_distance(annotations: Annotations, track_token: str):
+        for box, name, candidate_track_token in zip(annotations.boxes, annotations.names, annotations.track_tokens):
+            if name != "vehicle" or candidate_track_token != track_token:
+                continue
+
+            box_x = float(box[BoundingBoxIndex.X])
+            box_length = float(box[BoundingBoxIndex.LENGTH])
+            return max(box_x - 0.5 * max(box_length, 0.0), 0.0)
+
+        return None
+
+    def _compute_front_ttc_targets(self, scene: Scene, frame_idx: int) -> Dict[str, torch.Tensor]:
+        front_ttc = 1.0e6
+        front_ttc_valid = False
+        front_distance = 0.0
+        front_relative_speed = 0.0
+
+        current_candidate = self._front_vehicle_candidate(scene.frames[frame_idx].annotations)
+        if current_candidate is not None:
+            track_token, front_distance = current_candidate
+            previous_frame_idx = frame_idx - 2
+
+            if previous_frame_idx >= 0:
+                previous_distance = self._track_distance(
+                    scene.frames[previous_frame_idx].annotations,
+                    track_token,
+                )
+                if previous_distance is not None:
+                    front_relative_speed = previous_distance - front_distance
+                    if front_relative_speed > 1e-3:
+                        front_ttc = front_distance / front_relative_speed
+                        front_ttc_valid = True
+
+        return {
+            "front_ttc": torch.tensor(front_ttc, dtype=torch.float32),
+            "front_ttc_valid": torch.tensor(front_ttc_valid, dtype=torch.bool),
+            "front_distance": torch.tensor(front_distance, dtype=torch.float32),
+            "front_relative_speed": torch.tensor(front_relative_speed, dtype=torch.float32),
         }
 
     def _compute_agent_targets(self, annotations: Annotations) -> Tuple[torch.Tensor, torch.Tensor]:
