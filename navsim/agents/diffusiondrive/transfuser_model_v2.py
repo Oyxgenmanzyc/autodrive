@@ -399,6 +399,104 @@ class CustomTransformerDecoder(nn.Module):
             traj_points = poses_reg[...,:2].clone().detach()
         return poses_reg_list, poses_cls_list
 
+
+class HistoryPlanningAdapter(nn.Module):
+    """BridgeAD-style short history query adapter for DiffusionDrive planning modes."""
+
+    def __init__(self, d_model: int, num_heads: int, history_steps: int = 3, dropout: float = 0.1):
+        super().__init__()
+        self.history_steps = history_steps
+        self.current_step_encoder = nn.Sequential(
+            *linear_relu_ln(d_model, 1, 1, 64),
+            nn.Linear(d_model, d_model),
+        )
+        self.history_step_encoder = nn.Sequential(
+            *linear_relu_ln(d_model, 1, 1, 64),
+            nn.Linear(d_model, d_model),
+        )
+        self.history_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.step_self_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.mode_self_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.norm_step = nn.LayerNorm(d_model)
+        self.norm_mode = nn.LayerNorm(d_model)
+        self.history_gate = nn.Parameter(torch.tensor(0.1))
+
+    def _inactive_metrics(self, traj_feature):
+        return {
+            "history_valid_ratio": traj_feature.new_tensor(0.0),
+            "history_gate": self.history_gate.detach(),
+            "history_delta_norm": traj_feature.new_tensor(0.0),
+        }
+
+    def forward(self, traj_feature, noisy_traj_points, previous_trajectory):
+        if previous_trajectory is None:
+            return traj_feature, self._inactive_metrics(traj_feature)
+
+        if previous_trajectory.dim() == 2:
+            previous_trajectory = previous_trajectory.unsqueeze(0)
+        if previous_trajectory.dim() < 3 or previous_trajectory.shape[0] != traj_feature.shape[0]:
+            return traj_feature, self._inactive_metrics(traj_feature)
+
+        steps = min(self.history_steps, noisy_traj_points.shape[-2], previous_trajectory.shape[-2])
+        if steps < self.history_steps:
+            return traj_feature, self._inactive_metrics(traj_feature)
+
+        previous_trajectory = previous_trajectory.to(device=traj_feature.device, dtype=traj_feature.dtype)
+        current_points = noisy_traj_points[:, :, :steps, :2]
+        history_points = previous_trajectory[:, :steps, :2]
+        if not torch.isfinite(current_points).all() or not torch.isfinite(history_points).all():
+            return traj_feature, self._inactive_metrics(traj_feature)
+
+        bs, num_modes, _, d_model = (
+            traj_feature.shape[0],
+            traj_feature.shape[1],
+            steps,
+            traj_feature.shape[-1],
+        )
+        current_embed = gen_sineembed_for_position(current_points, hidden_dim=64)
+        current_step_query = self.current_step_encoder(current_embed) + traj_feature.unsqueeze(2)
+        history_embed = gen_sineembed_for_position(history_points, hidden_dim=64)
+        history_step_query = self.history_step_encoder(history_embed)
+
+        q = current_step_query.reshape(bs * num_modes, steps, d_model)
+        kv = history_step_query.unsqueeze(1).expand(bs, num_modes, steps, d_model)
+        kv = kv.reshape(bs * num_modes, steps, d_model)
+
+        history_context = self.history_attn(q, kv, kv)[0]
+        step_query = self.norm_step(q + self.dropout(history_context))
+        step_context = self.step_self_attn(step_query, step_query, step_query)[0]
+        step_query = self.norm_step(step_query + self.dropout(step_context))
+        step_query = step_query.reshape(bs, num_modes, steps, d_model)
+
+        mode_delta = step_query.mean(dim=2)
+        mode_context = self.mode_self_attn(mode_delta, mode_delta, mode_delta)[0]
+        mode_delta = self.norm_mode(mode_delta + self.dropout(mode_context))
+        enhanced = traj_feature + self.history_gate * mode_delta
+
+        diagnostics = {
+            "history_valid_ratio": traj_feature.new_tensor(1.0),
+            "history_gate": self.history_gate.detach(),
+            "history_delta_norm": mode_delta.detach().norm(dim=-1).mean(),
+        }
+        return enhanced, diagnostics
+
+
 class TrajectoryHead(nn.Module):
     """Trajectory prediction head."""
 
@@ -437,7 +535,7 @@ class TrajectoryHead(nn.Module):
         self.energy_gt_weight = 0.00
         self.energy_temporal_weight = 0.80
         self.energy_comfort_weight = 0.20
-        self.temporal_rank_weight_max = 0.01
+        self.temporal_rank_weight_max = 0.30
         self.temporal_rank_margin = 0.10
         self.temporal_rank_energy_gap = 0.20
         self.temporal_rank_min_epoch = 50.0
@@ -464,6 +562,12 @@ class TrajectoryHead(nn.Module):
         self.plan_anchor_encoder = nn.Sequential(
             *linear_relu_ln(d_model, 1, 1,512),
             nn.Linear(d_model, d_model),
+        )
+        self.history_planning_adapter = HistoryPlanningAdapter(
+            d_model=d_model,
+            num_heads=config.tf_num_head,
+            history_steps=3,
+            dropout=config.tf_dropout,
         )
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(d_model),
@@ -924,6 +1028,12 @@ class TrajectoryHead(nn.Module):
         traj_pos_embed = traj_pos_embed.flatten(-2)
         traj_feature = self.plan_anchor_encoder(traj_pos_embed)
         traj_feature = traj_feature.view(bs,ego_fut_mode,-1)
+        traj_feature, history_metrics = self.history_planning_adapter(
+            traj_feature,
+            noisy_traj_points,
+            previous_trajectory,
+        )
+        temporal_metrics.update(history_metrics)
         # 3. embed the timesteps
         time_embed = self.time_mlp(timesteps)
         time_embed = time_embed.view(bs,1,-1)
@@ -993,6 +1103,7 @@ class TrajectoryHead(nn.Module):
         img = self.diffusion_scheduler.add_noise(original_samples=img, noise=noise, timesteps=trunc_timesteps)
         noisy_trajs = self.denorm_odo(img)
         ego_fut_mode = img.shape[1]
+        history_metrics = {}
         for k in roll_timesteps[:]:
             x_boxes = torch.clamp(img, min=-1, max=1)
             noisy_traj_points = self.denorm_odo(x_boxes)
@@ -1002,6 +1113,11 @@ class TrajectoryHead(nn.Module):
             traj_pos_embed = traj_pos_embed.flatten(-2)
             traj_feature = self.plan_anchor_encoder(traj_pos_embed)
             traj_feature = traj_feature.view(bs,ego_fut_mode,-1)
+            traj_feature, history_metrics = self.history_planning_adapter(
+                traj_feature,
+                noisy_traj_points,
+                previous_trajectory,
+            )
 
             timesteps = k
             if not torch.is_tensor(timesteps):
@@ -1036,4 +1152,5 @@ class TrajectoryHead(nn.Module):
         best_reg = torch.gather(poses_reg, 1, mode_idx).squeeze(1)
         output = {"trajectory": best_reg}
         output.update(temporal_diagnostics)
+        output.update(history_metrics)
         return output

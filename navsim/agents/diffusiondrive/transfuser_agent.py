@@ -64,6 +64,9 @@ class TransfuserAgent(AbstractAgent):
         self._last_temporal_rescore_cls_margin = 0.0
         self._last_temporal_rescore_selected_mode = 0.0
         self._last_temporal_rescore_base_mode = 0.0
+        self._last_history_valid_ratio = 0.0
+        self._last_history_gate = 0.0
+        self._last_history_delta_norm = 0.0
         self.init_from_pretrained()
 
     def init_from_pretrained(self):
@@ -189,6 +192,9 @@ class TransfuserAgent(AbstractAgent):
             "temporal_rescore_cls_margin": self._last_temporal_rescore_cls_margin,
             "temporal_rescore_selected_mode": self._last_temporal_rescore_selected_mode,
             "temporal_rescore_base_mode": self._last_temporal_rescore_base_mode,
+            "history_valid_ratio": self._last_history_valid_ratio,
+            "history_gate": self._last_history_gate,
+            "history_delta_norm": self._last_history_delta_norm,
         }
 
     @staticmethod
@@ -235,6 +241,9 @@ class TransfuserAgent(AbstractAgent):
             self._last_temporal_rescore_cls_margin = self._prediction_scalar(predictions, "temporal_rescore_cls_margin")
             self._last_temporal_rescore_selected_mode = self._prediction_scalar(predictions, "temporal_rescore_selected_mode")
             self._last_temporal_rescore_base_mode = self._prediction_scalar(predictions, "temporal_rescore_base_mode")
+            self._last_history_valid_ratio = self._prediction_scalar(predictions, "history_valid_ratio")
+            self._last_history_gate = self._prediction_scalar(predictions, "history_gate")
+            self._last_history_delta_norm = self._prediction_scalar(predictions, "history_delta_norm")
             poses = predictions["trajectory"].squeeze(0).numpy()
 
         self._previous_trajectory = poses.copy()

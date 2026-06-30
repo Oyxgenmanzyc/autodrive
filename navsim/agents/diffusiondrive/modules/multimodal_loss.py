@@ -167,6 +167,7 @@ class LossComputer(nn.Module):
     def _energy_supervision(
         self,
         poses_reg: Tensor,
+        poses_cls: Tensor,
         target_traj: Tensor,
         dist: Tensor,
         cls_target: Tensor,
@@ -293,6 +294,7 @@ class LossComputer(nn.Module):
         target_classes_onehot.scatter_(1, cls_target.unsqueeze(1), 1)
         energy_info = self._energy_supervision(
             poses_reg,
+            poses_cls,
             target_traj,
             dist,
             mode_idx_flat,

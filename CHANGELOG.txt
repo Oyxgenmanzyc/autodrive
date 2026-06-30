@@ -454,3 +454,35 @@ CHANGELOG.txt
 
 与论文撰写的关系：
 3.12 可表述为 “Temporal Pairwise Ranking Distillation”。它把历史连接性从直接轨迹惩罚改为 GT top-K 内的弱排序监督，更接近 metric learning / ranking loss 思想，避免 3.9 中 soft target 和 auxiliary regression 对原始 DiffusionDrive 监督造成强干扰。
+修改主题：3.16 BridgeAD-Style 3-Step History Planning Query
+修改日期：2026-06-30
+
+修改目的：
+基于当前 DiffusionDrive_3_13_clean_final / 3.13 temporal-comfort pairwise ranking 基线，单独验证 BridgeAD 启发的 historical planning query 机制是否能真正影响 DiffusionDrive 的候选生成。此前 3.13.3 的 progress-risk temporal boost 仍然只是 loss / ranking energy 层面的改动，没有实现 BridgeAD 的 historical planning query -> current planning query cross-attention，因此 3.13.3 不起作用不能说明 BridgeAD 思路不起作用。3.16 不继续叠加 progress-cost、TTC-cost 或 progress-risk boost，而是在 traj_feature 进入 diff_decoder 前新增可学习的 3-step history planning adapter。
+
+涉及文件：
+navsim/agents/diffusiondrive/transfuser_model_v2.py
+navsim/agents/diffusiondrive/transfuser_agent.py
+navsim/agents/diffusiondrive/modules/multimodal_loss.py
+tests/test_diffusiondrive_factorized_temporal_compat.py
+CHANGELOG.txt
+
+核心改动：
+1. 新增 HistoryPlanningAdapter，输入当前 20 个 mode 的 traj_feature、当前 noisy_traj_points 和 previous_trajectory。
+2. 只使用 previous_trajectory 与 noisy_traj_points 的前 3 个 waypoint 构造 step-level planning query；无历史、步数不足或非有限值时直接返回原 traj_feature，并记录 inactive diagnostics。
+3. 使用 gen_sineembed_for_position(hidden_dim=64) 编码 current/history step points，再投影到 d_model。
+4. 通过 MultiheadAttention 执行 current step query 对 historical step query 的 cross-attention，然后进行 step-level self-attention 与 mode-level self-attention，最后 pool 回 mode-level delta。
+5. 使用 history_gate 控制注入强度，初始值为 0.1，不设为 0，避免模块前期完全无效；最终形式为 traj_feature + history_gate * mode_delta。
+6. 在 forward_train 和 forward_test 中均于 plan_anchor_encoder 之后、diff_decoder 之前接入 HistoryPlanningAdapter，保证训练和推理一致；forward_test 每个 denoising step 都使用同一 previous_trajectory 条件化当前 planning query。
+7. 按 md 最终建议，将 temporal_rank_weight_max 从 0.01 提高到 0.30，保留 3.13 clean 的 temporal + comfort ranking 框架，不新增 21st anchor，不改变 diffusion decoder mode 数量，不改变 one-hot 分类监督和 best-mode regression。
+8. 新增 history_valid_ratio、history_gate、history_delta_norm 三个诊断字段，并在 TransfuserAgent.get_temporal_debug_info() 中暴露，便于服务器 PDM CSV 判断 adapter 是否触发以及是否实际改变 planning query。
+9. 修正 _energy_supervision 签名与函数内部 poses_cls 使用不一致的问题，确保 temporal ranking active 时训练路径和轻量测试都能正常访问分类 logits；该修复不改变 ranking energy 语义。
+
+预期影响：
+3.16 的核心变量不是继续放大 temporal cost，也不是针对 progress-risk candidate 做局部 loss boost，而是让短期历史规划信息在候选生成前进入 planning query 表征。若 history_delta_norm 稳定非零且 PDM 有变化，说明 historical planning query adapter 能直接影响 poses_reg / poses_cls；若指标无变化，则说明仅用 previous_trajectory 构造的轻量 BridgeAD-style query 仍不足以改变 DiffusionDrive 的最终决策，后续再考虑缓存历史 traj_feature 的更接近 BridgeAD memory queue 的版本。
+
+测试/验证结果：
+本地按项目约定只做轻量验证，不运行 full training、full validation 或完整 PDM。默认 python 未安装 pytest，因此未运行 pytest；已使用 D:\python\venv\Scripts\python.exe 完成 py_compile、git diff --check 和 manual runner，22 个 test_ 函数全部通过。新增轻量测试覆盖：无 previous_trajectory 时 adapter inactive；有效 3-step history 时输出 shape 不变且 history_delta_norm 非零；history_gate 初始化为 0.1 且可反传；3.16 的 temporal_rank_weight_max 为 0.30。最终训练和 PDM 结果等待服务器验证。
+
+与论文撰写的关系：
+3.16 可表述为 BridgeAD-inspired Historical Planning Query Adapter：受 BridgeAD historical planning query 机制启发，将历史轨迹编码为短期 step-level planning query，并在扩散解码前通过 cross-attention 注入当前多模态 planning query。与 3.13.3 的区别是，本版本新增可学习结构并直接改变 traj_feature，而不是只在 ranking loss 中调整 progress-risk 候选权重。

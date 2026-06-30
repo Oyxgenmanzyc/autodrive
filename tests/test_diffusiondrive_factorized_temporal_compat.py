@@ -1,5 +1,6 @@
 import sys
 import types
+import inspect
 
 import torch
 
@@ -17,10 +18,29 @@ class _DummyModule(torch.nn.Module):
         super().__init__()
 
 
+class _DummyScheduler:
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+def _test_sineembed_for_position(pos_tensor, hidden_dim=64):
+    half_hidden_dim = hidden_dim // 2
+    scale = 2 * torch.pi
+    dim_t = torch.arange(half_hidden_dim, dtype=torch.float32, device=pos_tensor.device)
+    dim_t = 10000 ** (2 * (dim_t // 2) / half_hidden_dim)
+    x_embed = pos_tensor[..., 0] * scale
+    y_embed = pos_tensor[..., 1] * scale
+    pos_x = x_embed[..., None] / dim_t
+    pos_y = y_embed[..., None] / dim_t
+    pos_x = torch.stack((pos_x[..., 0::2].sin(), pos_x[..., 1::2].cos()), dim=-1).flatten(-2)
+    pos_y = torch.stack((pos_y[..., 0::2].sin(), pos_y[..., 1::2].cos()), dim=-1).flatten(-2)
+    return torch.cat((pos_y, pos_x), dim=-1)
+
+
 def _load_trajectory_head():
     diffusers_module = _stub_module("diffusers")
     diffusers_module.__path__ = []
-    _stub_module("diffusers.schedulers", DDIMScheduler=object)
+    _stub_module("diffusers.schedulers", DDIMScheduler=_DummyScheduler)
     _stub_module("navsim.agents.diffusiondrive.transfuser_config", TransfuserConfig=object)
     _stub_module("navsim.agents.diffusiondrive.transfuser_backbone", TransfuserBackbone=object)
     _stub_module("navsim.agents.diffusiondrive.transfuser_features", BoundingBox2DIndex=object)
@@ -34,7 +54,7 @@ def _load_trajectory_head():
         "navsim.agents.diffusiondrive.modules.blocks",
         linear_relu_ln=lambda *args, **kwargs: [],
         bias_init_with_prob=lambda *args, **kwargs: 0.0,
-        gen_sineembed_for_position=lambda *args, **kwargs: None,
+        gen_sineembed_for_position=_test_sineembed_for_position,
         GridSampleCrossBEVAttention=_DummyModule,
     )
     _stub_module("navsim.agents.diffusiondrive.modules.multimodal_loss", LossComputer=_DummyModule)
@@ -42,6 +62,13 @@ def _load_trajectory_head():
     from navsim.agents.diffusiondrive.transfuser_model_v2 import TrajectoryHead
 
     return TrajectoryHead
+
+
+def _load_history_planning_adapter():
+    _load_trajectory_head()
+    from navsim.agents.diffusiondrive.transfuser_model_v2 import HistoryPlanningAdapter
+
+    return HistoryPlanningAdapter
 
 
 def _load_loss_computer():
@@ -93,6 +120,55 @@ def _straight_x(scale=1.0, steps=8):
 
 def _straight_y(scale=1.0, steps=8):
     return torch.stack([torch.zeros(steps), torch.arange(1, steps + 1).float() * scale], dim=-1)
+
+
+def test_history_planning_adapter_inactive_without_previous_trajectory():
+    HistoryPlanningAdapter = _load_history_planning_adapter()
+    adapter = HistoryPlanningAdapter(d_model=64, num_heads=4, history_steps=3, dropout=0.0)
+    traj_feature = torch.randn(2, 20, 64)
+    noisy_traj_points = torch.randn(2, 20, 8, 2)
+
+    enhanced, diagnostics = adapter(traj_feature, noisy_traj_points, None)
+
+    assert torch.allclose(enhanced, traj_feature)
+    assert diagnostics["history_valid_ratio"] == 0.0
+    assert diagnostics["history_delta_norm"] == 0.0
+    assert torch.allclose(diagnostics["history_gate"], torch.tensor(0.1))
+
+
+def test_history_planning_adapter_updates_query_with_valid_three_step_history():
+    HistoryPlanningAdapter = _load_history_planning_adapter()
+    adapter = HistoryPlanningAdapter(d_model=64, num_heads=4, history_steps=3, dropout=0.0)
+    traj_feature = torch.randn(2, 20, 64)
+    noisy_traj_points = torch.randn(2, 20, 8, 2)
+    previous_trajectory = torch.randn(2, 3, 2)
+
+    enhanced, diagnostics = adapter(traj_feature, noisy_traj_points, previous_trajectory)
+
+    assert enhanced.shape == traj_feature.shape
+    assert not torch.allclose(enhanced, traj_feature)
+    assert diagnostics["history_valid_ratio"] == 1.0
+    assert diagnostics["history_delta_norm"] > 0.0
+
+
+def test_history_planning_adapter_gate_receives_gradient():
+    HistoryPlanningAdapter = _load_history_planning_adapter()
+    adapter = HistoryPlanningAdapter(d_model=64, num_heads=4, history_steps=3, dropout=0.0)
+    traj_feature = torch.randn(1, 20, 64, requires_grad=True)
+    noisy_traj_points = torch.randn(1, 20, 8, 2)
+    previous_trajectory = torch.randn(1, 3, 2)
+
+    enhanced, diagnostics = adapter(traj_feature, noisy_traj_points, previous_trajectory)
+    enhanced.sum().backward()
+
+    assert torch.allclose(diagnostics["history_gate"], torch.tensor(0.1))
+    assert adapter.history_gate.grad is not None
+
+
+def test_trajectory_head_uses_stronger_temporal_rank_weight_for_3_16():
+    TrajectoryHead = _load_trajectory_head()
+
+    assert "self.temporal_rank_weight_max = 0.30" in inspect.getsource(TrajectoryHead.__init__)
 
 
 def test_temporal_noise_scale_returns_none_without_previous():
@@ -350,6 +426,7 @@ def test_temporal_rank_adds_loss_without_changing_classification_target():
 
     energy_info = loss_computer._energy_supervision(
         poses_reg,
+        poses_cls,
         target["trajectory"],
         dist,
         cls_target,
@@ -370,6 +447,7 @@ def test_temporal_rank_does_not_use_mode_outside_gt_topk():
 
     energy_info = loss_computer._energy_supervision(
         poses_reg,
+        poses_cls,
         target["trajectory"],
         dist,
         cls_target,
@@ -389,6 +467,7 @@ def test_temporal_rank_uses_detached_energy_but_backprops_to_logits():
 
     energy_info = loss_computer._energy_supervision(
         poses_reg,
+        poses_cls,
         target["trajectory"],
         dist,
         cls_target,
@@ -412,6 +491,7 @@ def test_temporal_comfort_rank_can_use_comfort_inside_gt_topk():
 
     energy_info = loss_computer._energy_supervision(
         poses_reg,
+        poses_cls,
         target["trajectory"],
         dist,
         cls_target,
