@@ -53,6 +53,7 @@ class TransfuserAgent(AbstractAgent):
         self._checkpoint_path = checkpoint_path
         self._transfuser_model = TransfuserModel(config)
         self._previous_trajectory: Optional[np.ndarray] = None
+        self._previous_query_memory: Optional[np.ndarray] = None
         self._temporal_reset_distance = 5.0
         self._last_temporal_reference_active = False
         self._last_previous_ego_delta_active = False
@@ -65,9 +66,12 @@ class TransfuserAgent(AbstractAgent):
         self._last_temporal_rescore_selected_mode = 0.0
         self._last_temporal_rescore_base_mode = 0.0
         self._last_history_valid_ratio = 0.0
+        self._last_history_memory_valid_ratio = 0.0
         self._last_history_delta_norm = 0.0
         self._last_history_feature_delta_norm = 0.0
-        self._last_history_residual_scale = 0.0
+        self._last_history_mode_bias_norm = 0.0
+        self._last_history_mode_bias_margin = 0.0
+        self._last_history_memory_size = 0.0
         self.init_from_pretrained()
 
     def init_from_pretrained(self):
@@ -127,8 +131,10 @@ class TransfuserAgent(AbstractAgent):
         targets: Dict[str, torch.Tensor]=None,
         previous_trajectory: Optional[torch.Tensor]=None,
         previous_ego_delta: Optional[torch.Tensor]=None,
+        previous_query_memory: Optional[torch.Tensor]=None,
         training_epoch: Optional[int]=None,
         energy_ramp_override: Optional[torch.Tensor]=None,
+        return_query_memory: bool=False,
     ) -> Dict[str, torch.Tensor]:
         """Inherited, see superclass."""
         return self._transfuser_model(
@@ -136,13 +142,16 @@ class TransfuserAgent(AbstractAgent):
             targets=targets,
             previous_trajectory=previous_trajectory,
             previous_ego_delta=previous_ego_delta,
+            previous_query_memory=previous_query_memory,
             training_epoch=training_epoch,
             energy_ramp_override=energy_ramp_override,
+            return_query_memory=return_query_memory,
         )
 
     def reset_temporal_context(self) -> None:
         """Clears cached inference trajectory before starting an unrelated scene."""
         self._previous_trajectory = None
+        self._previous_query_memory = None
         self._last_temporal_reference_active = False
         self._last_previous_ego_delta_active = False
         self._last_temporal_rescore_active = 0.0
@@ -154,9 +163,12 @@ class TransfuserAgent(AbstractAgent):
         self._last_temporal_rescore_selected_mode = 0.0
         self._last_temporal_rescore_base_mode = 0.0
         self._last_history_valid_ratio = 0.0
+        self._last_history_memory_valid_ratio = 0.0
         self._last_history_delta_norm = 0.0
         self._last_history_feature_delta_norm = 0.0
-        self._last_history_residual_scale = 0.0
+        self._last_history_mode_bias_norm = 0.0
+        self._last_history_mode_bias_margin = 0.0
+        self._last_history_memory_size = 0.0
 
     def _build_temporal_reference(self, agent_input: AgentInput) -> Optional[np.ndarray]:
         if self._previous_trajectory is None or len(agent_input.ego_statuses) < 2:
@@ -198,9 +210,12 @@ class TransfuserAgent(AbstractAgent):
             "temporal_rescore_selected_mode": self._last_temporal_rescore_selected_mode,
             "temporal_rescore_base_mode": self._last_temporal_rescore_base_mode,
             "history_valid_ratio": self._last_history_valid_ratio,
+            "history_memory_valid_ratio": self._last_history_memory_valid_ratio,
             "history_delta_norm": self._last_history_delta_norm,
             "history_feature_delta_norm": self._last_history_feature_delta_norm,
-            "history_residual_scale": self._last_history_residual_scale,
+            "history_mode_bias_norm": self._last_history_mode_bias_norm,
+            "history_mode_bias_margin": self._last_history_mode_bias_margin,
+            "history_memory_size": self._last_history_memory_size,
         }
 
     @staticmethod
@@ -211,6 +226,23 @@ class TransfuserAgent(AbstractAgent):
         if torch.is_tensor(value):
             return float(value.detach().float().mean().cpu().item())
         return float(value)
+
+    @staticmethod
+    def _query_memory_to_numpy(predictions: Dict[str, torch.Tensor]) -> Optional[np.ndarray]:
+        query_memory = predictions.get("history_query_memory")
+        selected_feature = predictions.get("history_selected_mode_feature")
+        if query_memory is None:
+            return None
+        if query_memory.dim() == 3:
+            query_memory = query_memory.squeeze(0)
+        if query_memory.dim() != 2:
+            return None
+        if selected_feature is not None:
+            if selected_feature.dim() == 2:
+                selected_feature = selected_feature.squeeze(0)
+            if selected_feature.dim() == 1 and selected_feature.shape[-1] == query_memory.shape[-1]:
+                query_memory = torch.cat([selected_feature[None], query_memory], dim=0)
+        return query_memory.detach().float().cpu().numpy()
 
     def compute_trajectory(self, agent_input: AgentInput) -> Trajectory:
         """
@@ -226,6 +258,9 @@ class TransfuserAgent(AbstractAgent):
         previous_trajectory_tensor = None
         if previous_trajectory is not None:
             previous_trajectory_tensor = torch.tensor(previous_trajectory).unsqueeze(0)
+        previous_query_memory_tensor = None
+        if self._previous_query_memory is not None:
+            previous_query_memory_tensor = torch.tensor(self._previous_query_memory).unsqueeze(0)
         previous_ego_delta = self._build_previous_ego_delta(agent_input)
         previous_ego_delta_tensor = None
         if previous_ego_delta is not None:
@@ -238,6 +273,8 @@ class TransfuserAgent(AbstractAgent):
                 features,
                 previous_trajectory=previous_trajectory_tensor,
                 previous_ego_delta=previous_ego_delta_tensor,
+                previous_query_memory=previous_query_memory_tensor,
+                return_query_memory=True,
             )
             self._last_temporal_rescore_active = self._prediction_scalar(predictions, "temporal_rescore_active")
             self._last_temporal_rescore_changed = self._prediction_scalar(predictions, "temporal_rescore_changed")
@@ -248,12 +285,16 @@ class TransfuserAgent(AbstractAgent):
             self._last_temporal_rescore_selected_mode = self._prediction_scalar(predictions, "temporal_rescore_selected_mode")
             self._last_temporal_rescore_base_mode = self._prediction_scalar(predictions, "temporal_rescore_base_mode")
             self._last_history_valid_ratio = self._prediction_scalar(predictions, "history_valid_ratio")
+            self._last_history_memory_valid_ratio = self._prediction_scalar(predictions, "history_memory_valid_ratio")
             self._last_history_delta_norm = self._prediction_scalar(predictions, "history_delta_norm")
             self._last_history_feature_delta_norm = self._prediction_scalar(predictions, "history_feature_delta_norm")
-            self._last_history_residual_scale = self._prediction_scalar(predictions, "history_residual_scale")
+            self._last_history_mode_bias_norm = self._prediction_scalar(predictions, "history_mode_bias_norm")
+            self._last_history_mode_bias_margin = self._prediction_scalar(predictions, "history_mode_bias_margin")
+            self._last_history_memory_size = self._prediction_scalar(predictions, "history_memory_size")
             poses = predictions["trajectory"].squeeze(0).numpy()
 
         self._previous_trajectory = poses.copy()
+        self._previous_query_memory = self._query_memory_to_numpy(predictions)
         return Trajectory(poses)
         
     def compute_loss(

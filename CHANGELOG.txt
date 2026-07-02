@@ -516,3 +516,35 @@ CHANGELOG.txt
 
 与论文撰写的关系：
 3.16.1 更适合作为 3.16 的诊断修正版。论文表述中不再强调 learnable gate，而是描述为 fixed-scale residual injection 的 historical planning query adapter，并用日志字段证明历史 query 是否真实参与模型前向。
+修改主题：3.18 Previous Query Memory History Adapter + Mode Bias
+修改日期：2026-07-02
+
+修改目的：
+基于 3.16.1 单独做更接近 BridgeAD historical planning query 的强版本。3.16/3.16.1 的核心限制是只用 previous_trajectory xy 构造历史 query，且对当前 query 的影响较弱；这不能代表 BridgeAD 中缓存历史 planning query / motion query 的机制。3.18 使用 temporal pair 中已经存在但此前未使用的 prev_features，先跑上一帧并导出 previous traj_feature / selected mode feature，再作为当前帧的 history query memory。目标是让历史信息在候选生成和 mode selection 两条路径上都产生可训练、可记录的影响。
+
+涉及文件：
+navsim/agents/diffusiondrive/transfuser_model_v2.py
+navsim/agents/diffusiondrive/transfuser_agent.py
+navsim/planning/training/agent_lightning_module.py
+tests/test_diffusiondrive_factorized_temporal_compat.py
+CHANGELOG.txt
+
+核心改动：
+1. V2TransfuserModel、TransfuserAgent 和 TrajectoryHead forward 接口新增 previous_query_memory 与 return_query_memory。
+2. TrajectoryHead 在 return_query_memory=True 时导出 history_query_memory [B,20,D] 和 history_selected_mode_feature [B,D]，均 detach，模拟 BridgeAD queue 中历史 query 不反传到上一帧。
+3. TemporalPairAgentLightningModule._step() 不再只使用 prev_targets["trajectory"]；它会在 torch.no_grad() 下先跑 prev_features/prev_targets，并将 selected mode feature 与 20 个 mode query 拼成 [B,21,D] 的 previous_query_memory 传入当前帧。
+4. HistoryPlanningAdapter 的主要输入从 previous_trajectory xy 改为 previous_query_memory；没有 query memory、shape 不匹配或非 finite 时 inactive。previous_trajectory 仍保留给原有 temporal cost / rescore 使用，但不再激活 history adapter。
+5. adapter 使用当前 traj_feature 对 previous_query_memory 做 cross-attention，再通过 query_fusion 生成 history_enhanced_traj_feature 作为 diff_decoder 的主 query，不再使用 0.1 * delta 的弱 residual 注入。
+6. adapter 同时生成 history_mode_bias [B,20] 并加到每层 poses_cls，使历史 query memory 直接影响分类 logits、训练 one-hot 分类监督和推理 mode selection。
+7. 推理端 TransfuserAgent 会缓存上一帧输出的 selected mode feature + query memory，下一帧作为 previous_query_memory 传入模型，使 train/test 都具备 query-memory 数据流。
+8. 新增日志/调试字段 history_memory_valid_ratio、history_mode_bias_norm、history_mode_bias_margin、history_memory_size，并保留 history_delta_norm、history_feature_delta_norm。
+9. 保留 20 anchors、diffusion decoder、one-hot 分类监督、best-mode regression、temporal_rank_weight_max=0.30；不加入 progress-cost、TTC-cost 或 progress-risk boost。
+
+预期影响：
+3.18 比 3.17 更接近 BridgeAD 的关键机制：历史来源不再是几何 xy，而是上一帧模型内部 planning query。若 history_memory_valid_ratio 接近 1、history_feature_delta_norm / history_mode_bias_margin 非零，且 loss/PDM 出现变化，说明 query-memory 路径确实进入候选生成与 mode selection。若这些指标非零但结果仍无改善，再考虑历史 query 本身是否需要更长 queue、motion-plan interaction 或更贴近 BridgeAD 的多层 query update。
+
+测试/验证结果：
+本地仅做轻量验证，不运行 full training、full validation 或完整 PDM。轻量测试覆盖：无 query memory 时 adapter inactive；只有 previous_trajectory xy 不会激活 query-memory adapter；有效 [B,21,D] memory 会改变 query 并产生非零 mode bias；Lightning wrapper 会读取 prev_features、请求 return_query_memory，并把 previous_query_memory 传给当前帧。最终训练和 PDM 结果等待服务器验证。
+
+与论文撰写的关系：
+3.18 可表述为 “Previous Planning Query Memory Adapter”，比 3.16 更接近 BridgeAD 的 historical planning query 机制。它仍不是完整 BridgeAD，因为没有引入 motion query queue、ego status queue 或 motion-plan interaction，但已经验证 DiffusionDrive 中最关键的适配问题：历史 planning query memory 是否能在不改变 anchors 和 decoder mode 数量的前提下影响当前 planning query 与 mode logits。

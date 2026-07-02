@@ -180,7 +180,22 @@ class TemporalPairAgentLightningModule(AgentLightningModule):
         previous_xy_in_current = torch.bmm(previous_xy, rotation.transpose(1, 2)) + previous_ego_pose[:, None, :2]
         return previous_xy_in_current.detach()
 
+    @staticmethod
+    def _build_previous_query_memory(prediction: Dict[str, Tensor]) -> Tensor:
+        query_memory = prediction.get("history_query_memory")
+        selected_feature = prediction.get("history_selected_mode_feature")
+        if query_memory is None:
+            return None
+        if query_memory.dim() != 3:
+            return None
+        if selected_feature is not None and selected_feature.dim() == 2:
+            selected_feature = selected_feature[:, None, :]
+            if selected_feature.shape[0] == query_memory.shape[0] and selected_feature.shape[-1] == query_memory.shape[-1]:
+                query_memory = torch.cat([selected_feature, query_memory], dim=1)
+        return query_memory.detach()
+
     def _step(self, batch: Dict[str, Any], logging_prefix: str) -> Tensor:
+        prev_features = batch["prev_features"]
         prev_targets = batch["prev_targets"]
         curr_features = batch["curr_features"]
         curr_targets = batch["curr_targets"]
@@ -198,6 +213,17 @@ class TemporalPairAgentLightningModule(AgentLightningModule):
             reference_tensor,
             previous_ego_pose,
         )
+        with torch.no_grad():
+            prev_prediction = self._agent_forward(
+                prev_features,
+                prev_targets,
+                previous_trajectory=None,
+                previous_ego_delta=None,
+                previous_query_memory=None,
+                training_epoch=self.current_epoch,
+                return_query_memory=True,
+            )
+        previous_query_memory = self._build_previous_query_memory(prev_prediction)
         energy_ramp_override = self._energy_ramp_override() if logging_prefix == "train" else None
 
         curr_prediction = self._agent_forward(
@@ -205,6 +231,7 @@ class TemporalPairAgentLightningModule(AgentLightningModule):
             curr_targets,
             previous_trajectory=previous_trajectory,
             previous_ego_delta=previous_ego_delta,
+            previous_query_memory=previous_query_memory,
             training_epoch=self.current_epoch,
             energy_ramp_override=energy_ramp_override,
         )
@@ -228,9 +255,12 @@ class TemporalPairAgentLightningModule(AgentLightningModule):
             "temporal_path_cost",
             "temporal_velocity_cost",
             "history_valid_ratio",
+            "history_memory_valid_ratio",
             "history_delta_norm",
             "history_feature_delta_norm",
-            "history_residual_scale",
+            "history_mode_bias_norm",
+            "history_mode_bias_margin",
+            "history_memory_size",
         ):
             if metric_name in curr_prediction:
                 self.log(

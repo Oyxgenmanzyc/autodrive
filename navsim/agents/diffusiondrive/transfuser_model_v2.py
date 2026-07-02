@@ -98,8 +98,10 @@ class V2TransfuserModel(nn.Module):
         targets: Dict[str, torch.Tensor]=None,
         previous_trajectory: Optional[torch.Tensor]=None,
         previous_ego_delta: Optional[torch.Tensor]=None,
+        previous_query_memory: Optional[torch.Tensor]=None,
         training_epoch: Optional[int]=None,
         energy_ramp_override: Optional[torch.Tensor]=None,
+        return_query_memory: bool=False,
     ) -> Dict[str, torch.Tensor]:
         """Torch module forward pass."""
 
@@ -147,8 +149,10 @@ class V2TransfuserModel(nn.Module):
             global_img=None,
             previous_trajectory=previous_trajectory,
             previous_ego_delta=previous_ego_delta,
+            previous_query_memory=previous_query_memory,
             training_epoch=training_epoch,
             energy_ramp_override=energy_ramp_override,
+            return_query_memory=return_query_memory,
         )
         output.update(trajectory)
 
@@ -401,27 +405,12 @@ class CustomTransformerDecoder(nn.Module):
 
 
 class HistoryPlanningAdapter(nn.Module):
-    """BridgeAD-style short history query adapter for DiffusionDrive planning modes."""
+    """BridgeAD-style query-memory adapter for DiffusionDrive planning modes."""
 
     def __init__(self, d_model: int, num_heads: int, history_steps: int = 3, dropout: float = 0.1):
         super().__init__()
         self.history_steps = history_steps
-        self.history_residual_scale = 0.1
-        self.current_step_encoder = nn.Sequential(
-            *linear_relu_ln(d_model, 1, 1, 64),
-            nn.Linear(d_model, d_model),
-        )
-        self.history_step_encoder = nn.Sequential(
-            *linear_relu_ln(d_model, 1, 1, 64),
-            nn.Linear(d_model, d_model),
-        )
-        self.history_attn = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.step_self_attn = nn.MultiheadAttention(
+        self.memory_attn = nn.MultiheadAttention(
             embed_dim=d_model,
             num_heads=num_heads,
             dropout=dropout,
@@ -433,71 +422,73 @@ class HistoryPlanningAdapter(nn.Module):
             dropout=dropout,
             batch_first=True,
         )
+        self.query_fusion = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model),
+        )
+        self.mode_bias_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, 1),
+        )
         self.dropout = nn.Dropout(dropout)
-        self.norm_step = nn.LayerNorm(d_model)
+        self.norm_memory = nn.LayerNorm(d_model)
         self.norm_mode = nn.LayerNorm(d_model)
 
     def _inactive_metrics(self, traj_feature):
         return {
             "history_valid_ratio": traj_feature.new_tensor(0.0),
+            "history_memory_valid_ratio": traj_feature.new_tensor(0.0),
             "history_delta_norm": traj_feature.new_tensor(0.0),
             "history_feature_delta_norm": traj_feature.new_tensor(0.0),
-            "history_residual_scale": traj_feature.new_tensor(self.history_residual_scale),
+            "history_mode_bias_norm": traj_feature.new_tensor(0.0),
+            "history_mode_bias_margin": traj_feature.new_tensor(0.0),
+            "history_memory_size": traj_feature.new_tensor(0.0),
         }
 
-    def forward(self, traj_feature, noisy_traj_points, previous_trajectory):
-        if previous_trajectory is None:
-            return traj_feature, self._inactive_metrics(traj_feature)
+    def _inactive(self, traj_feature):
+        mode_bias = traj_feature.new_zeros(traj_feature.shape[:2])
+        return traj_feature, mode_bias, self._inactive_metrics(traj_feature)
 
-        if previous_trajectory.dim() == 2:
-            previous_trajectory = previous_trajectory.unsqueeze(0)
-        if previous_trajectory.dim() < 3 or previous_trajectory.shape[0] != traj_feature.shape[0]:
-            return traj_feature, self._inactive_metrics(traj_feature)
+    def forward(self, traj_feature, noisy_traj_points, previous_trajectory=None, previous_query_memory=None):
+        if previous_query_memory is None:
+            return self._inactive(traj_feature)
 
-        steps = min(self.history_steps, noisy_traj_points.shape[-2], previous_trajectory.shape[-2])
-        if steps < self.history_steps:
-            return traj_feature, self._inactive_metrics(traj_feature)
+        if previous_query_memory.dim() == 2:
+            previous_query_memory = previous_query_memory.unsqueeze(1)
+        if previous_query_memory.dim() != 3:
+            return self._inactive(traj_feature)
+        if previous_query_memory.shape[0] != traj_feature.shape[0]:
+            return self._inactive(traj_feature)
+        if previous_query_memory.shape[-1] != traj_feature.shape[-1]:
+            return self._inactive(traj_feature)
 
-        previous_trajectory = previous_trajectory.to(device=traj_feature.device, dtype=traj_feature.dtype)
-        current_points = noisy_traj_points[:, :, :steps, :2]
-        history_points = previous_trajectory[:, :steps, :2]
-        if not torch.isfinite(current_points).all() or not torch.isfinite(history_points).all():
-            return traj_feature, self._inactive_metrics(traj_feature)
+        previous_query_memory = previous_query_memory.to(device=traj_feature.device, dtype=traj_feature.dtype)
+        if not torch.isfinite(previous_query_memory).all():
+            return self._inactive(traj_feature)
 
-        bs, num_modes, _, d_model = (
-            traj_feature.shape[0],
-            traj_feature.shape[1],
-            steps,
-            traj_feature.shape[-1],
-        )
-        current_embed = gen_sineembed_for_position(current_points, hidden_dim=64)
-        current_step_query = self.current_step_encoder(current_embed) + traj_feature.unsqueeze(2)
-        history_embed = gen_sineembed_for_position(history_points, hidden_dim=64)
-        history_step_query = self.history_step_encoder(history_embed)
-
-        q = current_step_query.reshape(bs * num_modes, steps, d_model)
-        kv = history_step_query.unsqueeze(1).expand(bs, num_modes, steps, d_model)
-        kv = kv.reshape(bs * num_modes, steps, d_model)
-
-        history_context = self.history_attn(q, kv, kv)[0]
-        step_query = self.norm_step(q + self.dropout(history_context))
-        step_context = self.step_self_attn(step_query, step_query, step_query)[0]
-        step_query = self.norm_step(step_query + self.dropout(step_context))
-        step_query = step_query.reshape(bs, num_modes, steps, d_model)
-
-        mode_delta = step_query.mean(dim=2)
-        mode_context = self.mode_self_attn(mode_delta, mode_delta, mode_delta)[0]
-        mode_delta = self.norm_mode(mode_delta + self.dropout(mode_context))
-        feature_delta = self.history_residual_scale * mode_delta
-        enhanced = traj_feature + feature_delta
+        memory_context = self.memory_attn(traj_feature, previous_query_memory, previous_query_memory)[0]
+        fused = self.query_fusion(torch.cat([traj_feature, memory_context], dim=-1))
+        enhanced = self.norm_memory(fused)
+        mode_context = self.mode_self_attn(enhanced, enhanced, enhanced)[0]
+        enhanced = self.norm_mode(enhanced + self.dropout(mode_context))
+        feature_delta = enhanced - traj_feature
+        mode_bias = self.mode_bias_head(enhanced).squeeze(-1)
+        mode_bias = mode_bias - mode_bias.mean(dim=-1, keepdim=True)
 
         diagnostics = {
             "history_valid_ratio": traj_feature.new_tensor(1.0),
-            "history_delta_norm": mode_delta.detach().norm(dim=-1).mean(),
+            "history_memory_valid_ratio": traj_feature.new_tensor(1.0),
+            "history_delta_norm": memory_context.detach().norm(dim=-1).mean(),
             "history_feature_delta_norm": feature_delta.detach().norm(dim=-1).mean(),
-            "history_residual_scale": traj_feature.new_tensor(self.history_residual_scale),
+            "history_mode_bias_norm": mode_bias.detach().norm(dim=-1).mean(),
+            "history_mode_bias_margin": (
+                mode_bias.detach().max(dim=-1).values - mode_bias.detach().min(dim=-1).values
+            ).mean(),
+            "history_memory_size": traj_feature.new_tensor(float(previous_query_memory.shape[1])),
         }
-        return enhanced, diagnostics
+        return enhanced, mode_bias, diagnostics
 
 
 class TrajectoryHead(nn.Module):
@@ -997,15 +988,15 @@ class TrajectoryHead(nn.Module):
         }
         return mode_idx, diagnostics
 
-    def forward(self, ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None,previous_trajectory=None,previous_ego_delta=None,training_epoch=None,energy_ramp_override=None) -> Dict[str, torch.Tensor]:
+    def forward(self, ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None,previous_trajectory=None,previous_ego_delta=None,previous_query_memory=None,training_epoch=None,energy_ramp_override=None,return_query_memory=False) -> Dict[str, torch.Tensor]:
         """Torch module forward pass."""
         if self.training:
-            return self.forward_train(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,targets,global_img,previous_trajectory,previous_ego_delta,training_epoch,energy_ramp_override)
+            return self.forward_train(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,targets,global_img,previous_trajectory,previous_ego_delta,previous_query_memory,training_epoch,energy_ramp_override,return_query_memory)
         else:
-            return self.forward_test(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,global_img,previous_trajectory,previous_ego_delta)
+            return self.forward_test(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,global_img,previous_trajectory,previous_ego_delta,previous_query_memory,return_query_memory)
 
 
-    def forward_train(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None,previous_trajectory=None,previous_ego_delta=None,training_epoch=None,energy_ramp_override=None) -> Dict[str, torch.Tensor]:
+    def forward_train(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None,previous_trajectory=None,previous_ego_delta=None,previous_query_memory=None,training_epoch=None,energy_ramp_override=None,return_query_memory=False) -> Dict[str, torch.Tensor]:
         bs = ego_query.shape[0]
         device = ego_query.device
         # 1. add truncated noise to the plan anchor
@@ -1031,10 +1022,11 @@ class TrajectoryHead(nn.Module):
         traj_pos_embed = traj_pos_embed.flatten(-2)
         traj_feature = self.plan_anchor_encoder(traj_pos_embed)
         traj_feature = traj_feature.view(bs,ego_fut_mode,-1)
-        traj_feature, history_metrics = self.history_planning_adapter(
+        traj_feature, history_mode_bias, history_metrics = self.history_planning_adapter(
             traj_feature,
             noisy_traj_points,
             previous_trajectory,
+            previous_query_memory,
         )
         temporal_metrics.update(history_metrics)
         # 3. embed the timesteps
@@ -1044,6 +1036,7 @@ class TrajectoryHead(nn.Module):
 
         # 4. begin the stacked decoder
         poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)
+        poses_cls_list = [poses_cls + history_mode_bias for poses_cls in poses_cls_list]
         temporal_context = self._energy_loss_context(
             poses_reg_list[-1][..., :2],
             previous_trajectory,
@@ -1081,14 +1074,22 @@ class TrajectoryHead(nn.Module):
             ret_original_traj_loss += original_trajectory_loss
 
         mode_idx = poses_cls_list[-1].argmax(dim=-1)
+        selected_feature = torch.gather(
+            traj_feature,
+            1,
+            mode_idx[:, None, None].expand(-1, 1, traj_feature.shape[-1]),
+        ).squeeze(1)
         mode_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
         best_reg = torch.gather(poses_reg_list[-1], 1, mode_idx).squeeze(1)
         trajectory_loss_dict["trajectory_original_loss"] = ret_original_traj_loss.detach()
         output = {"trajectory": best_reg,"trajectory_loss":ret_traj_loss,"trajectory_loss_dict":trajectory_loss_dict}
+        if return_query_memory:
+            output["history_query_memory"] = traj_feature.detach()
+            output["history_selected_mode_feature"] = selected_feature.detach()
         output.update(temporal_metrics)
         return output
 
-    def forward_test(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding,global_img,previous_trajectory=None,previous_ego_delta=None) -> Dict[str, torch.Tensor]:
+    def forward_test(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding,global_img,previous_trajectory=None,previous_ego_delta=None,previous_query_memory=None,return_query_memory=False) -> Dict[str, torch.Tensor]:
         step_num = 2
         bs = ego_query.shape[0]
         device = ego_query.device
@@ -1116,10 +1117,11 @@ class TrajectoryHead(nn.Module):
             traj_pos_embed = traj_pos_embed.flatten(-2)
             traj_feature = self.plan_anchor_encoder(traj_pos_embed)
             traj_feature = traj_feature.view(bs,ego_fut_mode,-1)
-            traj_feature, history_metrics = self.history_planning_adapter(
+            traj_feature, history_mode_bias, history_metrics = self.history_planning_adapter(
                 traj_feature,
                 noisy_traj_points,
                 previous_trajectory,
+                previous_query_memory,
             )
 
             timesteps = k
@@ -1136,6 +1138,7 @@ class TrajectoryHead(nn.Module):
 
             # 4. begin the stacked decoder
             poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)
+            poses_cls_list = [poses_cls + history_mode_bias for poses_cls in poses_cls_list]
             poses_reg = poses_reg_list[-1]
             poses_cls = poses_cls_list[-1]
             x_start = poses_reg[...,:2]
@@ -1151,9 +1154,17 @@ class TrajectoryHead(nn.Module):
             previous_trajectory,
             previous_ego_delta,
         )
+        selected_feature = torch.gather(
+            traj_feature,
+            1,
+            mode_idx[:, None, None].expand(-1, 1, traj_feature.shape[-1]),
+        ).squeeze(1)
         mode_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
         best_reg = torch.gather(poses_reg, 1, mode_idx).squeeze(1)
         output = {"trajectory": best_reg}
+        if return_query_memory:
+            output["history_query_memory"] = traj_feature.detach()
+            output["history_selected_mode_feature"] = selected_feature.detach()
         output.update(temporal_diagnostics)
         output.update(history_metrics)
         return output
