@@ -223,7 +223,15 @@ class TemporalPairAgentLightningModule(AgentLightningModule):
                     batch_size=batch_size,
                 )
         self.log(f"{logging_prefix}/temporal_pair_active", torch.ones((), device=self.device), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True, batch_size=batch_size)
-        for metric_name in ("temporal_start_cost", "temporal_path_cost", "temporal_velocity_cost"):
+        for metric_name in (
+            "temporal_start_cost",
+            "temporal_path_cost",
+            "temporal_velocity_cost",
+            "history_valid_ratio",
+            "history_delta_norm",
+            "history_feature_delta_norm",
+            "history_residual_scale",
+        ):
             if metric_name in curr_prediction:
                 self.log(
                     f"{logging_prefix}/{metric_name}",

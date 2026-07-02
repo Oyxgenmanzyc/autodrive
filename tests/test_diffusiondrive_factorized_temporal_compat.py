@@ -1,6 +1,7 @@
 import sys
 import types
 import inspect
+from pathlib import Path
 
 import torch
 
@@ -133,7 +134,8 @@ def test_history_planning_adapter_inactive_without_previous_trajectory():
     assert torch.allclose(enhanced, traj_feature)
     assert diagnostics["history_valid_ratio"] == 0.0
     assert diagnostics["history_delta_norm"] == 0.0
-    assert torch.allclose(diagnostics["history_gate"], torch.tensor(0.1))
+    assert diagnostics["history_feature_delta_norm"] == 0.0
+    assert torch.allclose(diagnostics["history_residual_scale"], torch.tensor(0.1))
 
 
 def test_history_planning_adapter_updates_query_with_valid_three_step_history():
@@ -149,20 +151,25 @@ def test_history_planning_adapter_updates_query_with_valid_three_step_history():
     assert not torch.allclose(enhanced, traj_feature)
     assert diagnostics["history_valid_ratio"] == 1.0
     assert diagnostics["history_delta_norm"] > 0.0
+    assert diagnostics["history_feature_delta_norm"] > 0.0
+    assert torch.allclose(diagnostics["history_residual_scale"], torch.tensor(0.1))
 
 
-def test_history_planning_adapter_gate_receives_gradient():
+def test_history_planning_adapter_no_longer_uses_learnable_gate():
     HistoryPlanningAdapter = _load_history_planning_adapter()
     adapter = HistoryPlanningAdapter(d_model=64, num_heads=4, history_steps=3, dropout=0.0)
-    traj_feature = torch.randn(1, 20, 64, requires_grad=True)
-    noisy_traj_points = torch.randn(1, 20, 8, 2)
-    previous_trajectory = torch.randn(1, 3, 2)
 
-    enhanced, diagnostics = adapter(traj_feature, noisy_traj_points, previous_trajectory)
-    enhanced.sum().backward()
+    assert not hasattr(adapter, "history_gate")
+    assert not any(name == "history_gate" for name, _ in adapter.named_parameters())
 
-    assert torch.allclose(diagnostics["history_gate"], torch.tensor(0.1))
-    assert adapter.history_gate.grad is not None
+
+def test_temporal_pair_lightning_logs_history_diagnostics():
+    source = Path("navsim/planning/training/agent_lightning_module.py").read_text()
+
+    assert '"history_valid_ratio"' in source
+    assert '"history_delta_norm"' in source
+    assert '"history_feature_delta_norm"' in source
+    assert '"history_residual_scale"' in source
 
 
 def test_trajectory_head_uses_stronger_temporal_rank_weight_for_3_16():

@@ -486,3 +486,33 @@ CHANGELOG.txt
 
 与论文撰写的关系：
 3.16 可表述为 BridgeAD-inspired Historical Planning Query Adapter：受 BridgeAD historical planning query 机制启发，将历史轨迹编码为短期 step-level planning query，并在扩散解码前通过 cross-attention 注入当前多模态 planning query。与 3.13.3 的区别是，本版本新增可学习结构并直接改变 traj_feature，而不是只在 ranking loss 中调整 progress-risk 候选权重。
+修改主题：3.16.1 Simplified History Adapter + Diagnostics
+修改日期：2026-07-02
+
+修改目的：
+基于 3.16 BridgeAD-style 3-step history planning query 做小修正版。3.16 的训练日志显示 loss 可以下降但关键 history diagnostics 没有进入 TensorBoard，因此无法判断 historical planning query adapter 是否真正触发、是否改变 planning query。3.16.1 不重新设计模块，不加入 progress/TTC/progress-risk 逻辑，只减少 gate 设置并补齐日志，使服务器训练后可以直接观察模块是否起作用。
+
+涉及文件：
+navsim/agents/diffusiondrive/transfuser_model_v2.py
+navsim/agents/diffusiondrive/transfuser_agent.py
+navsim/planning/training/agent_lightning_module.py
+tests/test_diffusiondrive_factorized_temporal_compat.py
+CHANGELOG.txt
+
+核心改动：
+1. 移除 HistoryPlanningAdapter 中的可学习 history_gate 参数，避免历史模块再引入额外 gate 概念。
+2. 保留唯一必要的有效性判断：previous_trajectory 为空、shape 不匹配、步数不足或非 finite 时 adapter inactive。
+3. 有效历史输入时使用固定残差注入：traj_feature + 0.1 * mode_delta。0.1 是固定 residual scale，不参与学习，不作为 gate 解释。
+4. diagnostics 改为 history_valid_ratio、history_delta_norm、history_feature_delta_norm、history_residual_scale。
+5. TransfuserAgent 的 PDM debug 字段同步移除 history_gate，新增 history_feature_delta_norm 与 history_residual_scale。
+6. TemporalPairAgentLightningModule 显式记录 curr_prediction 中的 history diagnostics，服务器训练日志应出现 train/history_valid_ratio_epoch、train/history_delta_norm_epoch、train/history_feature_delta_norm_epoch、train/history_residual_scale_epoch。
+7. 保留 3.16 的 temporal_rank_weight_max=0.30，不改 20 anchors、diffusion decoder、one-hot 分类监督、best-mode regression，不加入 progress-cost、TTC-cost 或 progress-risk boost。
+
+预期影响：
+3.16.1 的目标是让实验更容易解释：如果 history_valid_ratio 接近 1 且 history_feature_delta_norm 稳定非零，说明 BridgeAD-style adapter 确实进入了训练和推理 query；如果这些值为 0，则优先检查 previous_trajectory 数据流；如果 history_feature_delta_norm 非零但 PDM/loss 无改善，再判断该轻量历史 query 本身作用有限。
+
+测试/验证结果：
+本地只做轻量验证，不运行 full training、full validation 或完整 PDM。更新轻量测试覆盖：无历史输入 inactive；有效 3-step history 会改变 query；adapter 不再包含 history_gate 参数；Lightning wrapper 会记录 history diagnostics。最终训练和 PDM 结果等待服务器验证。
+
+与论文撰写的关系：
+3.16.1 更适合作为 3.16 的诊断修正版。论文表述中不再强调 learnable gate，而是描述为 fixed-scale residual injection 的 historical planning query adapter，并用日志字段证明历史 query 是否真实参与模型前向。

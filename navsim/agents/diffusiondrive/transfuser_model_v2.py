@@ -406,6 +406,7 @@ class HistoryPlanningAdapter(nn.Module):
     def __init__(self, d_model: int, num_heads: int, history_steps: int = 3, dropout: float = 0.1):
         super().__init__()
         self.history_steps = history_steps
+        self.history_residual_scale = 0.1
         self.current_step_encoder = nn.Sequential(
             *linear_relu_ln(d_model, 1, 1, 64),
             nn.Linear(d_model, d_model),
@@ -435,13 +436,13 @@ class HistoryPlanningAdapter(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.norm_step = nn.LayerNorm(d_model)
         self.norm_mode = nn.LayerNorm(d_model)
-        self.history_gate = nn.Parameter(torch.tensor(0.1))
 
     def _inactive_metrics(self, traj_feature):
         return {
             "history_valid_ratio": traj_feature.new_tensor(0.0),
-            "history_gate": self.history_gate.detach(),
             "history_delta_norm": traj_feature.new_tensor(0.0),
+            "history_feature_delta_norm": traj_feature.new_tensor(0.0),
+            "history_residual_scale": traj_feature.new_tensor(self.history_residual_scale),
         }
 
     def forward(self, traj_feature, noisy_traj_points, previous_trajectory):
@@ -487,12 +488,14 @@ class HistoryPlanningAdapter(nn.Module):
         mode_delta = step_query.mean(dim=2)
         mode_context = self.mode_self_attn(mode_delta, mode_delta, mode_delta)[0]
         mode_delta = self.norm_mode(mode_delta + self.dropout(mode_context))
-        enhanced = traj_feature + self.history_gate * mode_delta
+        feature_delta = self.history_residual_scale * mode_delta
+        enhanced = traj_feature + feature_delta
 
         diagnostics = {
             "history_valid_ratio": traj_feature.new_tensor(1.0),
-            "history_gate": self.history_gate.detach(),
             "history_delta_norm": mode_delta.detach().norm(dim=-1).mean(),
+            "history_feature_delta_norm": feature_delta.detach().norm(dim=-1).mean(),
+            "history_residual_scale": traj_feature.new_tensor(self.history_residual_scale),
         }
         return enhanced, diagnostics
 
