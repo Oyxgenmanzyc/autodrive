@@ -230,7 +230,8 @@ class TemporalPairAgentLightningModule(AgentLightningModule):
             "history_valid_ratio",
             "history_delta_norm",
             "history_feature_delta_norm",
-            "history_residual_scale",
+            "history_mode_bias_norm",
+            "history_mode_bias_margin",
         ):
             if metric_name in curr_prediction:
                 self.log(

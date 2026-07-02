@@ -67,7 +67,8 @@ class TransfuserAgent(AbstractAgent):
         self._last_history_valid_ratio = 0.0
         self._last_history_delta_norm = 0.0
         self._last_history_feature_delta_norm = 0.0
-        self._last_history_residual_scale = 0.0
+        self._last_history_mode_bias_norm = 0.0
+        self._last_history_mode_bias_margin = 0.0
         self.init_from_pretrained()
 
     def init_from_pretrained(self):
@@ -156,7 +157,8 @@ class TransfuserAgent(AbstractAgent):
         self._last_history_valid_ratio = 0.0
         self._last_history_delta_norm = 0.0
         self._last_history_feature_delta_norm = 0.0
-        self._last_history_residual_scale = 0.0
+        self._last_history_mode_bias_norm = 0.0
+        self._last_history_mode_bias_margin = 0.0
 
     def _build_temporal_reference(self, agent_input: AgentInput) -> Optional[np.ndarray]:
         if self._previous_trajectory is None or len(agent_input.ego_statuses) < 2:
@@ -200,7 +202,8 @@ class TransfuserAgent(AbstractAgent):
             "history_valid_ratio": self._last_history_valid_ratio,
             "history_delta_norm": self._last_history_delta_norm,
             "history_feature_delta_norm": self._last_history_feature_delta_norm,
-            "history_residual_scale": self._last_history_residual_scale,
+            "history_mode_bias_norm": self._last_history_mode_bias_norm,
+            "history_mode_bias_margin": self._last_history_mode_bias_margin,
         }
 
     @staticmethod
@@ -250,7 +253,8 @@ class TransfuserAgent(AbstractAgent):
             self._last_history_valid_ratio = self._prediction_scalar(predictions, "history_valid_ratio")
             self._last_history_delta_norm = self._prediction_scalar(predictions, "history_delta_norm")
             self._last_history_feature_delta_norm = self._prediction_scalar(predictions, "history_feature_delta_norm")
-            self._last_history_residual_scale = self._prediction_scalar(predictions, "history_residual_scale")
+            self._last_history_mode_bias_norm = self._prediction_scalar(predictions, "history_mode_bias_norm")
+            self._last_history_mode_bias_margin = self._prediction_scalar(predictions, "history_mode_bias_margin")
             poses = predictions["trajectory"].squeeze(0).numpy()
 
         self._previous_trajectory = poses.copy()

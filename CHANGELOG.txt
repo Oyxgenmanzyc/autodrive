@@ -516,3 +516,33 @@ CHANGELOG.txt
 
 与论文撰写的关系：
 3.16.1 更适合作为 3.16 的诊断修正版。论文表述中不再强调 learnable gate，而是描述为 fixed-scale residual injection 的 historical planning query adapter，并用日志字段证明历史 query 是否真实参与模型前向。
+修改主题：3.17 History Query Main Injection + Mode Bias
+修改日期：2026-07-02
+
+修改目的：
+基于 3.16.1 做一个更容易产生可观测影响的轻量版本。3.16/3.16.1 只用 previous_trajectory 构造短历史 query，并通过很弱的 residual 改变 traj_feature，训练日志即使能看到 history_feature_delta_norm 非零，也未必能影响最终 mode selection。3.17 不引入 progress-cost、TTC-cost 或 progress-risk boost，而是让历史 adapter 的输出成为进入 diffusion decoder 的主 planning query，并额外产生 history_mode_bias 直接加到 poses_cls，验证“历史 query 是否应该进入分类/模式选择”这一变量。
+
+涉及文件：
+navsim/agents/diffusiondrive/transfuser_model_v2.py
+navsim/agents/diffusiondrive/transfuser_agent.py
+navsim/planning/training/agent_lightning_module.py
+tests/test_diffusiondrive_factorized_temporal_compat.py
+CHANGELOG.txt
+
+核心改动：
+1. HistoryPlanningAdapter 不再使用 history_residual_scale，也不引入 learnable gate。
+2. 有效 previous_trajectory 输入时，adapter 仍使用前三个 waypoint 与当前 noisy_traj_points 构造 step-level cross-attention、step self-attention 和 mode self-attention。
+3. adapter 输出 history_enhanced_traj_feature 作为进入 diff_decoder 的主 query；不再使用 0.1 * delta 的弱注入方式。
+4. 新增 mode_bias_head，根据 history-aware mode feature 产生 history_mode_bias [B,20]，并按 batch 内 mode 维度去均值，避免只产生对 softmax 无效的整体 logit shift。
+5. forward_train 和 forward_test 中，每层 decoder 的 poses_cls 都加上 history_mode_bias，使历史信息直接影响 one-hot 分类监督、best-mode 选择和最终推理 mode selection。
+6. 新增/同步日志字段 history_mode_bias_norm、history_mode_bias_margin；移除 history_residual_scale 诊断。
+7. 保留 20 anchors、diffusion decoder、one-hot 分类监督、best-mode regression、temporal_rank_weight_max=0.30；不混入 3.15 progress/TTC ranking。
+
+预期影响：
+若 3.17 相比 3.16.1 的 loss/PDM 有明显变化，说明历史 query 需要进入 mode logits 才能影响 DiffusionDrive 的最终决策；若 history_mode_bias_norm 和 history_mode_bias_margin 非零但 PDM 仍无变化，说明仅使用 previous xy 构造的轻量 history query 仍不足，需要转向 3.18 的 previous query memory。
+
+测试/验证结果：
+本地仅做轻量验证，不运行 full training、full validation 或完整 PDM。轻量测试覆盖：无历史输入时 query 不变且 mode bias 为 0；有效 3-step history 时 query shape 不变、feature delta 非零、mode bias 非零；确认不再存在 history_gate / history_residual_scale；确认 Lightning wrapper 会记录 mode bias 诊断。最终训练和 PDM 结果等待服务器验证。
+
+与论文撰写的关系：
+3.17 可作为 “History Query + Classification Bias” 消融，用于说明 3.16 的问题可能不是 BridgeAD 思路本身，而是历史 query 没有足够强地进入 DiffusionDrive 的 mode selection 路径。它仍不声称复现 BridgeAD memory queue，因为历史来源仍是 previous trajectory xy。

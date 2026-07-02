@@ -406,7 +406,6 @@ class HistoryPlanningAdapter(nn.Module):
     def __init__(self, d_model: int, num_heads: int, history_steps: int = 3, dropout: float = 0.1):
         super().__init__()
         self.history_steps = history_steps
-        self.history_residual_scale = 0.1
         self.current_step_encoder = nn.Sequential(
             *linear_relu_ln(d_model, 1, 1, 64),
             nn.Linear(d_model, d_model),
@@ -436,33 +435,44 @@ class HistoryPlanningAdapter(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.norm_step = nn.LayerNorm(d_model)
         self.norm_mode = nn.LayerNorm(d_model)
+        self.norm_output = nn.LayerNorm(d_model)
+        self.mode_bias_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, 1),
+        )
 
     def _inactive_metrics(self, traj_feature):
         return {
             "history_valid_ratio": traj_feature.new_tensor(0.0),
             "history_delta_norm": traj_feature.new_tensor(0.0),
             "history_feature_delta_norm": traj_feature.new_tensor(0.0),
-            "history_residual_scale": traj_feature.new_tensor(self.history_residual_scale),
+            "history_mode_bias_norm": traj_feature.new_tensor(0.0),
+            "history_mode_bias_margin": traj_feature.new_tensor(0.0),
         }
 
     def forward(self, traj_feature, noisy_traj_points, previous_trajectory):
         if previous_trajectory is None:
-            return traj_feature, self._inactive_metrics(traj_feature)
+            mode_bias = traj_feature.new_zeros(traj_feature.shape[:2])
+            return traj_feature, mode_bias, self._inactive_metrics(traj_feature)
 
         if previous_trajectory.dim() == 2:
             previous_trajectory = previous_trajectory.unsqueeze(0)
         if previous_trajectory.dim() < 3 or previous_trajectory.shape[0] != traj_feature.shape[0]:
-            return traj_feature, self._inactive_metrics(traj_feature)
+            mode_bias = traj_feature.new_zeros(traj_feature.shape[:2])
+            return traj_feature, mode_bias, self._inactive_metrics(traj_feature)
 
         steps = min(self.history_steps, noisy_traj_points.shape[-2], previous_trajectory.shape[-2])
         if steps < self.history_steps:
-            return traj_feature, self._inactive_metrics(traj_feature)
+            mode_bias = traj_feature.new_zeros(traj_feature.shape[:2])
+            return traj_feature, mode_bias, self._inactive_metrics(traj_feature)
 
         previous_trajectory = previous_trajectory.to(device=traj_feature.device, dtype=traj_feature.dtype)
         current_points = noisy_traj_points[:, :, :steps, :2]
         history_points = previous_trajectory[:, :steps, :2]
         if not torch.isfinite(current_points).all() or not torch.isfinite(history_points).all():
-            return traj_feature, self._inactive_metrics(traj_feature)
+            mode_bias = traj_feature.new_zeros(traj_feature.shape[:2])
+            return traj_feature, mode_bias, self._inactive_metrics(traj_feature)
 
         bs, num_modes, _, d_model = (
             traj_feature.shape[0],
@@ -488,16 +498,21 @@ class HistoryPlanningAdapter(nn.Module):
         mode_delta = step_query.mean(dim=2)
         mode_context = self.mode_self_attn(mode_delta, mode_delta, mode_delta)[0]
         mode_delta = self.norm_mode(mode_delta + self.dropout(mode_context))
-        feature_delta = self.history_residual_scale * mode_delta
-        enhanced = traj_feature + feature_delta
+        enhanced = self.norm_output(traj_feature + mode_delta)
+        mode_bias = self.mode_bias_head(mode_delta).squeeze(-1)
+        mode_bias = mode_bias - mode_bias.mean(dim=-1, keepdim=True)
+        feature_delta = enhanced - traj_feature
 
         diagnostics = {
             "history_valid_ratio": traj_feature.new_tensor(1.0),
             "history_delta_norm": mode_delta.detach().norm(dim=-1).mean(),
             "history_feature_delta_norm": feature_delta.detach().norm(dim=-1).mean(),
-            "history_residual_scale": traj_feature.new_tensor(self.history_residual_scale),
+            "history_mode_bias_norm": mode_bias.detach().norm(dim=-1).mean(),
+            "history_mode_bias_margin": (
+                mode_bias.detach().max(dim=-1).values - mode_bias.detach().min(dim=-1).values
+            ).mean(),
         }
-        return enhanced, diagnostics
+        return enhanced, mode_bias, diagnostics
 
 
 class TrajectoryHead(nn.Module):
@@ -1031,7 +1046,7 @@ class TrajectoryHead(nn.Module):
         traj_pos_embed = traj_pos_embed.flatten(-2)
         traj_feature = self.plan_anchor_encoder(traj_pos_embed)
         traj_feature = traj_feature.view(bs,ego_fut_mode,-1)
-        traj_feature, history_metrics = self.history_planning_adapter(
+        traj_feature, history_mode_bias, history_metrics = self.history_planning_adapter(
             traj_feature,
             noisy_traj_points,
             previous_trajectory,
@@ -1044,6 +1059,7 @@ class TrajectoryHead(nn.Module):
 
         # 4. begin the stacked decoder
         poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)
+        poses_cls_list = [poses_cls + history_mode_bias for poses_cls in poses_cls_list]
         temporal_context = self._energy_loss_context(
             poses_reg_list[-1][..., :2],
             previous_trajectory,
@@ -1116,7 +1132,7 @@ class TrajectoryHead(nn.Module):
             traj_pos_embed = traj_pos_embed.flatten(-2)
             traj_feature = self.plan_anchor_encoder(traj_pos_embed)
             traj_feature = traj_feature.view(bs,ego_fut_mode,-1)
-            traj_feature, history_metrics = self.history_planning_adapter(
+            traj_feature, history_mode_bias, history_metrics = self.history_planning_adapter(
                 traj_feature,
                 noisy_traj_points,
                 previous_trajectory,
@@ -1136,6 +1152,7 @@ class TrajectoryHead(nn.Module):
 
             # 4. begin the stacked decoder
             poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)
+            poses_cls_list = [poses_cls + history_mode_bias for poses_cls in poses_cls_list]
             poses_reg = poses_reg_list[-1]
             poses_cls = poses_cls_list[-1]
             x_start = poses_reg[...,:2]

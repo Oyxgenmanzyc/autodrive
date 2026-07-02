@@ -129,13 +129,15 @@ def test_history_planning_adapter_inactive_without_previous_trajectory():
     traj_feature = torch.randn(2, 20, 64)
     noisy_traj_points = torch.randn(2, 20, 8, 2)
 
-    enhanced, diagnostics = adapter(traj_feature, noisy_traj_points, None)
+    enhanced, mode_bias, diagnostics = adapter(traj_feature, noisy_traj_points, None)
 
     assert torch.allclose(enhanced, traj_feature)
+    assert torch.allclose(mode_bias, torch.zeros_like(mode_bias))
     assert diagnostics["history_valid_ratio"] == 0.0
     assert diagnostics["history_delta_norm"] == 0.0
     assert diagnostics["history_feature_delta_norm"] == 0.0
-    assert torch.allclose(diagnostics["history_residual_scale"], torch.tensor(0.1))
+    assert diagnostics["history_mode_bias_norm"] == 0.0
+    assert diagnostics["history_mode_bias_margin"] == 0.0
 
 
 def test_history_planning_adapter_updates_query_with_valid_three_step_history():
@@ -145,14 +147,16 @@ def test_history_planning_adapter_updates_query_with_valid_three_step_history():
     noisy_traj_points = torch.randn(2, 20, 8, 2)
     previous_trajectory = torch.randn(2, 3, 2)
 
-    enhanced, diagnostics = adapter(traj_feature, noisy_traj_points, previous_trajectory)
+    enhanced, mode_bias, diagnostics = adapter(traj_feature, noisy_traj_points, previous_trajectory)
 
     assert enhanced.shape == traj_feature.shape
+    assert mode_bias.shape == traj_feature.shape[:2]
     assert not torch.allclose(enhanced, traj_feature)
+    assert diagnostics["history_mode_bias_norm"] > 0.0
+    assert diagnostics["history_mode_bias_margin"] > 0.0
     assert diagnostics["history_valid_ratio"] == 1.0
     assert diagnostics["history_delta_norm"] > 0.0
     assert diagnostics["history_feature_delta_norm"] > 0.0
-    assert torch.allclose(diagnostics["history_residual_scale"], torch.tensor(0.1))
 
 
 def test_history_planning_adapter_no_longer_uses_learnable_gate():
@@ -161,6 +165,7 @@ def test_history_planning_adapter_no_longer_uses_learnable_gate():
 
     assert not hasattr(adapter, "history_gate")
     assert not any(name == "history_gate" for name, _ in adapter.named_parameters())
+    assert not hasattr(adapter, "history_residual_scale")
 
 
 def test_temporal_pair_lightning_logs_history_diagnostics():
@@ -169,7 +174,15 @@ def test_temporal_pair_lightning_logs_history_diagnostics():
     assert '"history_valid_ratio"' in source
     assert '"history_delta_norm"' in source
     assert '"history_feature_delta_norm"' in source
-    assert '"history_residual_scale"' in source
+    assert '"history_mode_bias_norm"' in source
+    assert '"history_mode_bias_margin"' in source
+
+
+def test_history_mode_bias_is_added_to_decoder_logits():
+    TrajectoryHead = _load_trajectory_head()
+    source = inspect.getsource(TrajectoryHead.forward_train)
+
+    assert "poses_cls_list = [poses_cls + history_mode_bias for poses_cls in poses_cls_list]" in source
 
 
 def test_trajectory_head_uses_stronger_temporal_rank_weight_for_3_16():
