@@ -1,0 +1,49 @@
+3.20 第二个创新点：风险时序注意力与决策时机
+
+修改日期
+- 2026-07-07
+
+修改目的
+- 从 origin/main 重新建立实验分支。
+- 在不重写 DiffusionDrive、不改变 20 mode anchor 和原始 trajectory 主 loss 的前提下，引入历史风险趋势，让模型更关注跟车场景中的刹车时机和所需减速度。
+
+涉及文件
+- navsim/agents/diffusiondrive/modules/risk_utils.py
+- navsim/agents/diffusiondrive/modules/risk_attention.py
+- navsim/agents/diffusiondrive/modules/risk_gate.py
+- navsim/agents/diffusiondrive/transfuser_features.py
+- navsim/agents/diffusiondrive/transfuser_model_v2.py
+- navsim/agents/diffusiondrive/transfuser_loss.py
+- navsim/agents/diffusiondrive/transfuser_config.py
+- navsim/agents/diffusiondrive/transfuser_agent.py
+- navsim/planning/script/config/common/agent/diffusiondrive_agent.yaml
+- tests/test_diffusiondrive_risk_utils.py
+- tests/test_diffusiondrive_risk_attention_gate.py
+
+核心改动
+- FeatureBuilder 仍只使用推理阶段可用的 AgentInput，不使用 GT agent box 作为模型输入。
+- 新增 LiDAR 前方走廊 gap 代理，从 4 帧历史 LiDAR 和 ego 状态构造 history_risk_tokens。
+- 显式计算 THW、TTC、DRAC、delta THW、delta TTC、delta DRAC，避免让网络从零学习风险公式。
+- TargetBuilder 使用训练阶段可用的 GT 历史 box、velocity、track_tokens 生成 memory auxiliary labels，仅作为监督信号。
+- 新增 HistoricalRiskTemporalSelfAttention，将 history_risk_tokens 编码为 history_risk_memory。
+- 新增 TemporalRiskCrossAttention，让 step-level trajectory query 查询历史风险记忆，再聚合回 mode-level feature。
+- 新增 memory auxiliary loss，监督 risk trend、urgency、brake need 三个风险语义。
+- 新增最终 risk gate，在 decoder 输出后按 safe、warning、dangerous 分组重选 mode，避免使用 cls - lambda * risk 这种量纲混合分数。
+- 所有新增功能都有 config flag 控制；TransfuserConfig 默认关闭，3.20 的 diffusiondrive_agent.yaml 显式开启前四个开关。
+
+预期影响
+- 历史 LiDAR gap 变化提供可评测输入下的风险趋势代理。
+- history_risk_memory 负责表达过去 0.5s 到 1.5s 风险是否恶化。
+- Temporal Risk Cross-Attention 让候选轨迹的每个未来时间点接收风险趋势条件。
+- risk gate 在推理阶段优先过滤刹车过晚、减速度不足或前向间距风险过高的 mode。
+
+测试/验证结果
+- 已通过 Python AST 静态解析检查。
+- 已通过 git diff --check。
+- 本地 unittest 未完整运行：当前 Windows Python 环境缺少 numpy，报 ModuleNotFoundError: No module named 'numpy'。
+- 完整训练与服务器验证待后续服务器 smoke test。
+
+与论文撰写的关系
+- 可作为第二个创新点 3.20 的第一版工程实现。
+- 对应论文表述：显式风险量化 + 历史风险时序注意力 + 风险条件轨迹解码 + 最终安全门控。
+- 保持输入/监督边界与原始 DiffusionDrive 一致：推理输入不使用训练标注，GT 历史 box 只用于训练辅助监督和离线诊断。

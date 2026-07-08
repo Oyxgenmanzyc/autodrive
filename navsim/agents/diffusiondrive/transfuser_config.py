@@ -36,6 +36,33 @@ class TransfuserConfig:
     # new
     lidar_seq_len: int = 1
 
+    # 3.20 risk temporal attention flags
+    use_risk_gate: bool = False
+    use_historical_risk_attention: bool = False
+    use_temporal_risk_cross_attention: bool = False
+    use_memory_aux_loss: bool = False
+    use_risk_aware_cls: bool = False
+    use_step_brake_timing_loss: bool = False
+
+    # LiDAR-based history risk token settings
+    risk_history_num_frames: int = 4
+    risk_history_dt: float = 0.5
+    risk_token_dim: int = 12
+    risk_front_x_min: float = 1.0
+    risk_front_x_max: float = 32.0
+    risk_front_y_abs: float = 1.8
+    risk_lidar_min_z: float = 0.2
+    risk_lidar_max_z: float = 3.0
+    risk_lidar_min_points: int = 3
+    risk_lidar_gap_percentile: float = 10.0
+    risk_ego_front_offset: float = 2.0
+    risk_ttc_max: float = 10.0
+    risk_drac_max: float = 6.0
+    risk_attention_layers: int = 1
+    memory_aux_loss_weight: float = 0.2
+    risk_gate_min_gap: float = 1.0
+    risk_gate_cls_margin: float = 2.0
+
     camera_width: int = 1024
     camera_height: int = 256
     lidar_resolution_width = 256

@@ -12,6 +12,11 @@ from navsim.agents.diffusiondrive.modules.conditional_unet1d import ConditionalU
 import torch.nn.functional as F
 from navsim.agents.diffusiondrive.modules.blocks import linear_relu_ln,bias_init_with_prob, gen_sineembed_for_position, GridSampleCrossBEVAttention
 from navsim.agents.diffusiondrive.modules.multimodal_loss import LossComputer
+from navsim.agents.diffusiondrive.modules.risk_attention import (
+    HistoricalRiskTemporalSelfAttention,
+    TemporalRiskCrossAttention,
+)
+from navsim.agents.diffusiondrive.modules.risk_gate import select_risk_gated_mode
 from torch.nn import TransformerDecoder,TransformerDecoderLayer
 from typing import Any, List, Dict, Optional, Union
 class V2TransfuserModel(nn.Module):
@@ -98,6 +103,7 @@ class V2TransfuserModel(nn.Module):
         camera_feature: torch.Tensor = features["camera_feature"]
         lidar_feature: torch.Tensor = features["lidar_feature"]
         status_feature: torch.Tensor = features["status_feature"]
+        history_risk_tokens: Optional[torch.Tensor] = features.get("history_risk_tokens")
 
         batch_size = status_feature.shape[0]
 
@@ -129,7 +135,16 @@ class V2TransfuserModel(nn.Module):
 
         output: Dict[str, torch.Tensor] = {"bev_semantic_map": bev_semantic_map}
 
-        trajectory = self._trajectory_head(trajectory_query,agents_query, cross_bev_feature,bev_spatial_shape,status_encoding[:, None],targets=targets,global_img=None)
+        trajectory = self._trajectory_head(
+            trajectory_query,
+            agents_query,
+            cross_bev_feature,
+            bev_spatial_shape,
+            status_encoding[:, None],
+            targets=targets,
+            global_img=None,
+            history_risk_tokens=history_risk_tokens,
+        )
         output.update(trajectory)
 
         agents = self._agent_head(agents_query)
@@ -296,6 +311,12 @@ class CustomTransformerDecoderLayer(nn.Module):
             dropout=config.tf_dropout,
             batch_first=True,
         )
+        self.use_temporal_risk_cross_attention = config.use_temporal_risk_cross_attention
+        if self.use_temporal_risk_cross_attention:
+            self.temporal_risk_attention = TemporalRiskCrossAttention(
+                d_model=config.tf_d_model,
+                num_heads=config.tf_num_head,
+            )
         self.ffn = nn.Sequential(
             nn.Linear(config.tf_d_model, config.tf_d_ffn),
             nn.ReLU(),
@@ -320,6 +341,7 @@ class CustomTransformerDecoderLayer(nn.Module):
                 ego_query, 
                 time_embed, 
                 status_encoding,
+                history_risk_memory=None,
                 global_img=None):
         traj_feature = self.cross_bev_attention(traj_feature,noisy_traj_points,bev_feature,bev_spatial_shape)
         traj_feature = traj_feature + self.dropout(self.cross_agent_attention(traj_feature, agents_query,agents_query)[0])
@@ -330,6 +352,9 @@ class CustomTransformerDecoderLayer(nn.Module):
         # 4.5 cross attention with  ego query
         traj_feature = traj_feature + self.dropout1(self.cross_ego_attention(traj_feature, ego_query,ego_query)[0])
         traj_feature = self.norm2(traj_feature)
+
+        if self.use_temporal_risk_cross_attention and history_risk_memory is not None:
+            traj_feature = self.temporal_risk_attention(traj_feature, noisy_traj_points, history_risk_memory)
         
         # 4.6 feedforward network
         traj_feature = self.norm3(self.ffn(traj_feature))
@@ -368,12 +393,24 @@ class CustomTransformerDecoder(nn.Module):
                 ego_query, 
                 time_embed, 
                 status_encoding,
+                history_risk_memory=None,
                 global_img=None):
         poses_reg_list = []
         poses_cls_list = []
         traj_points = noisy_traj_points
         for mod in self.layers:
-            poses_reg, poses_cls = mod(traj_feature, traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)
+            poses_reg, poses_cls = mod(
+                traj_feature,
+                traj_points,
+                bev_feature,
+                bev_spatial_shape,
+                agents_query,
+                ego_query,
+                time_embed,
+                status_encoding,
+                history_risk_memory,
+                global_img,
+            )
             poses_reg_list.append(poses_reg)
             poses_cls_list.append(poses_cls)
             traj_points = poses_reg[...,:2].clone().detach()
@@ -430,6 +467,16 @@ class TrajectoryHead(nn.Module):
         self.diff_decoder = CustomTransformerDecoder(diff_decoder_layer, 2)
 
         self.loss_computer = LossComputer(config)
+        self._config = config
+        self.use_historical_risk_attention = config.use_historical_risk_attention
+        if self.use_historical_risk_attention:
+            self.history_risk_encoder = HistoricalRiskTemporalSelfAttention(
+                token_dim=config.risk_token_dim,
+                d_model=d_model,
+                num_heads=config.tf_num_head,
+                num_layers=config.risk_attention_layers,
+                history_frames=config.risk_history_num_frames,
+            )
     def norm_odo(self, odo_info_fut):
         odo_info_fut_x = odo_info_fut[..., 0:1]
         odo_info_fut_y = odo_info_fut[..., 1:2]
@@ -448,17 +495,68 @@ class TrajectoryHead(nn.Module):
         odo_info_fut_y = (odo_info_fut_y + 1)/2 * 46 - 20
         odo_info_fut_head = (odo_info_fut_head + 1)/2 * 3.9 - 2
         return torch.cat([odo_info_fut_x, odo_info_fut_y, odo_info_fut_head], dim=-1)
-    def forward(self, ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None) -> Dict[str, torch.Tensor]:
+    def _encode_history_risk(self, history_risk_tokens, targets=None):
+        if not self.use_historical_risk_attention or history_risk_tokens is None:
+            return None, None
+        history_risk_memory, risk_aux_logits = self.history_risk_encoder(history_risk_tokens)
+        risk_aux_loss = None
+        if self.training and self._config.use_memory_aux_loss and targets is not None:
+            risk_aux_loss = self.history_risk_encoder.compute_aux_loss(
+                risk_aux_logits,
+                targets,
+                self._config.memory_aux_loss_weight,
+            )
+        return history_risk_memory, risk_aux_loss
+
+    def forward(
+        self,
+        ego_query,
+        agents_query,
+        bev_feature,
+        bev_spatial_shape,
+        status_encoding,
+        targets=None,
+        global_img=None,
+        history_risk_tokens=None,
+    ) -> Dict[str, torch.Tensor]:
         """Torch module forward pass."""
         if self.training:
-            return self.forward_train(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,targets,global_img)
+            return self.forward_train(
+                ego_query,
+                agents_query,
+                bev_feature,
+                bev_spatial_shape,
+                status_encoding,
+                targets,
+                global_img,
+                history_risk_tokens,
+            )
         else:
-            return self.forward_test(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,global_img)
+            return self.forward_test(
+                ego_query,
+                agents_query,
+                bev_feature,
+                bev_spatial_shape,
+                status_encoding,
+                global_img,
+                history_risk_tokens,
+            )
 
 
-    def forward_train(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None) -> Dict[str, torch.Tensor]:
+    def forward_train(
+        self,
+        ego_query,
+        agents_query,
+        bev_feature,
+        bev_spatial_shape,
+        status_encoding,
+        targets=None,
+        global_img=None,
+        history_risk_tokens=None,
+    ) -> Dict[str, torch.Tensor]:
         bs = ego_query.shape[0]
         device = ego_query.device
+        history_risk_memory, risk_aux_loss = self._encode_history_risk(history_risk_tokens, targets)
         # 1. add truncated noise to the plan anchor
         plan_anchor = self.plan_anchor.unsqueeze(0).repeat(bs,1,1,1)
         odo_info_fut = self.norm_odo(plan_anchor)
@@ -487,7 +585,18 @@ class TrajectoryHead(nn.Module):
 
 
         # 4. begin the stacked decoder
-        poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)
+        poses_reg_list, poses_cls_list = self.diff_decoder(
+            traj_feature,
+            noisy_traj_points,
+            bev_feature,
+            bev_spatial_shape,
+            agents_query,
+            ego_query,
+            time_embed,
+            status_encoding,
+            history_risk_memory,
+            global_img,
+        )
 
         trajectory_loss_dict = {}
         ret_traj_loss = 0
@@ -499,12 +608,26 @@ class TrajectoryHead(nn.Module):
         mode_idx = poses_cls_list[-1].argmax(dim=-1)
         mode_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
         best_reg = torch.gather(poses_reg_list[-1], 1, mode_idx).squeeze(1)
-        return {"trajectory": best_reg,"trajectory_loss":ret_traj_loss,"trajectory_loss_dict":trajectory_loss_dict}
+        output = {"trajectory": best_reg,"trajectory_loss":ret_traj_loss,"trajectory_loss_dict":trajectory_loss_dict}
+        if risk_aux_loss is not None:
+            output["memory_aux_loss"] = risk_aux_loss
+            output["trajectory_loss_dict"]["memory_aux_loss"] = risk_aux_loss
+        return output
 
-    def forward_test(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding,global_img) -> Dict[str, torch.Tensor]:
+    def forward_test(
+        self,
+        ego_query,
+        agents_query,
+        bev_feature,
+        bev_spatial_shape,
+        status_encoding,
+        global_img,
+        history_risk_tokens=None,
+    ) -> Dict[str, torch.Tensor]:
         step_num = 2
         bs = ego_query.shape[0]
         device = ego_query.device
+        history_risk_memory, _ = self._encode_history_risk(history_risk_tokens)
         self.diffusion_scheduler.set_timesteps(1000, device)
         step_ratio = 20 / step_num
         roll_timesteps = (np.arange(0, step_num) * step_ratio).round()[::-1].copy().astype(np.int64)
@@ -542,7 +665,18 @@ class TrajectoryHead(nn.Module):
             time_embed = time_embed.view(bs,1,-1)
 
             # 4. begin the stacked decoder
-            poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)
+            poses_reg_list, poses_cls_list = self.diff_decoder(
+                traj_feature,
+                noisy_traj_points,
+                bev_feature,
+                bev_spatial_shape,
+                agents_query,
+                ego_query,
+                time_embed,
+                status_encoding,
+                history_risk_memory,
+                global_img,
+            )
             poses_reg = poses_reg_list[-1]
             poses_cls = poses_cls_list[-1]
             x_start = poses_reg[...,:2]
@@ -552,7 +686,10 @@ class TrajectoryHead(nn.Module):
                 timestep=k,
                 sample=img
             ).prev_sample
-        mode_idx = poses_cls.argmax(dim=-1)
+        if self._config.use_risk_gate and history_risk_tokens is not None:
+            mode_idx = select_risk_gated_mode(poses_reg, poses_cls, history_risk_tokens, self._config)
+        else:
+            mode_idx = poses_cls.argmax(dim=-1)
         mode_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
         best_reg = torch.gather(poses_reg, 1, mode_idx).squeeze(1)
         return {"trajectory": best_reg}

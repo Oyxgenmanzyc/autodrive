@@ -92,7 +92,25 @@ class TransfuserAgent(AbstractAgent):
 
     def get_sensor_config(self) -> SensorConfig:
         """Inherited, see superclass."""
-        return SensorConfig.build_all_sensors(include=[3])
+        if not (
+            self._config.use_risk_gate
+            or self._config.use_historical_risk_attention
+            or self._config.use_temporal_risk_cross_attention
+        ):
+            return SensorConfig.build_all_sensors(include=[3])
+
+        history_indices = list(range(self._config.risk_history_num_frames))
+        return SensorConfig(
+            cam_f0=[self._config.risk_history_num_frames - 1],
+            cam_l0=[self._config.risk_history_num_frames - 1],
+            cam_l1=False,
+            cam_l2=False,
+            cam_r0=[self._config.risk_history_num_frames - 1],
+            cam_r1=False,
+            cam_r2=False,
+            cam_b0=False,
+            lidar_pc=history_indices,
+        )
 
     def get_target_builders(self) -> List[AbstractTargetBuilder]:
         """Inherited, see superclass."""

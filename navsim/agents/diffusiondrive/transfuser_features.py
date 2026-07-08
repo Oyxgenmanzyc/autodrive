@@ -16,6 +16,7 @@ from nuplan.common.actor_state.state_representation import StateSE2
 from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
 
 from navsim.agents.diffusiondrive.transfuser_config import TransfuserConfig
+from navsim.agents.diffusiondrive.modules.risk_utils import build_gt_history_risk_targets, build_history_risk_tokens
 from navsim.common.dataclasses import AgentInput, Scene, Annotations
 from navsim.common.enums import BoundingBoxIndex, LidarIndex
 from navsim.planning.scenario_builder.navsim_scenario_utils import tracked_object_types
@@ -49,6 +50,11 @@ class TransfuserFeatureBuilder(AbstractFeatureBuilder):
                 torch.tensor(agent_input.ego_statuses[-1].ego_acceleration, dtype=torch.float32),
             ],
         )
+        if self._config.use_historical_risk_attention or self._config.use_temporal_risk_cross_attention:
+            features["history_risk_tokens"] = torch.tensor(
+                build_history_risk_tokens(agent_input, self._config),
+                dtype=torch.float32,
+            )
 
         return features
 
@@ -145,12 +151,18 @@ class TransfuserTargetBuilder(AbstractTargetBuilder):
         agent_states, agent_labels = self._compute_agent_targets(annotations)
         bev_semantic_map = self._compute_bev_semantic_map(annotations, scene.map_api, ego_pose)
 
-        return {
+        targets = {
             "trajectory": trajectory,
             "agent_states": agent_states,
             "agent_labels": agent_labels,
             "bev_semantic_map": bev_semantic_map,
         }
+        if self._config.use_memory_aux_loss:
+            risk_targets = build_gt_history_risk_targets(scene, self._config)
+            targets["risk_aux_labels"] = torch.tensor(risk_targets["risk_aux_labels"], dtype=torch.long)
+            targets["risk_aux_valid"] = torch.tensor(risk_targets["risk_aux_valid"], dtype=torch.float32)
+
+        return targets
 
     def _compute_agent_targets(self, annotations: Annotations) -> Tuple[torch.Tensor, torch.Tensor]:
         """
