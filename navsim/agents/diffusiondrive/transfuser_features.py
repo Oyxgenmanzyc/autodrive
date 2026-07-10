@@ -50,7 +50,13 @@ class TransfuserFeatureBuilder(AbstractFeatureBuilder):
                 torch.tensor(agent_input.ego_statuses[-1].ego_acceleration, dtype=torch.float32),
             ],
         )
-        if self._config.use_historical_risk_attention or self._config.use_temporal_risk_cross_attention:
+        if (
+            self._config.use_risk_gate
+            or self._config.use_historical_risk_attention
+            or self._config.use_temporal_risk_cross_attention
+            or self._config.use_risk_shadow_evaluator
+            or self._config.use_soft_risk_rescore
+        ):
             features["history_risk_tokens"] = torch.tensor(
                 build_history_risk_tokens(agent_input, self._config),
                 dtype=torch.float32,

@@ -31,9 +31,10 @@ class HistoricalRiskTemporalSelfAttention(nn.Module):
         self.brake_need_head = nn.Linear(d_model, 5)
 
     def forward(self, history_risk_tokens: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        history_risk_tokens = torch.nan_to_num(history_risk_tokens.float(), nan=0.0, posinf=0.0, neginf=0.0)
         valid = history_risk_tokens[..., -1:].clamp(0.0, 1.0)
         x = (self.token_embedding(history_risk_tokens) + self.time_embedding[:, : history_risk_tokens.shape[1]]) * valid
-        memory = self.encoder(x) * valid
+        memory = torch.nan_to_num(self.encoder(x) * valid, nan=0.0, posinf=0.0, neginf=0.0)
 
         denom = valid.sum(dim=1).clamp(min=1.0)
         pooled = memory.sum(dim=1) / denom
@@ -95,9 +96,13 @@ class TemporalRiskCrossAttention(nn.Module):
         noisy_traj_points: torch.Tensor,
         history_risk_memory: torch.Tensor,
     ) -> torch.Tensor:
+        traj_feature = torch.nan_to_num(traj_feature, nan=0.0, posinf=0.0, neginf=0.0)
+        noisy_traj_points = torch.nan_to_num(noisy_traj_points, nan=0.0, posinf=0.0, neginf=0.0)
+        history_risk_memory = torch.nan_to_num(history_risk_memory, nan=0.0, posinf=0.0, neginf=0.0)
         bs, num_mode, num_step, _ = noisy_traj_points.shape
         step_query = traj_feature[:, :, None, :] + self.step_embedding(noisy_traj_points)
         flat_query = step_query.reshape(bs, num_mode * num_step, -1)
         risk_context = self.cross_attention(flat_query, history_risk_memory, history_risk_memory)[0]
+        risk_context = torch.nan_to_num(risk_context, nan=0.0, posinf=0.0, neginf=0.0)
         risk_context = risk_context.reshape(bs, num_mode, num_step, -1).mean(dim=2)
         return self.norm(traj_feature + risk_context)

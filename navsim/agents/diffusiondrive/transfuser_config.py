@@ -43,6 +43,8 @@ class TransfuserConfig:
     use_memory_aux_loss: bool = False
     use_risk_aware_cls: bool = False
     use_step_brake_timing_loss: bool = False
+    use_risk_shadow_evaluator: bool = False
+    use_soft_risk_rescore: bool = False
 
     # LiDAR-based history risk token settings
     risk_history_num_frames: int = 4
@@ -62,6 +64,31 @@ class TransfuserConfig:
     memory_aux_loss_weight: float = 0.2
     risk_gate_min_gap: float = 1.0
     risk_gate_cls_margin: float = 2.0
+
+    # 3.20 stage-1 shadow evaluator. These settings add no trainable parameters.
+    risk_shadow_agent_confidence: float = 0.35
+    risk_shadow_gap_agreement: float = 3.0
+    risk_shadow_min_reliability: float = 0.5
+    risk_shadow_default_lead_width: float = 2.0
+    risk_shadow_ego_width: float = 2.0
+    risk_shadow_lateral_margin: float = 0.3
+    risk_shadow_lead_accel_min: float = -4.0
+    risk_shadow_lead_accel_max: float = 2.0
+    risk_shadow_max_lead_speed: float = 40.0
+    risk_shadow_clearance_cap: float = 40.0
+    risk_shadow_warning_gap: float = 3.0
+    risk_shadow_brake_accel: float = -0.5
+    risk_shadow_brake_preparation_time: float = 1.0
+    risk_shadow_jerk_free: float = 4.0
+    risk_shadow_jerk_scale: float = 4.0
+    risk_shadow_decel_free: float = 4.0
+    risk_shadow_decel_scale: float = 4.0
+    risk_shadow_clearance_weight: float = 0.45
+    risk_shadow_timing_weight: float = 0.25
+    risk_shadow_map_weight: float = 0.20
+    risk_shadow_comfort_weight: float = 0.10
+    risk_shadow_cls_margin: float = 1.0
+    risk_shadow_logit_penalty: float = 1.0
 
     camera_width: int = 1024
     camera_height: int = 256

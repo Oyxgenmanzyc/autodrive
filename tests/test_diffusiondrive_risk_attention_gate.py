@@ -8,6 +8,11 @@ from navsim.agents.diffusiondrive.modules.risk_attention import (
     TemporalRiskCrossAttention,
 )
 from navsim.agents.diffusiondrive.modules.risk_gate import select_risk_gated_mode
+from navsim.agents.diffusiondrive.modules.risk_shadow import (
+    _sample_drivable_probability,
+    _trajectory_dynamics,
+    evaluate_risk_shadow,
+)
 
 
 class RiskAttentionGateTest(unittest.TestCase):
@@ -55,6 +60,85 @@ class RiskAttentionGateTest(unittest.TestCase):
         selected = select_risk_gated_mode(poses_reg, poses_cls, history_tokens, config)
 
         self.assertEqual(selected.item(), 2)
+
+    @staticmethod
+    def _risk_inputs(agent_gap=8.0):
+        poses_reg = torch.zeros(1, 2, 8, 3)
+        poses_reg[0, 0, :, 0] = torch.linspace(1.0, 12.0, 8)
+        poses_reg[0, 1, :, 0] = torch.linspace(0.5, 7.0, 8)
+        poses_cls = torch.tensor([[2.0, 1.8]])
+        history_tokens = torch.zeros(1, 4, 12)
+        history_tokens[0, -2:, 0] = 8.0
+        history_tokens[0, -2:, 2] = 10.0
+        history_tokens[0, -2:, 3] = 5.0
+        history_tokens[0, -2:, 6] = 1.6
+        history_tokens[0, -2:, 7] = 3.0
+        history_tokens[0, -2:, -1] = 1.0
+        agent_states = torch.zeros(1, 1, 5)
+        agent_states[0, 0] = torch.tensor([agent_gap + 4.0, 0.0, 0.0, 4.0, 2.0])
+        agent_labels = torch.tensor([[10.0]])
+        bev_semantic_map = torch.zeros(1, 7, 128, 256)
+        bev_semantic_map[:, 1] = 10.0
+        return poses_reg, poses_cls, history_tokens, agent_states, agent_labels, bev_semantic_map
+
+    def test_shadow_uses_dynamic_lead_motion(self):
+        inputs = self._risk_inputs()
+        _, diagnostics = evaluate_risk_shadow(*inputs, SimpleNamespace())
+
+        self.assertGreater(
+            diagnostics["risk_base_dynamic_clearance"].item(),
+            diagnostics["risk_base_static_clearance"].item(),
+        )
+        self.assertEqual(diagnostics["risk_front_source"].item(), 3.0)
+        self.assertEqual(diagnostics["risk_shadow_reliable"].item(), 1.0)
+
+    def test_lateral_non_overlap_removes_longitudinal_collision_cost(self):
+        inputs = list(self._risk_inputs())
+        inputs[0][..., 1] = 5.0
+        _, diagnostics = evaluate_risk_shadow(*inputs, SimpleNamespace())
+
+        self.assertEqual(diagnostics["risk_base_clearance_cost"].item(), 0.0)
+
+    def test_agent_lidar_disagreement_keeps_classifier_mode(self):
+        inputs = self._risk_inputs(agent_gap=20.0)
+        proposed_mode, diagnostics = evaluate_risk_shadow(*inputs, SimpleNamespace())
+
+        self.assertEqual(proposed_mode.item(), 0)
+        self.assertEqual(diagnostics["risk_front_source"].item(), 4.0)
+        self.assertEqual(diagnostics["risk_shadow_reliable"].item(), 0.0)
+
+    def test_bev_probability_penalizes_out_of_map_trajectory(self):
+        poses = torch.zeros(1, 2, 8, 3)
+        poses[0, 0, :, 0] = torch.linspace(0.5, 4.0, 8)
+        poses[0, 1, :, 0] = torch.linspace(0.5, 4.0, 8)
+        poses[0, 1, :, 1] = 100.0
+        bev_semantic_map = torch.zeros(1, 7, 128, 256)
+        bev_semantic_map[:, 1] = 10.0
+
+        probability, valid = _sample_drivable_probability(poses, bev_semantic_map, SimpleNamespace())
+
+        self.assertTrue(valid.item())
+        self.assertGreater(probability[0, 0].item(), 0.99)
+        self.assertEqual(probability[0, 1].item(), 0.0)
+
+    def test_brake_onset_requires_two_consecutive_deceleration_steps(self):
+        dt = 0.5
+        sustained_speeds = torch.tensor([6.0, 5.5, 5.0, 4.5, 4.0, 3.5, 3.0, 2.5])
+        spike_speeds = torch.tensor([6.0, 4.0, 6.0, 6.0, 6.0, 6.0, 6.0, 6.0])
+        poses = torch.zeros(1, 2, 8, 3)
+        poses[0, 0, :, 0] = torch.cumsum(sustained_speeds * dt, dim=0)
+        poses[0, 1, :, 0] = torch.cumsum(spike_speeds * dt, dim=0)
+
+        dynamics = _trajectory_dynamics(
+            poses,
+            ego_v=torch.tensor([6.0]),
+            ego_a=torch.tensor([0.0]),
+            dt=dt,
+            config=SimpleNamespace(),
+        )
+
+        self.assertLess(dynamics["brake_onset"][0, 0].item(), 4.5)
+        self.assertEqual(dynamics["brake_onset"][0, 1].item(), 4.5)
 
 
 if __name__ == "__main__":

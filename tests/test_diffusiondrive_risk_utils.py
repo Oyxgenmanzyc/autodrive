@@ -83,6 +83,11 @@ class RiskUtilsTest(unittest.TestCase):
         self.assertEqual(risk["drac"], 0.0)
         self.assertEqual(risk["ttc"], 10.0)
 
+    def test_low_speed_thw_is_capped(self):
+        risk = compute_longitudinal_risk(gap=20.0, rel_v=0.0, ego_v=0.0, ttc_max=10.0)
+
+        self.assertEqual(risk["thw"], 10.0)
+
     def test_gap_shrink_generates_positive_relative_velocity(self):
         agent_input = SimpleNamespace(
             ego_statuses=[_ego(), _ego(), _ego(), _ego()],

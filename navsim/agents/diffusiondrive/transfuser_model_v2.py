@@ -17,6 +17,7 @@ from navsim.agents.diffusiondrive.modules.risk_attention import (
     TemporalRiskCrossAttention,
 )
 from navsim.agents.diffusiondrive.modules.risk_gate import select_risk_gated_mode
+from navsim.agents.diffusiondrive.modules.risk_shadow import evaluate_risk_shadow
 from torch.nn import TransformerDecoder,TransformerDecoderLayer
 from typing import Any, List, Dict, Optional, Union
 class V2TransfuserModel(nn.Module):
@@ -135,6 +136,8 @@ class V2TransfuserModel(nn.Module):
 
         output: Dict[str, torch.Tensor] = {"bev_semantic_map": bev_semantic_map}
 
+        agents = self._agent_head(agents_query)
+
         trajectory = self._trajectory_head(
             trajectory_query,
             agents_query,
@@ -144,10 +147,12 @@ class V2TransfuserModel(nn.Module):
             targets=targets,
             global_img=None,
             history_risk_tokens=history_risk_tokens,
+            agent_states=agents["agent_states"],
+            agent_labels=agents["agent_labels"],
+            bev_semantic_map=bev_semantic_map,
         )
         output.update(trajectory)
 
-        agents = self._agent_head(agents_query)
         output.update(agents)
 
         return output
@@ -518,6 +523,9 @@ class TrajectoryHead(nn.Module):
         targets=None,
         global_img=None,
         history_risk_tokens=None,
+        agent_states=None,
+        agent_labels=None,
+        bev_semantic_map=None,
     ) -> Dict[str, torch.Tensor]:
         """Torch module forward pass."""
         if self.training:
@@ -540,6 +548,9 @@ class TrajectoryHead(nn.Module):
                 status_encoding,
                 global_img,
                 history_risk_tokens,
+                agent_states,
+                agent_labels,
+                bev_semantic_map,
             )
 
 
@@ -623,6 +634,9 @@ class TrajectoryHead(nn.Module):
         status_encoding,
         global_img,
         history_risk_tokens=None,
+        agent_states=None,
+        agent_labels=None,
+        bev_semantic_map=None,
     ) -> Dict[str, torch.Tensor]:
         step_num = 2
         bs = ego_query.shape[0]
@@ -686,10 +700,30 @@ class TrajectoryHead(nn.Module):
                 timestep=k,
                 sample=img
             ).prev_sample
-        if self._config.use_risk_gate and history_risk_tokens is not None:
+        risk_diagnostics: Dict[str, torch.Tensor] = {}
+        raw_mode = poses_cls.argmax(dim=-1)
+        shadow_enabled = self._config.use_risk_shadow_evaluator or self._config.use_soft_risk_rescore
+        if shadow_enabled and history_risk_tokens is not None:
+            proposed_mode, risk_diagnostics = evaluate_risk_shadow(
+                poses_reg,
+                poses_cls,
+                history_risk_tokens,
+                agent_states,
+                agent_labels,
+                bev_semantic_map,
+                self._config,
+            )
+            # Shadow mode is deliberately output-neutral. Soft re-ranking is a separate opt-in.
+            mode_idx = proposed_mode if self._config.use_soft_risk_rescore else raw_mode
+        elif self._config.use_risk_gate and history_risk_tokens is not None:
             mode_idx = select_risk_gated_mode(poses_reg, poses_cls, history_risk_tokens, self._config)
         else:
-            mode_idx = poses_cls.argmax(dim=-1)
-        mode_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
-        best_reg = torch.gather(poses_reg, 1, mode_idx).squeeze(1)
-        return {"trajectory": best_reg}
+            mode_idx = raw_mode
+        gather_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
+        best_reg = torch.gather(poses_reg, 1, gather_idx).squeeze(1)
+        output = {"trajectory": best_reg}
+        if risk_diagnostics:
+            risk_diagnostics["risk_selected_mode"] = mode_idx.float()
+            risk_diagnostics["risk_selection_changed"] = (mode_idx != raw_mode).float()
+            output.update(risk_diagnostics)
+        return output

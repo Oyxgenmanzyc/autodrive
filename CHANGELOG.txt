@@ -47,3 +47,33 @@
 - 可作为第二个创新点 3.20 的第一版工程实现。
 - 对应论文表述：显式风险量化 + 历史风险时序注意力 + 风险条件轨迹解码 + 最终安全门控。
 - 保持输入/监督边界与原始 DiffusionDrive 一致：推理输入不使用训练标注，GT 历史 box 只用于训练辅助监督和离线诊断。
+
+3.20 Stage 1: risk shadow evaluation
+Date
+- 2026-07-10
+
+Purpose
+- Diagnose the 3.20 hard-gate regression without changing the checkpoint or selected trajectory.
+- Replace the static-obstacle and single-brake-spike assumptions with measurable dynamic-risk terms.
+
+Core changes
+- Added an inference-only shadow scorer with no trainable parameters.
+- Fuses the historical LiDAR gap with the current predicted agent box only when both estimates agree.
+- Rolls the lead vehicle forward with estimated velocity and bounded acceleration.
+- Applies longitudinal clearance only while the candidate trajectory laterally overlaps the lead vehicle.
+- Defines brake onset as at least two consecutive deceleration steps and penalizes excessive jerk/deceleration.
+- Samples predicted BEV drivable probability as a soft cost; no GT map or GT agent box is used at inference.
+- Shadow mode records the proposed mode but always returns the original classifier mode.
+- Optional soft re-ranking remains disabled by default.
+- PDM CSV output now contains per-token front-source, static/dynamic clearance, brake timing, comfort, map, and cost diagnostics.
+
+Experiment defaults
+- use_risk_gate=False
+- use_temporal_risk_cross_attention=False
+- use_risk_shadow_evaluator=True
+- use_soft_risk_rescore=False
+
+Verification
+- Python AST parsing passed for all modified Python files.
+- Torch unit tests were not run locally because the Windows Python environment has no torch installation.
+- Server smoke test and navtest shadow evaluation are pending.

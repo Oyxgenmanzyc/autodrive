@@ -38,11 +38,11 @@ def compute_longitudinal_risk(
 ) -> Dict[str, float]:
     """Compute THW/TTC/DRAC for a longitudinal following proxy."""
 
-    gap = max(float(gap), eps)
-    rel_v = float(rel_v)
-    ego_v = max(float(ego_v), 0.0)
+    gap = max(float(np.nan_to_num(gap, nan=0.0, posinf=0.0, neginf=0.0)), eps)
+    rel_v = float(np.nan_to_num(rel_v, nan=0.0, posinf=0.0, neginf=0.0))
+    ego_v = max(float(np.nan_to_num(ego_v, nan=0.0, posinf=0.0, neginf=0.0)), 0.0)
 
-    thw = gap / max(ego_v, eps)
+    thw = min(gap / max(ego_v, eps), ttc_max)
     if rel_v > 0.0:
         ttc = min(gap / max(rel_v, eps), ttc_max)
         drac = min((rel_v * rel_v) / (2.0 * gap), drac_max)
@@ -129,6 +129,10 @@ def estimate_front_gap_from_lidar(lidar_pc: np.ndarray, config: Any) -> Dict[str
     points = lidar_pc[LidarIndex.POSITION].T
     if points.size == 0:
         return {"gap": 0.0, "valid": 0.0}
+    finite_mask = np.isfinite(points).all(axis=1)
+    points = points[finite_mask]
+    if points.size == 0:
+        return {"gap": 0.0, "valid": 0.0}
 
     x_min = float(_cfg(config, "risk_front_x_min", 1.0))
     x_max = float(_cfg(config, "risk_front_x_max", _cfg(config, "lidar_max_x", 32.0)))
@@ -173,8 +177,8 @@ def build_history_risk_tokens(agent_input: Any, config: Any) -> np.ndarray:
         gap_info = estimate_front_gap_from_lidar(lidar.lidar_pc, config)
         ego_velocity = np.asarray(ego_status.ego_velocity, dtype=np.float32)
         ego_acceleration = np.asarray(ego_status.ego_acceleration, dtype=np.float32)
-        ego_v = max(float(ego_velocity[0]), 0.0)
-        ego_a = float(ego_acceleration[0])
+        ego_v = max(float(np.nan_to_num(ego_velocity[0], nan=0.0, posinf=0.0, neginf=0.0)), 0.0)
+        ego_a = float(np.nan_to_num(ego_acceleration[0], nan=0.0, posinf=0.0, neginf=0.0))
         entries.append(
             {
                 "gap": float(gap_info["gap"]),
@@ -240,7 +244,7 @@ def build_history_risk_tokens(agent_input: Any, config: Any) -> np.ndarray:
         )
         prev_metrics = metrics if valid else None
 
-    return tokens
+    return np.nan_to_num(tokens, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def _select_history_front_track(scene: Any, config: Any) -> Optional[str]:
@@ -260,18 +264,19 @@ def _select_front_vehicle(annotations: Any, config: Any, preferred_track_token: 
     for idx, (box, name) in enumerate(zip(annotations.boxes, annotations.names)):
         if name != "vehicle":
             continue
-        box_x = float(box[0])
-        box_y = float(box[1])
-        box_length = float(box[3])
+        box_x = float(np.nan_to_num(box[0], nan=0.0, posinf=0.0, neginf=0.0))
+        box_y = float(np.nan_to_num(box[1], nan=0.0, posinf=0.0, neginf=0.0))
+        box_length = float(np.nan_to_num(box[3], nan=0.0, posinf=0.0, neginf=0.0))
         if box_x < x_min or box_x > x_max or abs(box_y) > y_abs:
             continue
         track_token = annotations.track_tokens[idx] if idx < len(annotations.track_tokens) else ""
         velocity = annotations.velocity_3d[idx] if idx < len(annotations.velocity_3d) else np.zeros(3, dtype=np.float32)
         gap = max(box_x - box_length / 2.0 - ego_front_offset, 0.0)
+        lead_v = float(np.nan_to_num(velocity[0], nan=0.0, posinf=0.0, neginf=0.0))
         candidates.append(
             {
                 "gap": gap,
-                "lead_v": float(velocity[0]),
+                "lead_v": lead_v,
                 "track_token": track_token,
                 "preferred": float(track_token == preferred_track_token),
             }
@@ -299,8 +304,8 @@ def build_gt_history_risk_targets(scene: Any, config: Any) -> Dict[str, np.ndarr
     for frame_idx in range(start, scene.scene_metadata.num_history_frames):
         frame = scene.frames[frame_idx]
         front = _select_front_vehicle(frame.annotations, config, preferred_track_token)
-        ego_v = max(float(frame.ego_status.ego_velocity[0]), 0.0)
-        ego_a = float(frame.ego_status.ego_acceleration[0])
+        ego_v = max(float(np.nan_to_num(frame.ego_status.ego_velocity[0], nan=0.0, posinf=0.0, neginf=0.0)), 0.0)
+        ego_a = float(np.nan_to_num(frame.ego_status.ego_acceleration[0], nan=0.0, posinf=0.0, neginf=0.0))
         if front is None:
             entries.append({"gap": 0.0, "rel_v": 0.0, "ego_v": ego_v, "ego_a": ego_a, "valid": 0.0})
             continue

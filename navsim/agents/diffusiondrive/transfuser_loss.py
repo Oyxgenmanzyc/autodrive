@@ -94,6 +94,8 @@ def _agent_loss(
     l1_cost = _get_l1_cost(gt_states, pred_states, gt_valid)
 
     cost = config.agent_class_weight * ce_cost + config.agent_box_weight * l1_cost
+    if not torch.isfinite(cost).all():
+        _log_invalid_agent_cost(gt_states, gt_valid, pred_states, pred_logits, ce_cost, l1_cost, cost)
     cost = cost.cpu()
 
     indices = [linear_sum_assignment(c) for i, c in enumerate(cost)]
@@ -117,6 +119,50 @@ def _agent_loss(
     ce_loss = ce_loss.view(batch_dim, -1).mean()
 
     return ce_loss, l1_loss
+
+
+@torch.no_grad()
+def _finite_summary(name: str, tensor: torch.Tensor) -> str:
+    tensor_detached = tensor.detach()
+    finite = torch.isfinite(tensor_detached)
+    finite_count = int(finite.sum().item())
+    total_count = tensor_detached.numel()
+    if finite_count > 0:
+        finite_values = tensor_detached[finite]
+        min_value = float(finite_values.min().item())
+        max_value = float(finite_values.max().item())
+        mean_value = float(finite_values.float().mean().item())
+    else:
+        min_value = float("nan")
+        max_value = float("nan")
+        mean_value = float("nan")
+    return (
+        f"{name}: shape={tuple(tensor_detached.shape)}, "
+        f"finite={finite_count}/{total_count}, min={min_value:.6g}, "
+        f"max={max_value:.6g}, mean={mean_value:.6g}"
+    )
+
+
+@torch.no_grad()
+def _log_invalid_agent_cost(
+    gt_states: torch.Tensor,
+    gt_valid: torch.Tensor,
+    pred_states: torch.Tensor,
+    pred_logits: torch.Tensor,
+    ce_cost: torch.Tensor,
+    l1_cost: torch.Tensor,
+    cost: torch.Tensor,
+) -> None:
+    invalid_batch = torch.nonzero(~torch.isfinite(cost).flatten(1).all(dim=1), as_tuple=False).flatten().tolist()
+    print("[DiffusionDrive][agent_loss] Invalid Hungarian cost detected.")
+    print(f"[DiffusionDrive][agent_loss] invalid_batch_indices={invalid_batch}")
+    print("[DiffusionDrive][agent_loss] " + _finite_summary("targets.agent_states", gt_states))
+    print("[DiffusionDrive][agent_loss] " + _finite_summary("targets.agent_labels", gt_valid.float()))
+    print("[DiffusionDrive][agent_loss] " + _finite_summary("predictions.agent_states", pred_states))
+    print("[DiffusionDrive][agent_loss] " + _finite_summary("predictions.agent_labels", pred_logits))
+    print("[DiffusionDrive][agent_loss] " + _finite_summary("ce_cost", ce_cost))
+    print("[DiffusionDrive][agent_loss] " + _finite_summary("l1_cost", l1_cost))
+    print("[DiffusionDrive][agent_loss] " + _finite_summary("hungarian_cost", cost))
 
 
 @torch.no_grad()

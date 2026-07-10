@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Union, Tuple
+from typing import Any, Dict, List, Union
 from pathlib import Path
 from dataclasses import asdict
 from datetime import datetime
@@ -30,6 +30,18 @@ logger = logging.getLogger(__name__)
 
 CONFIG_PATH = "config/pdm_scoring"
 CONFIG_NAME = "default_run_pdm_score"
+
+
+def _get_agent_risk_debug(agent: AbstractAgent) -> Dict[str, float]:
+    """Read optional scalar risk diagnostics for per-token CSV analysis."""
+    if not hasattr(agent, "get_risk_debug_info"):
+        return {}
+    debug_info = agent.get_risk_debug_info()
+    return {
+        key: float(value)
+        for key, value in debug_info.items()
+        if isinstance(value, (bool, int, float))
+    }
 
 
 def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[Dict[str, Any]]:
@@ -82,6 +94,7 @@ def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[D
                 trajectory = agent.compute_trajectory(agent_input, scene)
             else:
                 trajectory = agent.compute_trajectory(agent_input)
+            score_row.update(_get_agent_risk_debug(agent))
 
             pdm_result = pdm_score(
                 metric_cache=metric_cache,
@@ -136,27 +149,41 @@ def main(cfg: DictConfig) -> None:
         }
         for log_file, tokens_list in scene_loader.get_tokens_list_per_log().items()
     ]
-    score_rows: List[Tuple[Dict[str, Any], int, int]] = worker_map(worker, run_pdm_score, data_points)
+    score_rows: List[Dict[str, Any]] = worker_map(worker, run_pdm_score, data_points)
+    if len(score_rows) > 0 and isinstance(score_rows[0], list):
+        score_rows = [row for worker_rows in score_rows for row in worker_rows]
 
     pdm_score_df = pd.DataFrame(score_rows)
+    if len(pdm_score_df) == 0:
+        logger.warning("No scenarios were evaluated. Empty result file will be saved.")
+        save_path = Path(cfg.output_dir)
+        save_path.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y.%m.%d.%H.%M.%S")
+        pdm_score_df.to_csv(save_path / f"{timestamp}.csv", index=False)
+        return
+
     num_sucessful_scenarios = pdm_score_df["valid"].sum()
     num_failed_scenarios = len(pdm_score_df) - num_sucessful_scenarios
-    average_row = pdm_score_df.drop(columns=["token", "valid"]).mean(skipna=True)
+    numeric_columns = pdm_score_df.drop(columns=["token", "valid"], errors="ignore").select_dtypes(include="number").columns
+    average_row = pdm_score_df[numeric_columns].mean(skipna=True)
     average_row["token"] = "average"
     average_row["valid"] = pdm_score_df["valid"].all()
     pdm_score_df.loc[len(pdm_score_df)] = average_row
 
     save_path = Path(cfg.output_dir)
+    save_path.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y.%m.%d.%H.%M.%S")
-    pdm_score_df.to_csv(save_path / f"{timestamp}.csv")
+    result_path = save_path / f"{timestamp}.csv"
+    pdm_score_df.to_csv(result_path, index=False)
+    valid_score_mean = pdm_score_df[pdm_score_df["token"] != "average"]["score"].mean(skipna=True)
 
     logger.info(
         f"""
         Finished running evaluation.
             Number of successful scenarios: {num_sucessful_scenarios}.
             Number of failed scenarios: {num_failed_scenarios}.
-            Final average score of valid results: {pdm_score_df['score'].mean()}.
-            Results are stored in: {save_path / f"{timestamp}.csv"}.
+            Final average score of valid results: {valid_score_mean}.
+            Results are stored in: {result_path}.
         """
     )
 

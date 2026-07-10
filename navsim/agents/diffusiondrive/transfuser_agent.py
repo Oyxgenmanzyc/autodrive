@@ -51,6 +51,7 @@ class TransfuserAgent(AbstractAgent):
 
         self._checkpoint_path = checkpoint_path
         self._transfuser_model = TransfuserModel(config)
+        self._last_risk_debug: Dict[str, float] = {}
         self.init_from_pretrained()
 
     def init_from_pretrained(self):
@@ -96,6 +97,8 @@ class TransfuserAgent(AbstractAgent):
             self._config.use_risk_gate
             or self._config.use_historical_risk_attention
             or self._config.use_temporal_risk_cross_attention
+            or self._config.use_risk_shadow_evaluator
+            or self._config.use_soft_risk_rescore
         ):
             return SensorConfig.build_all_sensors(include=[3])
 
@@ -123,6 +126,32 @@ class TransfuserAgent(AbstractAgent):
     def forward(self, features: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]=None) -> Dict[str, torch.Tensor]:
         """Inherited, see superclass."""
         return self._transfuser_model(features,targets=targets)
+
+    def get_risk_debug_info(self) -> Dict[str, float]:
+        """Return scalar shadow-risk diagnostics for the current scenario."""
+        return dict(self._last_risk_debug)
+
+    def compute_trajectory(self, agent_input: AgentInput) -> Trajectory:
+        """Compute a trajectory and retain inference-only risk diagnostics."""
+        self.eval()
+        features: Dict[str, torch.Tensor] = {}
+        for builder in self.get_feature_builders():
+            features.update(builder.compute_features(agent_input))
+        features = {key: value.unsqueeze(0) for key, value in features.items()}
+
+        with torch.no_grad():
+            predictions = self.forward(features)
+            self._last_risk_debug = {}
+            for key, value in predictions.items():
+                if not key.startswith("risk_"):
+                    continue
+                if torch.is_tensor(value):
+                    self._last_risk_debug[key] = float(value.detach().float().mean().cpu().item())
+                elif isinstance(value, (int, float, bool)):
+                    self._last_risk_debug[key] = float(value)
+            poses = predictions["trajectory"].squeeze(0).detach().cpu().numpy()
+
+        return Trajectory(poses)
         
     def compute_loss(
         self,
