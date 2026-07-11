@@ -308,6 +308,53 @@ def evaluate_risk_shadow(
     adjusted_logits = adjusted_logits.masked_fill(~eligible, -torch.inf)
     proposed_mode = torch.where(reliable, adjusted_logits.argmax(dim=-1), raw_mode)
 
+    eligible_count = eligible.sum(dim=-1)
+    eligible_cost = total_cost.masked_fill(~eligible, torch.inf)
+    min_cost, min_cost_mode = eligible_cost.min(dim=-1)
+    max_cost = total_cost.masked_fill(~eligible, -torch.inf).max(dim=-1).values
+    base_cost = _mode_value(total_cost, raw_mode)
+    base_cls = _mode_value(logits, raw_mode)
+    lower_cost = eligible & (total_cost < base_cost[:, None] - 1e-6)
+    lower_cost_count = lower_cost.sum(dim=-1)
+
+    cost_reduction = (base_cost[:, None] - total_cost).clamp(min=0.0)
+    cls_reduction = (base_cls[:, None] - logits).clamp(min=0.0)
+    penalty_denominator = front["reliability"][:, None] * cost_reduction
+    required_penalty = torch.where(
+        lower_cost & (penalty_denominator > 1e-6),
+        cls_reduction / penalty_denominator.clamp(min=1e-6),
+        torch.inf,
+    ).min(dim=-1).values
+    required_penalty = torch.where(
+        torch.isfinite(required_penalty),
+        required_penalty,
+        torch.full_like(required_penalty, -1.0),
+    )
+
+    eligible_dynamic_clearance = dynamic_clearance.masked_fill(~eligible, torch.inf)
+    min_dynamic_clearance = eligible_dynamic_clearance.min(dim=-1).values
+    max_dynamic_clearance = dynamic_clearance.masked_fill(~eligible, -torch.inf).max(dim=-1).values
+    top2_logits = logits.topk(k=min(2, logits.shape[-1]), dim=-1).values
+    cls_margin = top2_logits[:, 0] - top2_logits[:, 1] if top2_logits.shape[-1] > 1 else torch.zeros_like(base_cls)
+    adjusted_top2 = adjusted_logits.topk(k=min(2, adjusted_logits.shape[-1]), dim=-1).values
+    adjusted_margin_raw = (
+        adjusted_top2[:, 0] - adjusted_top2[:, 1]
+        if adjusted_top2.shape[-1] > 1
+        else torch.zeros_like(base_cls)
+    )
+    adjusted_margin = torch.where(
+        eligible_count > 1,
+        adjusted_margin_raw,
+        torch.full_like(adjusted_margin_raw, -1.0),
+    )
+    base_dynamic_clearance = _mode_value(dynamic_clearance, raw_mode)
+    actionable = (
+        reliable
+        & (base_dynamic_clearance >= 0.0)
+        & (base_dynamic_clearance < warning_gap)
+        & (lower_cost_count > 0)
+    )
+
     diagnostics = {
         "risk_shadow_active": torch.ones_like(front["gap"]),
         "risk_shadow_reliable": reliable.float(),
@@ -320,7 +367,27 @@ def evaluate_risk_shadow(
         "risk_shadow_base_mode": raw_mode.float(),
         "risk_shadow_proposed_mode": proposed_mode.float(),
         "risk_shadow_changed": (proposed_mode != raw_mode).float(),
+        "risk_candidate_eligible_count": eligible_count.float(),
+        "risk_candidate_lower_cost_count": lower_cost_count.float(),
+        "risk_candidate_cls_margin": cls_margin,
+        "risk_candidate_adjusted_margin": adjusted_margin,
+        "risk_candidate_min_cost_mode": min_cost_mode.float(),
+        "risk_candidate_min_cost": min_cost,
+        "risk_candidate_cost_range": (max_cost - min_cost).clamp(min=0.0),
+        "risk_candidate_cost_improvement": (base_cost - min_cost).clamp(min=0.0),
+        "risk_candidate_min_dynamic_clearance": min_dynamic_clearance,
+        "risk_candidate_max_dynamic_clearance": max_dynamic_clearance,
+        "risk_candidate_dynamic_clearance_range": (max_dynamic_clearance - min_dynamic_clearance).clamp(min=0.0),
+        "risk_candidate_required_logit_penalty": required_penalty,
+        "risk_candidate_actionable": actionable.float(),
     }
+    diagnostics["risk_candidate_min_cost_cls"] = _mode_value(logits, min_cost_mode)
+    diagnostics["risk_candidate_min_cost_dynamic_clearance"] = _mode_value(dynamic_clearance, min_cost_mode)
+    diagnostics["risk_candidate_min_cost_brake_onset"] = _mode_value(dynamics["brake_onset"], min_cost_mode)
+    diagnostics["risk_candidate_min_cost_drivable_probability"] = _mode_value(
+        drivable_probability,
+        min_cost_mode,
+    )
     for prefix, mode in (("base", raw_mode), ("proposed", proposed_mode)):
         diagnostics[f"risk_{prefix}_cls"] = _mode_value(logits, mode)
         diagnostics[f"risk_{prefix}_static_clearance"] = _mode_value(static_clearance, mode)

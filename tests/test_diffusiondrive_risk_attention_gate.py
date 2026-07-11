@@ -91,6 +91,9 @@ class RiskAttentionGateTest(unittest.TestCase):
         )
         self.assertEqual(diagnostics["risk_front_source"].item(), 3.0)
         self.assertEqual(diagnostics["risk_shadow_reliable"].item(), 1.0)
+        self.assertGreaterEqual(diagnostics["risk_candidate_eligible_count"].item(), 1.0)
+        self.assertGreaterEqual(diagnostics["risk_candidate_cost_range"].item(), 0.0)
+        self.assertGreaterEqual(diagnostics["risk_candidate_dynamic_clearance_range"].item(), 0.0)
 
     def test_lateral_non_overlap_removes_longitudinal_collision_cost(self):
         inputs = list(self._risk_inputs())

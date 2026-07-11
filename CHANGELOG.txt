@@ -77,3 +77,18 @@ Verification
 - Python AST parsing passed for all modified Python files.
 - Torch unit tests were not run locally because the Windows Python environment has no torch installation.
 - Server smoke test and navtest shadow evaluation are pending.
+
+3.20.1 Candidate-level shadow diagnostics
+Date
+- 2026-07-11
+
+Purpose
+- Explain why the first shadow evaluation proposed no mode changes before adjusting any risk weight.
+
+Core changes
+- Added top-2 classifier margin and adjusted-logit margin diagnostics.
+- Added eligible-mode count, lower-risk-mode count, minimum candidate cost, and cost improvement.
+- Added candidate dynamic-clearance range and minimum-cost candidate motion diagnostics.
+- Added the minimum theoretical logit penalty required to prefer a lower-cost eligible mode.
+- Added an actionable flag for reliable fused-front scenes whose base dynamic clearance is within 0 to 3 meters.
+- Selection behavior remains unchanged; soft risk re-ranking is still disabled.
