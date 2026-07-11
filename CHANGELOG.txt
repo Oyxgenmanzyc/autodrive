@@ -114,3 +114,30 @@ Core changes
 Verification
 - Local Python AST parsing and git diff checks are required before commit.
 - PyTorch tests remain pending on the NAVSIM server environment.
+
+3.20.4 Safety-Pareto counterfactual shadow
+Date
+- 2026-07-12
+
+Purpose
+- Prevent map-only or numerical-noise cost reductions from selecting a trajectory that does not improve longitudinal safety.
+- Convert candidate selection from mixed scalar-cost ranking to explicit safety qualification.
+
+Evidence
+- In 3.20.3, 35 counterfactual trajectories averaged -0.02095 PDM.
+- Three new TTC failures had dynamic-clearance changes of -0.188 m, -0.014 m, and +0.005 m.
+- Total-cost differences as small as 1e-6 could previously switch modes.
+
+Core changes
+- Added a safety cost containing only weighted dynamic-clearance and brake-timing costs.
+- A top-3 non-base mode now requires at least 0.10 m clearance gain and 0.01 safety-cost gain.
+- Map and comfort costs are vetoes with bounded regression tolerances; they cannot compensate for absent safety gain.
+- Pareto-qualified candidates are ranked by safety-cost gain rather than mixed total cost.
+- Conditional lateral avoidance is preserved but now compares safety gain.
+- Added Pareto count, validity, clearance gain, safety-cost gain, map regression, and comfort regression diagnostics.
+- Actual trajectory selection remains unchanged because this experiment is still shadow-only.
+
+Verification
+- Python AST parsing and git diff checks passed locally.
+- Replaying the 3.20.3 CSV retained 9 of 35 candidates, removed all 3 new TTC failures, retained 1 collision fix, and produced a cumulative counterfactual PDM delta of +0.5293.
+- PyTorch unit tests and navtest counterfactual evaluation remain pending on the NAVSIM server.

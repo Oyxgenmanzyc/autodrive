@@ -11,6 +11,7 @@ from navsim.agents.diffusiondrive.modules.risk_gate import select_risk_gated_mod
 from navsim.agents.diffusiondrive.modules.risk_shadow import (
     _delayed_time_risk,
     _sample_drivable_probability,
+    _safety_pareto_terms,
     _trajectory_dynamics,
     evaluate_risk_shadow,
 )
@@ -173,6 +174,46 @@ class RiskAttentionGateTest(unittest.TestCase):
 
         self.assertEqual(state["time_risk"].item(), 0.0)
         self.assertFalse(state["trigger"].item())
+
+    def test_safety_pareto_rejects_map_only_and_tiny_clearance_gains(self):
+        terms = _safety_pareto_terms(
+            dynamic_clearance=torch.tensor([[2.0, 2.0, 2.05]]),
+            safety_cost=torch.tensor([[0.30, 0.30, 0.28]]),
+            map_cost=torch.tensor([[0.20, 0.00, 0.20]]),
+            comfort_cost=torch.zeros(1, 3),
+            base_mode=torch.tensor([0]),
+            config=SimpleNamespace(),
+        )
+
+        self.assertFalse(terms["eligible"][0, 1].item())
+        self.assertFalse(terms["eligible"][0, 2].item())
+
+    def test_safety_pareto_accepts_meaningful_safety_gain(self):
+        terms = _safety_pareto_terms(
+            dynamic_clearance=torch.tensor([[1.0, 1.25]]),
+            safety_cost=torch.tensor([[0.30, 0.25]]),
+            map_cost=torch.tensor([[0.10, 0.11]]),
+            comfort_cost=torch.tensor([[0.10, 0.12]]),
+            base_mode=torch.tensor([0]),
+            config=SimpleNamespace(),
+        )
+
+        self.assertTrue(terms["eligible"][0, 1].item())
+        self.assertAlmostEqual(terms["clearance_gain"][0, 1].item(), 0.25)
+        self.assertAlmostEqual(terms["safety_cost_gain"][0, 1].item(), 0.05)
+
+    def test_safety_pareto_vetoes_map_and_comfort_regressions(self):
+        terms = _safety_pareto_terms(
+            dynamic_clearance=torch.tensor([[1.0, 1.25, 1.25]]),
+            safety_cost=torch.tensor([[0.30, 0.25, 0.25]]),
+            map_cost=torch.tensor([[0.10, 0.13, 0.10]]),
+            comfort_cost=torch.tensor([[0.10, 0.10, 0.16]]),
+            base_mode=torch.tensor([0]),
+            config=SimpleNamespace(),
+        )
+
+        self.assertFalse(terms["eligible"][0, 1].item())
+        self.assertFalse(terms["eligible"][0, 2].item())
 
 
 if __name__ == "__main__":

@@ -95,6 +95,11 @@ class TransfuserConfig:
     risk_shadow_longitudinal_lateral_tolerance: float = 0.75
     risk_shadow_longitudinal_heading_tolerance: float = 0.20
     risk_shadow_lateral_cost_advantage: float = 0.02
+    risk_shadow_min_clearance_gain: float = 0.10
+    risk_shadow_min_safety_cost_gain: float = 0.01
+    risk_shadow_max_map_cost_regression: float = 0.02
+    risk_shadow_max_comfort_cost_regression: float = 0.05
+    risk_shadow_lateral_safety_advantage: float = 0.02
 
     camera_width: int = 1024
     camera_height: int = 256

@@ -12,6 +12,38 @@ def _mode_value(values: torch.Tensor, mode: torch.Tensor) -> torch.Tensor:
     return values.gather(1, mode[:, None]).squeeze(1)
 
 
+def _safety_pareto_terms(
+    dynamic_clearance: torch.Tensor,
+    safety_cost: torch.Tensor,
+    map_cost: torch.Tensor,
+    comfort_cost: torch.Tensor,
+    base_mode: torch.Tensor,
+    config: Any,
+) -> Dict[str, torch.Tensor]:
+    """Require measurable safety gain while treating map and comfort as vetoes."""
+
+    clearance_gain = dynamic_clearance - _mode_value(dynamic_clearance, base_mode)[:, None]
+    safety_cost_gain = _mode_value(safety_cost, base_mode)[:, None] - safety_cost
+    map_cost_regression = map_cost - _mode_value(map_cost, base_mode)[:, None]
+    comfort_cost_regression = comfort_cost - _mode_value(comfort_cost, base_mode)[:, None]
+    eligible = (
+        (clearance_gain >= float(_cfg(config, "risk_shadow_min_clearance_gain", 0.10)))
+        & (safety_cost_gain >= float(_cfg(config, "risk_shadow_min_safety_cost_gain", 0.01)))
+        & (map_cost_regression <= float(_cfg(config, "risk_shadow_max_map_cost_regression", 0.02)))
+        & (
+            comfort_cost_regression
+            <= float(_cfg(config, "risk_shadow_max_comfort_cost_regression", 0.05))
+        )
+    )
+    return {
+        "eligible": eligible,
+        "clearance_gain": clearance_gain,
+        "safety_cost_gain": safety_cost_gain,
+        "map_cost_regression": map_cost_regression,
+        "comfort_cost_regression": comfort_cost_regression,
+    }
+
+
 def _estimate_front_state(
     history_risk_tokens: torch.Tensor,
     agent_states: Optional[torch.Tensor],
@@ -412,9 +444,13 @@ def evaluate_risk_shadow(
     ).clamp(0.0, 1.0)
     comfort_cost = torch.maximum(jerk_cost, decel_cost)
 
-    total_cost = (
+    safety_cost = (
         float(_cfg(config, "risk_shadow_clearance_weight", 0.45)) * clearance_cost
         + float(_cfg(config, "risk_shadow_timing_weight", 0.25)) * timing_cost
+    )
+
+    total_cost = (
+        safety_cost
         + float(_cfg(config, "risk_shadow_map_weight", 0.20)) * map_cost
         + float(_cfg(config, "risk_shadow_comfort_weight", 0.10)) * comfort_cost
     ).clamp(0.0, 1.0)
@@ -480,6 +516,14 @@ def evaluate_risk_shadow(
     )
     base_dynamic_clearance = _mode_value(dynamic_clearance, raw_mode)
     time_state = _delayed_time_risk(front, config)
+    pareto = _safety_pareto_terms(
+        dynamic_clearance,
+        safety_cost,
+        map_cost,
+        comfort_cost,
+        raw_mode,
+        config,
+    )
 
     base_pose_idx = raw_mode[..., None, None, None].repeat(1, 1, poses.shape[-2], poses.shape[-1])
     base_pose = torch.gather(poses, 1, base_pose_idx).squeeze(1)
@@ -492,22 +536,24 @@ def evaluate_risk_shadow(
     )
 
     topk_mask = torch.zeros_like(total_cost, dtype=torch.bool).scatter(1, topk_modes, True)
-    lower_than_base = total_cost < base_cost[:, None] - 1e-6
     non_base = torch.arange(logits.shape[-1], device=logits.device)[None, :] != raw_mode[:, None]
-    longitudinal_mask = topk_mask & lower_than_base & non_base & longitudinal_like
-    lateral_mask = topk_mask & lower_than_base & non_base & ~longitudinal_like
+    longitudinal_mask = topk_mask & non_base & longitudinal_like & pareto["eligible"]
+    lateral_mask = topk_mask & non_base & ~longitudinal_like & pareto["eligible"]
 
-    longitudinal_costs = total_cost.masked_fill(~longitudinal_mask, torch.inf)
-    best_longitudinal_cost, best_longitudinal_mode = longitudinal_costs.min(dim=-1)
-    has_longitudinal = torch.isfinite(best_longitudinal_cost)
-    lateral_costs = total_cost.masked_fill(~lateral_mask, torch.inf)
-    best_lateral_cost, best_lateral_mode = lateral_costs.min(dim=-1)
-    has_lateral = torch.isfinite(best_lateral_cost)
+    longitudinal_gain = pareto["safety_cost_gain"].masked_fill(~longitudinal_mask, -torch.inf)
+    best_longitudinal_gain, best_longitudinal_mode = longitudinal_gain.max(dim=-1)
+    has_longitudinal = torch.isfinite(best_longitudinal_gain)
+    lateral_gain = pareto["safety_cost_gain"].masked_fill(~lateral_mask, -torch.inf)
+    best_lateral_gain, best_lateral_mode = lateral_gain.max(dim=-1)
+    has_lateral = torch.isfinite(best_lateral_gain)
 
-    lateral_advantage = float(_cfg(config, "risk_shadow_lateral_cost_advantage", 0.02))
+    lateral_advantage = float(_cfg(config, "risk_shadow_lateral_safety_advantage", 0.02))
     use_lateral = has_lateral & (
         ~has_longitudinal
-        | (time_state["emergency"] & (best_lateral_cost + lateral_advantage < best_longitudinal_cost))
+        | (
+            time_state["emergency"]
+            & (best_lateral_gain >= best_longitudinal_gain + lateral_advantage)
+        )
     )
     counterfactual_mode = torch.where(
         use_lateral,
@@ -521,11 +567,12 @@ def evaluate_risk_shadow(
     )
     counterfactual_cost = _mode_value(total_cost, counterfactual_mode)
     counterfactual_dynamic_clearance = _mode_value(dynamic_clearance, counterfactual_mode)
+    counterfactual_pareto_valid = _mode_value(pareto["eligible"].float(), counterfactual_mode) > 0.5
     counterfactual_active = (
         reliable
         & time_state["trigger"]
         & (counterfactual_mode != raw_mode)
-        & (counterfactual_cost < base_cost - 1e-6)
+        & counterfactual_pareto_valid
     )
     actionable = counterfactual_active
 
@@ -570,6 +617,22 @@ def evaluate_risk_shadow(
         "risk_counterfactual_has_longitudinal": has_longitudinal.float(),
         "risk_counterfactual_has_lateral": has_lateral.float(),
         "risk_counterfactual_used_lateral": use_lateral.float(),
+        "risk_counterfactual_pareto_count": (
+            topk_mask & non_base & pareto["eligible"]
+        ).sum(dim=-1).float(),
+        "risk_counterfactual_pareto_valid": counterfactual_pareto_valid.float(),
+        "risk_counterfactual_clearance_gain": _mode_value(
+            pareto["clearance_gain"], counterfactual_mode
+        ),
+        "risk_counterfactual_safety_cost_gain": _mode_value(
+            pareto["safety_cost_gain"], counterfactual_mode
+        ),
+        "risk_counterfactual_map_cost_regression": _mode_value(
+            pareto["map_cost_regression"], counterfactual_mode
+        ),
+        "risk_counterfactual_comfort_cost_regression": _mode_value(
+            pareto["comfort_cost_regression"], counterfactual_mode
+        ),
         "risk_time_thw": time_state["thw"],
         "risk_time_ttc": time_state["ttc"],
         "risk_time_drac": time_state["drac"],
@@ -606,6 +669,7 @@ def evaluate_risk_shadow(
         diagnostics[f"risk_{prefix}_drivable_probability"] = _mode_value(drivable_probability, mode)
         diagnostics[f"risk_{prefix}_clearance_cost"] = _mode_value(clearance_cost, mode)
         diagnostics[f"risk_{prefix}_timing_cost"] = _mode_value(timing_cost, mode)
+        diagnostics[f"risk_{prefix}_safety_cost"] = _mode_value(safety_cost, mode)
         diagnostics[f"risk_{prefix}_map_cost"] = _mode_value(map_cost, mode)
         diagnostics[f"risk_{prefix}_comfort_cost"] = _mode_value(comfort_cost, mode)
         diagnostics[f"risk_{prefix}_total_cost"] = _mode_value(total_cost, mode)
