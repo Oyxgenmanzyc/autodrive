@@ -9,6 +9,7 @@ from navsim.agents.diffusiondrive.modules.risk_attention import (
 )
 from navsim.agents.diffusiondrive.modules.risk_gate import select_risk_gated_mode
 from navsim.agents.diffusiondrive.modules.risk_shadow import (
+    _delayed_time_risk,
     _sample_drivable_probability,
     _trajectory_dynamics,
     evaluate_risk_shadow,
@@ -142,6 +143,36 @@ class RiskAttentionGateTest(unittest.TestCase):
 
         self.assertLess(dynamics["brake_onset"][0, 0].item(), 4.5)
         self.assertEqual(dynamics["brake_onset"][0, 1].item(), 4.5)
+
+    def test_waiting_one_step_crosses_speed_dependent_t1(self):
+        front = {
+            "valid": torch.tensor([True]),
+            "gap": torch.tensor([12.0]),
+            "ego_v": torch.tensor([10.0]),
+            "lead_v": torch.tensor([5.0]),
+            "lead_a": torch.tensor([0.0]),
+        }
+
+        state = _delayed_time_risk(front, SimpleNamespace())
+
+        self.assertGreater(state["ttc"].item(), state["t1"].item())
+        self.assertLessEqual(state["delayed_ttc"].item(), state["t1"].item())
+        self.assertTrue(state["crossing_t1"].item())
+        self.assertTrue(state["trigger"].item())
+
+    def test_non_closing_front_does_not_trigger_time_risk(self):
+        front = {
+            "valid": torch.tensor([True]),
+            "gap": torch.tensor([8.0]),
+            "ego_v": torch.tensor([5.0]),
+            "lead_v": torch.tensor([5.0]),
+            "lead_a": torch.tensor([0.0]),
+        }
+
+        state = _delayed_time_risk(front, SimpleNamespace())
+
+        self.assertEqual(state["time_risk"].item(), 0.0)
+        self.assertFalse(state["trigger"].item())
 
 
 if __name__ == "__main__":

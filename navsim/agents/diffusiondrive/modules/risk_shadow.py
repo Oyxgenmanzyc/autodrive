@@ -212,6 +212,131 @@ def _sample_drivable_probability(
     return sampled[:, 0].mean(dim=-1), torch.ones(batch_size, device=poses_reg.device, dtype=torch.bool)
 
 
+def _mulder_time_risk(
+    thw: torch.Tensor,
+    ttc: torch.Tensor,
+    closing: torch.Tensor,
+    config: Any,
+) -> torch.Tensor:
+    """Compute Mulder-style TTC risk amplified by short time headway."""
+
+    thw_min = float(_cfg(config, "risk_shadow_thw_min", 0.5))
+    thw_max = float(_cfg(config, "risk_shadow_thw_max", 2.5))
+    ttc_max = float(_cfg(config, "risk_ttc_max", 10.0))
+    ttc_ratio = ttc_max / ttc.clamp(min=1e-3)
+    blend = torch.where(
+        thw < thw_min,
+        torch.ones_like(thw),
+        thw_min * (thw_max - thw).clamp(min=0.0),
+    )
+    risk = (blend * ttc_ratio).clamp(0.0, 1.0)
+    return torch.where(closing & (thw <= thw_max), risk, torch.zeros_like(risk))
+
+
+def _delayed_time_risk(front: Dict[str, torch.Tensor], config: Any) -> Dict[str, torch.Tensor]:
+    """Estimate whether waiting one 0.5-second decision step crosses a risk boundary."""
+
+    dt = max(float(_cfg(config, "risk_history_dt", 0.5)), 1e-3)
+    ttc_max = float(_cfg(config, "risk_ttc_max", 10.0))
+    drac_max = float(_cfg(config, "risk_drac_max", 6.0))
+    eps = 1e-3
+
+    gap = front["gap"].clamp(min=eps)
+    ego_v = front["ego_v"].clamp(min=0.0)
+    lead_v = front["lead_v"].clamp(min=0.0)
+    rel_v = (ego_v - lead_v).clamp(min=0.0)
+    closing = rel_v > 0.1
+    thw = (gap / ego_v.clamp(min=eps)).clamp(max=ttc_max)
+    ttc = torch.where(
+        closing,
+        (gap / rel_v.clamp(min=eps)).clamp(max=ttc_max),
+        torch.full_like(gap, ttc_max),
+    )
+    drac = torch.where(
+        closing,
+        (rel_v.square() / (2.0 * gap)).clamp(max=drac_max),
+        torch.zeros_like(gap),
+    )
+
+    next_lead_v = (lead_v + front["lead_a"] * dt).clamp(
+        min=0.0,
+        max=float(_cfg(config, "risk_shadow_max_lead_speed", 40.0)),
+    )
+    lead_displacement = 0.5 * (lead_v + next_lead_v) * dt
+    delayed_gap = (gap + lead_displacement - ego_v * dt).clamp(min=eps)
+    delayed_rel_v = (ego_v - next_lead_v).clamp(min=0.0)
+    delayed_closing = delayed_rel_v > 0.1
+    delayed_thw = (delayed_gap / ego_v.clamp(min=eps)).clamp(max=ttc_max)
+    delayed_ttc = torch.where(
+        delayed_closing,
+        (delayed_gap / delayed_rel_v.clamp(min=eps)).clamp(max=ttc_max),
+        torch.full_like(delayed_gap, ttc_max),
+    )
+    delayed_drac = torch.where(
+        delayed_closing,
+        (delayed_rel_v.square() / (2.0 * delayed_gap)).clamp(max=drac_max),
+        torch.zeros_like(delayed_gap),
+    )
+
+    t1 = torch.where(
+        ego_v <= 10.0,
+        torch.full_like(ego_v, 2.0),
+        torch.where(
+            ego_v < 25.0,
+            2.78 - 0.078 * ego_v,
+            torch.full_like(ego_v, 0.83),
+        ),
+    )
+    t2 = torch.where(
+        ego_v <= 10.0,
+        torch.full_like(ego_v, 1.0),
+        torch.where(
+            ego_v < 25.0,
+            1.42 - 0.042 * ego_v,
+            torch.full_like(ego_v, 0.37),
+        ),
+    )
+
+    time_risk = _mulder_time_risk(thw, ttc, closing, config)
+    delayed_time_risk = _mulder_time_risk(delayed_thw, delayed_ttc, delayed_closing, config)
+    crossing_t1 = (ttc > t1) & (delayed_ttc <= t1)
+    worsening = (
+        (delayed_time_risk > time_risk + 0.05)
+        | (delayed_ttc < ttc - 0.25)
+        | (front["lead_a"] < -0.5)
+    )
+    thw_max = float(_cfg(config, "risk_shadow_thw_max", 2.5))
+    trigger = (
+        front["valid"]
+        & (closing | delayed_closing)
+        & ((thw <= thw_max) | (delayed_thw <= thw_max))
+        & ((ttc <= t1) | crossing_t1 | ((delayed_drac >= 2.0) & worsening))
+    )
+    emergency = (
+        front["valid"]
+        & (closing | delayed_closing)
+        & ((ttc <= t2) | (delayed_ttc <= t2) | (delayed_drac >= 4.0))
+    )
+
+    return {
+        "thw": thw,
+        "ttc": ttc,
+        "drac": drac,
+        "time_risk": time_risk,
+        "delayed_gap": delayed_gap,
+        "delayed_thw": delayed_thw,
+        "delayed_ttc": delayed_ttc,
+        "delayed_drac": delayed_drac,
+        "delayed_time_risk": delayed_time_risk,
+        "t1": t1,
+        "t2": t2,
+        "crossing_t1": crossing_t1,
+        "worsening": worsening,
+        "trigger": trigger,
+        "emergency": emergency,
+    }
+
+
 def evaluate_risk_shadow(
     poses_reg: torch.Tensor,
     poses_cls: torch.Tensor,
@@ -308,6 +433,12 @@ def evaluate_risk_shadow(
     adjusted_logits = adjusted_logits.masked_fill(~eligible, -torch.inf)
     proposed_mode = torch.where(reliable, adjusted_logits.argmax(dim=-1), raw_mode)
 
+    counterfactual_topk = min(
+        max(int(_cfg(config, "risk_shadow_counterfactual_topk", 3)), 1),
+        logits.shape[-1],
+    )
+    topk_modes = logits.topk(k=counterfactual_topk, dim=-1).indices
+
     eligible_count = eligible.sum(dim=-1)
     eligible_cost = total_cost.masked_fill(~eligible, torch.inf)
     min_cost, min_cost_mode = eligible_cost.min(dim=-1)
@@ -348,12 +479,55 @@ def evaluate_risk_shadow(
         torch.full_like(adjusted_margin_raw, -1.0),
     )
     base_dynamic_clearance = _mode_value(dynamic_clearance, raw_mode)
-    actionable = (
-        reliable
-        & (base_dynamic_clearance >= 0.0)
-        & (base_dynamic_clearance < warning_gap)
-        & (lower_cost_count > 0)
+    time_state = _delayed_time_risk(front, config)
+
+    base_pose_idx = raw_mode[..., None, None, None].repeat(1, 1, poses.shape[-2], poses.shape[-1])
+    base_pose = torch.gather(poses, 1, base_pose_idx).squeeze(1)
+    lateral_change = (poses[..., 1] - base_pose[:, None, :, 1]).abs().max(dim=-1).values
+    heading_delta = poses[..., 2] - base_pose[:, None, :, 2]
+    heading_change = torch.atan2(heading_delta.sin(), heading_delta.cos()).abs().max(dim=-1).values
+    longitudinal_like = (
+        (lateral_change <= float(_cfg(config, "risk_shadow_longitudinal_lateral_tolerance", 0.75)))
+        & (heading_change <= float(_cfg(config, "risk_shadow_longitudinal_heading_tolerance", 0.20)))
     )
+
+    topk_mask = torch.zeros_like(total_cost, dtype=torch.bool).scatter(1, topk_modes, True)
+    lower_than_base = total_cost < base_cost[:, None] - 1e-6
+    non_base = torch.arange(logits.shape[-1], device=logits.device)[None, :] != raw_mode[:, None]
+    longitudinal_mask = topk_mask & lower_than_base & non_base & longitudinal_like
+    lateral_mask = topk_mask & lower_than_base & non_base & ~longitudinal_like
+
+    longitudinal_costs = total_cost.masked_fill(~longitudinal_mask, torch.inf)
+    best_longitudinal_cost, best_longitudinal_mode = longitudinal_costs.min(dim=-1)
+    has_longitudinal = torch.isfinite(best_longitudinal_cost)
+    lateral_costs = total_cost.masked_fill(~lateral_mask, torch.inf)
+    best_lateral_cost, best_lateral_mode = lateral_costs.min(dim=-1)
+    has_lateral = torch.isfinite(best_lateral_cost)
+
+    lateral_advantage = float(_cfg(config, "risk_shadow_lateral_cost_advantage", 0.02))
+    use_lateral = has_lateral & (
+        ~has_longitudinal
+        | (time_state["emergency"] & (best_lateral_cost + lateral_advantage < best_longitudinal_cost))
+    )
+    counterfactual_mode = torch.where(
+        use_lateral,
+        best_lateral_mode,
+        torch.where(has_longitudinal, best_longitudinal_mode, raw_mode),
+    )
+    counterfactual_type = torch.where(
+        use_lateral,
+        torch.full_like(raw_mode, 2),
+        torch.where(has_longitudinal, torch.ones_like(raw_mode), torch.zeros_like(raw_mode)),
+    )
+    counterfactual_cost = _mode_value(total_cost, counterfactual_mode)
+    counterfactual_dynamic_clearance = _mode_value(dynamic_clearance, counterfactual_mode)
+    counterfactual_active = (
+        reliable
+        & time_state["trigger"]
+        & (counterfactual_mode != raw_mode)
+        & (counterfactual_cost < base_cost - 1e-6)
+    )
+    actionable = counterfactual_active
 
     diagnostics = {
         "risk_shadow_active": torch.ones_like(front["gap"]),
@@ -380,6 +554,37 @@ def evaluate_risk_shadow(
         "risk_candidate_dynamic_clearance_range": (max_dynamic_clearance - min_dynamic_clearance).clamp(min=0.0),
         "risk_candidate_required_logit_penalty": required_penalty,
         "risk_candidate_actionable": actionable.float(),
+        "risk_counterfactual_active": counterfactual_active.float(),
+        "risk_counterfactual_mode": counterfactual_mode.float(),
+        "risk_counterfactual_topk": torch.full_like(base_cost, float(counterfactual_topk)),
+        "risk_counterfactual_cost_improvement": (base_cost - counterfactual_cost).clamp(min=0.0),
+        "risk_counterfactual_dynamic_clearance_improvement": (
+            counterfactual_dynamic_clearance - base_dynamic_clearance
+        ),
+        "risk_counterfactual_cls_gap": (
+            base_cls - _mode_value(logits, counterfactual_mode)
+        ).clamp(min=0.0),
+        "risk_counterfactual_type": counterfactual_type.float(),
+        "risk_counterfactual_lateral_change": _mode_value(lateral_change, counterfactual_mode),
+        "risk_counterfactual_heading_change": _mode_value(heading_change, counterfactual_mode),
+        "risk_counterfactual_has_longitudinal": has_longitudinal.float(),
+        "risk_counterfactual_has_lateral": has_lateral.float(),
+        "risk_counterfactual_used_lateral": use_lateral.float(),
+        "risk_time_thw": time_state["thw"],
+        "risk_time_ttc": time_state["ttc"],
+        "risk_time_drac": time_state["drac"],
+        "risk_time_mulder": time_state["time_risk"],
+        "risk_time_delayed_gap": time_state["delayed_gap"],
+        "risk_time_delayed_thw": time_state["delayed_thw"],
+        "risk_time_delayed_ttc": time_state["delayed_ttc"],
+        "risk_time_delayed_drac": time_state["delayed_drac"],
+        "risk_time_delayed_mulder": time_state["delayed_time_risk"],
+        "risk_time_t1": time_state["t1"],
+        "risk_time_t2": time_state["t2"],
+        "risk_time_crossing_t1": time_state["crossing_t1"].float(),
+        "risk_time_worsening": time_state["worsening"].float(),
+        "risk_time_trigger": time_state["trigger"].float(),
+        "risk_time_emergency": time_state["emergency"].float(),
     }
     diagnostics["risk_candidate_min_cost_cls"] = _mode_value(logits, min_cost_mode)
     diagnostics["risk_candidate_min_cost_dynamic_clearance"] = _mode_value(dynamic_clearance, min_cost_mode)
@@ -388,7 +593,11 @@ def evaluate_risk_shadow(
         drivable_probability,
         min_cost_mode,
     )
-    for prefix, mode in (("base", raw_mode), ("proposed", proposed_mode)):
+    for prefix, mode in (
+        ("base", raw_mode),
+        ("proposed", proposed_mode),
+        ("counterfactual", counterfactual_mode),
+    ):
         diagnostics[f"risk_{prefix}_cls"] = _mode_value(logits, mode)
         diagnostics[f"risk_{prefix}_static_clearance"] = _mode_value(static_clearance, mode)
         diagnostics[f"risk_{prefix}_dynamic_clearance"] = _mode_value(dynamic_clearance, mode)

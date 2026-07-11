@@ -103,7 +103,31 @@ def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[D
                 simulator=simulator,
                 scorer=scorer,
             )
-            score_row.update(asdict(pdm_result))
+            base_result = asdict(pdm_result)
+            score_row.update(base_result)
+            score_row["risk_counterfactual_pdm_valid"] = 0.0
+            counterfactual_trajectory = None
+            if hasattr(agent, "get_risk_counterfactual_trajectory"):
+                counterfactual_trajectory = agent.get_risk_counterfactual_trajectory()
+            if counterfactual_trajectory is not None:
+                try:
+                    counterfactual_result = pdm_score(
+                        metric_cache=metric_cache,
+                        model_trajectory=counterfactual_trajectory,
+                        future_sampling=simulator.proposal_sampling,
+                        simulator=simulator,
+                        scorer=scorer,
+                    )
+                    counterfactual_result = asdict(counterfactual_result)
+                    score_row["risk_counterfactual_pdm_valid"] = 1.0
+                    for key, value in counterfactual_result.items():
+                        score_row[f"counterfactual_{key}"] = value
+                    score_row["counterfactual_score_delta"] = (
+                        counterfactual_result["score"] - base_result["score"]
+                    )
+                except Exception:
+                    logger.warning(f"----------- Counterfactual scoring failed for token {token}:")
+                    traceback.print_exc()
         except Exception as e:
             logger.warning(f"----------- Agent failed for token {token}:")
             traceback.print_exc()

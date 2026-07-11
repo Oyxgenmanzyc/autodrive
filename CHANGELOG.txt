@@ -92,3 +92,25 @@ Core changes
 - Added the minimum theoretical logit penalty required to prefer a lower-cost eligible mode.
 - Added an actionable flag for reliable fused-front scenes whose base dynamic clearance is within 0 to 3 meters.
 - Selection behavior remains unchanged; soft risk re-ranking is still disabled.
+
+3.20.3 THW/TTC delayed-trigger counterfactual shadow
+Date
+- 2026-07-12
+
+Purpose
+- Trigger intervention only when waiting one 0.5-second decision step reaches a speed-dependent risk boundary.
+- Prefer longitudinal braking corrections while retaining conditional lateral avoidance candidates.
+- Avoid direct arithmetic mixing of classifier logits and bounded risk costs.
+
+Core changes
+- Added Mulder-style THW amplification of TTC with THWmin=0.5s, THWmax=2.5s, and TTCmax=10s.
+- Added current and delayed-0.5s THW/TTC/DRAC estimation.
+- Added speed-dependent T1/T2 boundaries derived from the car-following TM study.
+- Split top-3 lower-risk candidates into longitudinal-like and lateral-avoidance groups.
+- Prefer longitudinal correction; allow lateral candidates when no lower-risk longitudinal candidate exists, or in emergency when lateral risk is clearly lower.
+- Added same-run counterfactual PDM scoring while keeping the original classifier trajectory as the actual output.
+- Added diagnostics for time-risk trigger, candidate type, lateral change, heading change, and counterfactual PDM delta.
+
+Verification
+- Local Python AST parsing and git diff checks are required before commit.
+- PyTorch tests remain pending on the NAVSIM server environment.

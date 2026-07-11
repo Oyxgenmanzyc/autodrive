@@ -725,5 +725,12 @@ class TrajectoryHead(nn.Module):
         if risk_diagnostics:
             risk_diagnostics["risk_selected_mode"] = mode_idx.float()
             risk_diagnostics["risk_selection_changed"] = (mode_idx != raw_mode).float()
+            counterfactual_mode = risk_diagnostics["risk_counterfactual_mode"].long()
+            counterfactual_idx = counterfactual_mode[..., None, None, None].repeat(
+                1, 1, self._num_poses, 3
+            )
+            output["risk_counterfactual_trajectory"] = torch.gather(
+                poses_reg, 1, counterfactual_idx
+            ).squeeze(1)
             output.update(risk_diagnostics)
         return output
