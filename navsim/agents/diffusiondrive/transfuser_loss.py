@@ -62,7 +62,9 @@ def transfuser_loss(
         trajectory_loss_dict = predictions["trajectory_loss_dict"]
         loss_dict.update(trajectory_loss_dict)
     for key, value in predictions.items():
-        if key.startswith("risk_rank_"):
+        if key.startswith("risk_rank_") and (
+            not torch.is_tensor(value) or value.numel() == 1
+        ):
             loss_dict[key] = value
     # import ipdb; ipdb.set_trace()
     return loss_dict
