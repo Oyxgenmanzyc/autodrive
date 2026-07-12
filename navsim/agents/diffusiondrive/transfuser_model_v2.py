@@ -18,6 +18,10 @@ from navsim.agents.diffusiondrive.modules.risk_attention import (
 )
 from navsim.agents.diffusiondrive.modules.risk_gate import select_risk_gated_mode
 from navsim.agents.diffusiondrive.modules.risk_shadow import evaluate_risk_shadow
+from navsim.agents.diffusiondrive.modules.risk_mode_ranking import (
+    RiskModeRankingHead,
+    compute_risk_mode_ranking_loss,
+)
 from torch.nn import TransformerDecoder,TransformerDecoderLayer
 from typing import Any, List, Dict, Optional, Union
 class V2TransfuserModel(nn.Module):
@@ -371,7 +375,7 @@ class CustomTransformerDecoderLayer(nn.Module):
         poses_reg[...,:2] = poses_reg[...,:2] + noisy_traj_points
         poses_reg[..., StateSE2Index.HEADING] = poses_reg[..., StateSE2Index.HEADING].tanh() * np.pi
 
-        return poses_reg, poses_cls
+        return poses_reg, poses_cls, traj_feature
 def _get_clones(module, N):
     # FIXME: copy.deepcopy() is not defined on nn.module
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
@@ -402,9 +406,10 @@ class CustomTransformerDecoder(nn.Module):
                 global_img=None):
         poses_reg_list = []
         poses_cls_list = []
+        final_traj_feature = None
         traj_points = noisy_traj_points
         for mod in self.layers:
-            poses_reg, poses_cls = mod(
+            poses_reg, poses_cls, final_traj_feature = mod(
                 traj_feature,
                 traj_points,
                 bev_feature,
@@ -419,7 +424,7 @@ class CustomTransformerDecoder(nn.Module):
             poses_reg_list.append(poses_reg)
             poses_cls_list.append(poses_cls)
             traj_points = poses_reg[...,:2].clone().detach()
-        return poses_reg_list, poses_cls_list
+        return poses_reg_list, poses_cls_list, final_traj_feature
 
 class TrajectoryHead(nn.Module):
     """Trajectory prediction head."""
@@ -482,6 +487,11 @@ class TrajectoryHead(nn.Module):
                 num_layers=config.risk_attention_layers,
                 history_frames=config.risk_history_num_frames,
             )
+        self.use_risk_aware_cls = config.use_risk_aware_cls
+        if self.use_risk_aware_cls:
+            if not self.use_historical_risk_attention:
+                raise ValueError("use_risk_aware_cls requires use_historical_risk_attention")
+            self.risk_mode_ranking_head = RiskModeRankingHead(d_model)
     def norm_odo(self, odo_info_fut):
         odo_info_fut_x = odo_info_fut[..., 0:1]
         odo_info_fut_y = odo_info_fut[..., 1:2]
@@ -596,7 +606,7 @@ class TrajectoryHead(nn.Module):
 
 
         # 4. begin the stacked decoder
-        poses_reg_list, poses_cls_list = self.diff_decoder(
+        poses_reg_list, poses_cls_list, final_traj_feature = self.diff_decoder(
             traj_feature,
             noisy_traj_points,
             bev_feature,
@@ -616,13 +626,32 @@ class TrajectoryHead(nn.Module):
             trajectory_loss_dict[f"trajectory_loss_{idx}"] = trajectory_loss
             ret_traj_loss += trajectory_loss
 
-        mode_idx = poses_cls_list[-1].argmax(dim=-1)
+        ranking_output: Dict[str, torch.Tensor] = {}
+        selection_logits = poses_cls_list[-1]
+        if self.use_risk_aware_cls:
+            history_valid = history_risk_tokens[..., -1] if history_risk_tokens is not None else None
+            risk_delta = self.risk_mode_ranking_head(
+                final_traj_feature,
+                history_risk_memory,
+                history_valid,
+            )
+            ranking_output = compute_risk_mode_ranking_loss(
+                poses_reg_list[-1],
+                poses_cls_list[-1],
+                risk_delta,
+                targets,
+                self._config,
+            )
+            selection_logits = poses_cls_list[-1].detach() + risk_delta
+
+        mode_idx = selection_logits.argmax(dim=-1)
         mode_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
         best_reg = torch.gather(poses_reg_list[-1], 1, mode_idx).squeeze(1)
         output = {"trajectory": best_reg,"trajectory_loss":ret_traj_loss,"trajectory_loss_dict":trajectory_loss_dict}
         if risk_aux_loss is not None:
             output["memory_aux_loss"] = risk_aux_loss
             output["trajectory_loss_dict"]["memory_aux_loss"] = risk_aux_loss
+        output.update(ranking_output)
         return output
 
     def forward_test(
@@ -679,7 +708,7 @@ class TrajectoryHead(nn.Module):
             time_embed = time_embed.view(bs,1,-1)
 
             # 4. begin the stacked decoder
-            poses_reg_list, poses_cls_list = self.diff_decoder(
+            poses_reg_list, poses_cls_list, final_traj_feature = self.diff_decoder(
                 traj_feature,
                 noisy_traj_points,
                 bev_feature,
@@ -701,22 +730,43 @@ class TrajectoryHead(nn.Module):
                 sample=img
             ).prev_sample
         risk_diagnostics: Dict[str, torch.Tensor] = {}
-        raw_mode = poses_cls.argmax(dim=-1)
+        selection_logits = poses_cls
+        base_mode = poses_cls.argmax(dim=-1)
+        if self.use_risk_aware_cls:
+            history_valid = history_risk_tokens[..., -1] if history_risk_tokens is not None else None
+            risk_delta = self.risk_mode_ranking_head(
+                final_traj_feature,
+                history_risk_memory,
+                history_valid,
+            )
+            selection_logits = poses_cls + risk_delta
+            risk_diagnostics.update(
+                {
+                    "risk_rank_base_mode": base_mode.float(),
+                    "risk_rank_delta_abs_mean": risk_delta.abs().mean(dim=-1),
+                    "risk_rank_delta_abs_max": risk_delta.abs().max(dim=-1).values,
+                }
+            )
+        raw_mode = selection_logits.argmax(dim=-1)
+        if self.use_risk_aware_cls:
+            risk_diagnostics["risk_rank_selected_mode"] = raw_mode.float()
+            risk_diagnostics["risk_rank_selection_changed"] = (raw_mode != base_mode).float()
         shadow_enabled = self._config.use_risk_shadow_evaluator or self._config.use_soft_risk_rescore
         if shadow_enabled and history_risk_tokens is not None:
-            proposed_mode, risk_diagnostics = evaluate_risk_shadow(
+            proposed_mode, shadow_diagnostics = evaluate_risk_shadow(
                 poses_reg,
-                poses_cls,
+                selection_logits,
                 history_risk_tokens,
                 agent_states,
                 agent_labels,
                 bev_semantic_map,
                 self._config,
             )
+            risk_diagnostics.update(shadow_diagnostics)
             # Shadow mode is deliberately output-neutral. Soft re-ranking is a separate opt-in.
             mode_idx = proposed_mode if self._config.use_soft_risk_rescore else raw_mode
         elif self._config.use_risk_gate and history_risk_tokens is not None:
-            mode_idx = select_risk_gated_mode(poses_reg, poses_cls, history_risk_tokens, self._config)
+            mode_idx = select_risk_gated_mode(poses_reg, selection_logits, history_risk_tokens, self._config)
         else:
             mode_idx = raw_mode
         gather_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
@@ -725,12 +775,13 @@ class TrajectoryHead(nn.Module):
         if risk_diagnostics:
             risk_diagnostics["risk_selected_mode"] = mode_idx.float()
             risk_diagnostics["risk_selection_changed"] = (mode_idx != raw_mode).float()
-            counterfactual_mode = risk_diagnostics["risk_counterfactual_mode"].long()
-            counterfactual_idx = counterfactual_mode[..., None, None, None].repeat(
-                1, 1, self._num_poses, 3
-            )
-            output["risk_counterfactual_trajectory"] = torch.gather(
-                poses_reg, 1, counterfactual_idx
-            ).squeeze(1)
+            if "risk_counterfactual_mode" in risk_diagnostics:
+                counterfactual_mode = risk_diagnostics["risk_counterfactual_mode"].long()
+                counterfactual_idx = counterfactual_mode[..., None, None, None].repeat(
+                    1, 1, self._num_poses, 3
+                )
+                output["risk_counterfactual_trajectory"] = torch.gather(
+                    poses_reg, 1, counterfactual_idx
+                ).squeeze(1)
             output.update(risk_diagnostics)
         return output

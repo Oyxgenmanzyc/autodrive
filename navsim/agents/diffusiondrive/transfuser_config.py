@@ -101,6 +101,16 @@ class TransfuserConfig:
     risk_shadow_max_comfort_cost_regression: float = 0.05
     risk_shadow_lateral_safety_advantage: float = 0.02
 
+    # 3.21 isolated risk-conditioned mode ranking.
+    risk_rank_loss_weight: float = 0.2
+    risk_rank_normal_delta_weight: float = 0.01
+    risk_rank_margin: float = 1.0
+    risk_rank_lateral_tolerance: float = 0.75
+    risk_rank_heading_tolerance: float = 0.20
+    risk_rank_progress_tolerance: float = 1.0
+    risk_rank_min_onset_step_gain: int = 1
+    risk_rank_brake_accel_threshold: float = -0.5
+
     camera_width: int = 1024
     camera_height: int = 256
     lidar_resolution_width = 256

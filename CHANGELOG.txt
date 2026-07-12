@@ -141,3 +141,35 @@ Verification
 - Python AST parsing and git diff checks passed locally.
 - Replaying the 3.20.3 CSV retained 9 of 35 candidates, removed all 3 new TTC failures, retained 1 collision fix, and produced a cumulative counterfactual PDM delta of +0.5293.
 - PyTorch unit tests and navtest counterfactual evaluation remain pending on the NAVSIM server.
+
+3.21 Risk-conditioned mode ranking
+Date
+- 2026-07-12
+
+Purpose
+- Move the second innovation from inference-time rule selection into a minimal, isolated training objective.
+- Test whether all 20 generated modes contain same-behavior trajectories with genuinely different brake timing before adding trajectory-generation supervision.
+
+Core changes
+- TargetBuilder tracks the current GT front vehicle by `track_token` for eight future frames and stops the risk segment when that token disappears.
+- Future GT boxes are transformed from each future ego frame into the current ego coordinate frame.
+- A versioned target cache stores future-front boxes, current/delayed TTC context, continuous-track length, and a GT high-risk following mask.
+- Pair mining compares all 20 detached final-layer trajectories and uses only path similarity, at least one-step earlier sustained braking, and a 1.0 m progress tolerance.
+- TTC, dynamic clearance, map, comfort, and DRAC are excluded from pair scoring; available risk quantities remain diagnostics.
+- Added a zero-initialized residual classification head over detached mode features and detached pooled history-risk memory.
+- Pairwise softplus ranking loss updates only the residual head. Original focal classification, trajectory regression, diffusion, agent, BEV, and memory auxiliary losses remain unchanged.
+- A small normal-scene calibration loss keeps residual logits near zero outside GT risk scenes.
+- Inference selects `argmax(original_cls + risk_cls_delta)` without a hard gate, soft risk cost, or Temporal Risk Cross-Attention.
+
+Training observability
+- Logs include risk-scene rate, valid-pair scene rate, pair count, behavior-pair count, base/adjusted pair accuracy, positive/negative brake onset, original mode ranks, future clearance, TTC context, and residual magnitude.
+- The pair coverage metrics determine the next experiment: ranking if pairs are common, brake-timing trajectory supervision if pairs are scarce.
+
+Cache and training
+- A fresh cache is mandatory because the target schema and target-builder cache name changed.
+- Six-GPU DDP should use batch size 10 per GPU to keep the global batch near the original single-GPU batch size 64.
+
+Verification
+- Python AST parsing and `git diff --check` passed locally.
+- Added focused tests for coordinate conversion, continuous-token termination, timing-pair mining, zero initialization, and gradient isolation.
+- PyTorch tests, cache generation, and full training remain pending on the NAVSIM server.

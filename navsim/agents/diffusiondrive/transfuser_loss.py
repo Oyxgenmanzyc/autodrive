@@ -35,10 +35,15 @@ def transfuser_loss(
         memory_aux_loss = predictions['memory_aux_loss']
     else:
         memory_aux_loss = 0
+    if 'risk_mode_ranking_loss' in predictions:
+        risk_mode_ranking_loss = predictions['risk_mode_ranking_loss']
+    else:
+        risk_mode_ranking_loss = 0
     loss = (
         config.trajectory_weight * trajectory_loss
         + config.diff_loss_weight * diffusion_loss
         + memory_aux_loss
+        + risk_mode_ranking_loss
         + config.agent_class_weight * agent_class_loss
         + config.agent_box_weight * agent_box_loss
         + config.bev_semantic_weight * bev_semantic_loss
@@ -48,6 +53,7 @@ def transfuser_loss(
         'trajectory_loss': config.trajectory_weight*trajectory_loss,
         'diffusion_loss': config.diff_loss_weight*diffusion_loss,
         'memory_aux_loss': memory_aux_loss,
+        'risk_mode_ranking_loss': risk_mode_ranking_loss,
         'agent_class_loss': config.agent_class_weight*agent_class_loss,
         'agent_box_loss': config.agent_box_weight*agent_box_loss,
         'bev_semantic_loss': config.bev_semantic_weight*bev_semantic_loss
@@ -55,6 +61,9 @@ def transfuser_loss(
     if "trajectory_loss_dict" in predictions:
         trajectory_loss_dict = predictions["trajectory_loss_dict"]
         loss_dict.update(trajectory_loss_dict)
+    for key, value in predictions.items():
+        if key.startswith("risk_rank_"):
+            loss_dict[key] = value
     # import ipdb; ipdb.set_trace()
     return loss_dict
 
