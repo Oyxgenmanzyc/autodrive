@@ -195,11 +195,24 @@ class AgentHead(nn.Module):
     def forward(self, agent_queries) -> Dict[str, torch.Tensor]:
         """Torch module forward pass."""
 
+        invalid_batch = torch.nonzero(
+            ~torch.isfinite(agent_queries).flatten(1).all(dim=1),
+            as_tuple=False,
+        ).flatten()
+        if invalid_batch.numel() > 0:
+            print(
+                "[DiffusionDrive][agent_head] Sanitizing non-finite agent queries "
+                f"for batch indices={invalid_batch.detach().cpu().tolist()}",
+                flush=True,
+            )
+        agent_queries = torch.nan_to_num(agent_queries, nan=0.0, posinf=0.0, neginf=0.0)
         agent_states = self._mlp_states(agent_queries)
         agent_states[..., BoundingBox2DIndex.POINT] = agent_states[..., BoundingBox2DIndex.POINT].tanh() * 32
         agent_states[..., BoundingBox2DIndex.HEADING] = agent_states[..., BoundingBox2DIndex.HEADING].tanh() * np.pi
 
         agent_labels = self._mlp_label(agent_queries).squeeze(dim=-1)
+        agent_states = torch.nan_to_num(agent_states, nan=0.0, posinf=0.0, neginf=0.0)
+        agent_labels = torch.nan_to_num(agent_labels, nan=0.0, posinf=0.0, neginf=0.0)
 
         return {"agent_states": agent_states, "agent_labels": agent_labels}
 
