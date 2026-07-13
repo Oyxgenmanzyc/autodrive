@@ -17,7 +17,7 @@ from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
 
 from navsim.agents.diffusiondrive.transfuser_config import TransfuserConfig
 from navsim.agents.diffusiondrive.modules.risk_utils import (
-    build_gt_future_front_targets,
+    build_gt_brake_timing_context,
     build_gt_history_risk_targets,
     build_history_risk_tokens,
 )
@@ -146,8 +146,8 @@ class TransfuserTargetBuilder(AbstractTargetBuilder):
 
     def get_unique_name(self) -> str:
         """Inherited, see superclass."""
-        if self._config.use_risk_aware_cls:
-            return "transfuser_target_risk_rank_v1"
+        if self._config.use_step_brake_timing_loss:
+            return "transfuser_target_brake_timing_v1"
         return "transfuser_target"
 
     def compute_targets(self, scene: Scene) -> Dict[str, torch.Tensor]:
@@ -173,16 +173,9 @@ class TransfuserTargetBuilder(AbstractTargetBuilder):
             risk_targets = build_gt_history_risk_targets(scene, self._config)
             targets["risk_aux_labels"] = torch.tensor(risk_targets["risk_aux_labels"], dtype=torch.long)
             targets["risk_aux_valid"] = torch.tensor(risk_targets["risk_aux_valid"], dtype=torch.float32)
-        if self._config.use_risk_aware_cls:
-            ranking_targets = build_gt_future_front_targets(scene, self._config)
-            targets["risk_front_future"] = torch.tensor(
-                ranking_targets["risk_front_future"], dtype=torch.float32
-            )
-            targets["risk_pair_context"] = torch.tensor(
-                ranking_targets["risk_pair_context"], dtype=torch.float32
-            )
-            targets["risk_pair_scene_active"] = torch.tensor(
-                ranking_targets["risk_pair_scene_active"], dtype=torch.float32
+        if self._config.use_step_brake_timing_loss:
+            targets["brake_timing_context"] = torch.tensor(
+                build_gt_brake_timing_context(scene, self._config), dtype=torch.float32
             )
 
         return targets

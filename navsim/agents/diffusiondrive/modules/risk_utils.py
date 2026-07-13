@@ -267,8 +267,6 @@ def _select_front_vehicle(annotations: Any, config: Any, preferred_track_token: 
         box_x = float(np.nan_to_num(box[0], nan=0.0, posinf=0.0, neginf=0.0))
         box_y = float(np.nan_to_num(box[1], nan=0.0, posinf=0.0, neginf=0.0))
         box_length = float(np.nan_to_num(box[3], nan=0.0, posinf=0.0, neginf=0.0))
-        box_width = float(np.nan_to_num(box[4], nan=0.0, posinf=0.0, neginf=0.0))
-        box_heading = float(np.nan_to_num(box[6], nan=0.0, posinf=0.0, neginf=0.0))
         if box_x < x_min or box_x > x_max or abs(box_y) > y_abs:
             continue
         track_token = annotations.track_tokens[idx] if idx < len(annotations.track_tokens) else ""
@@ -281,12 +279,6 @@ def _select_front_vehicle(annotations: Any, config: Any, preferred_track_token: 
                 "lead_v": lead_v,
                 "track_token": track_token,
                 "preferred": float(track_token == preferred_track_token),
-                "index": idx,
-                "x": box_x,
-                "y": box_y,
-                "heading": box_heading,
-                "length": box_length,
-                "width": box_width,
             }
         )
 
@@ -306,22 +298,17 @@ def _box_in_origin_frame(box: np.ndarray, frame_ego_pose: np.ndarray, origin_ego
     origin_x, origin_y, origin_heading = [float(value) for value in origin_ego_pose]
     local_x = float(np.nan_to_num(box[0], nan=0.0, posinf=0.0, neginf=0.0))
     local_y = float(np.nan_to_num(box[1], nan=0.0, posinf=0.0, neginf=0.0))
-    local_heading = float(np.nan_to_num(box[6], nan=0.0, posinf=0.0, neginf=0.0))
-
     frame_cos, frame_sin = np.cos(frame_heading), np.sin(frame_heading)
     global_x = frame_x + frame_cos * local_x - frame_sin * local_y
     global_y = frame_y + frame_sin * local_x + frame_cos * local_y
-
     delta_x, delta_y = global_x - origin_x, global_y - origin_y
     origin_cos, origin_sin = np.cos(origin_heading), np.sin(origin_heading)
-    origin_local_x = origin_cos * delta_x + origin_sin * delta_y
-    origin_local_y = -origin_sin * delta_x + origin_cos * delta_y
-    heading = np.arctan2(
-        np.sin(frame_heading + local_heading - origin_heading),
-        np.cos(frame_heading + local_heading - origin_heading),
-    )
     return np.array(
-        [origin_local_x, origin_local_y, heading, float(box[3]), float(box[4]), 1.0],
+        [
+            origin_cos * delta_x + origin_sin * delta_y,
+            -origin_sin * delta_x + origin_cos * delta_y,
+            float(box[3]),
+        ],
         dtype=np.float32,
     )
 
@@ -334,26 +321,21 @@ def _speed_dependent_t1(ego_v: float) -> float:
     return 0.83
 
 
-def build_gt_future_front_targets(scene: Any, config: Any) -> Dict[str, np.ndarray]:
-    """Build training-only continuous future-front targets for mode pair mining."""
+def build_gt_brake_timing_context(scene: Any, config: Any) -> np.ndarray:
+    """Build training-only TTC context for brake-timing supervision."""
 
     num_poses = int(config.trajectory_sampling.num_poses)
     dt = max(float(_cfg(config, "risk_history_dt", 0.5)), 1e-3)
     ttc_max = float(_cfg(config, "risk_ttc_max", 10.0))
-    future_front = np.zeros((num_poses, 6), dtype=np.float32)
     context = np.zeros(5, dtype=np.float32)
-
     current_idx = scene.scene_metadata.num_history_frames - 1
     current_frame = scene.frames[current_idx]
     front = _select_front_vehicle(current_frame.annotations, config, preferred_track_token=None)
     if front is None or not front["track_token"]:
-        return {
-            "risk_front_future": future_front,
-            "risk_pair_context": context,
-            "risk_pair_scene_active": np.array(0.0, dtype=np.float32),
-        }
+        return context
 
     origin_pose = np.asarray(current_frame.ego_status.ego_pose, dtype=np.float64)
+    first_future_front = None
     continuous_steps = 0
     for step in range(num_poses):
         frame_idx = current_idx + step + 1
@@ -364,11 +346,13 @@ def build_gt_future_front_targets(scene: Any, config: Any) -> Dict[str, np.ndarr
             track_idx = frame.annotations.track_tokens.index(front["track_token"])
         except ValueError:
             break
-        future_front[step] = _box_in_origin_frame(
+        transformed = _box_in_origin_frame(
             frame.annotations.boxes[track_idx],
             np.asarray(frame.ego_status.ego_pose, dtype=np.float64),
             origin_pose,
         )
+        if first_future_front is None:
+            first_future_front = transformed
         continuous_steps += 1
 
     ego_v = max(
@@ -378,11 +362,11 @@ def build_gt_future_front_targets(scene: Any, config: Any) -> Dict[str, np.ndarr
     rel_v = max(ego_v - float(front["lead_v"]), 0.0)
     current_ttc = min(float(front["gap"]) / max(rel_v, 1e-3), ttc_max) if rel_v > 0.1 else ttc_max
     delayed_ttc = ttc_max
-    if continuous_steps > 0:
+    if first_future_front is not None:
         gt_ego = scene.get_future_trajectory(num_trajectory_frames=num_poses).poses
         delayed_gap = max(
-            float(future_front[0, 0])
-            - 0.5 * float(future_front[0, 3])
+            float(first_future_front[0])
+            - 0.5 * float(first_future_front[2])
             - float(gt_ego[0, 0])
             - float(_cfg(config, "risk_ego_front_offset", 2.0)),
             1e-3,
@@ -391,17 +375,8 @@ def build_gt_future_front_targets(scene: Any, config: Any) -> Dict[str, np.ndarr
         if delayed_rel_v > 0.1:
             delayed_ttc = min(delayed_gap / delayed_rel_v, ttc_max)
 
-    t1 = _speed_dependent_t1(ego_v)
-    risk_active = float(
-        continuous_steps >= 2
-        and (current_ttc <= t1 or (current_ttc > t1 and delayed_ttc <= t1))
-    )
-    context[:] = [ego_v, current_ttc, delayed_ttc, t1, float(continuous_steps)]
-    return {
-        "risk_front_future": future_front,
-        "risk_pair_context": context,
-        "risk_pair_scene_active": np.array(risk_active, dtype=np.float32),
-    }
+    context[:] = [ego_v, current_ttc, delayed_ttc, _speed_dependent_t1(ego_v), float(continuous_steps)]
+    return context
 
 
 def build_gt_history_risk_targets(scene: Any, config: Any) -> Dict[str, np.ndarray]:

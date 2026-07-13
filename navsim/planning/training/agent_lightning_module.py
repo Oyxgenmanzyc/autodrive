@@ -34,11 +34,10 @@ class AgentLightningModule(pl.LightningModule):
         progress_bar_keys = {
             "loss",
             "trajectory_loss",
-            "risk_mode_ranking_loss",
-            "risk_rank_scene_rate",
-            "risk_rank_pair_scene_rate",
-            "risk_rank_pair_count",
-            "risk_rank_adjusted_pair_accuracy",
+            "brake_timing_loss",
+            "brake_timing_active_rate",
+            "brake_timing_onset_abs_error_s",
+            "brake_timing_late_rate",
         }
         for k, v in loss_dict.items():
             if v is not None:

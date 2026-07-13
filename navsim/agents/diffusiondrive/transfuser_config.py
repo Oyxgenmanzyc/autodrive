@@ -41,7 +41,6 @@ class TransfuserConfig:
     use_historical_risk_attention: bool = False
     use_temporal_risk_cross_attention: bool = False
     use_memory_aux_loss: bool = False
-    use_risk_aware_cls: bool = False
     use_step_brake_timing_loss: bool = False
     use_risk_shadow_evaluator: bool = False
     use_soft_risk_rescore: bool = False
@@ -64,6 +63,13 @@ class TransfuserConfig:
     memory_aux_loss_weight: float = 0.2
     risk_gate_min_gap: float = 1.0
     risk_gate_cls_margin: float = 2.0
+
+    # 3.22 isolated GT soft brake-timing supervision.
+    brake_timing_loss_weight: float = 0.1
+    brake_timing_accel_threshold: float = -0.5
+    brake_timing_temperature: float = 0.35
+    brake_timing_profile_weight: float = 0.25
+    brake_timing_preparation_time: float = 1.0
 
     # 3.20 stage-1 shadow evaluator. These settings add no trainable parameters.
     risk_shadow_agent_confidence: float = 0.35
@@ -100,16 +106,6 @@ class TransfuserConfig:
     risk_shadow_max_map_cost_regression: float = 0.02
     risk_shadow_max_comfort_cost_regression: float = 0.05
     risk_shadow_lateral_safety_advantage: float = 0.02
-
-    # 3.21 isolated risk-conditioned mode ranking.
-    risk_rank_loss_weight: float = 0.2
-    risk_rank_normal_delta_weight: float = 0.01
-    risk_rank_margin: float = 1.0
-    risk_rank_lateral_tolerance: float = 0.75
-    risk_rank_heading_tolerance: float = 0.20
-    risk_rank_progress_tolerance: float = 1.0
-    risk_rank_min_onset_step_gain: int = 1
-    risk_rank_brake_accel_threshold: float = -0.5
 
     camera_width: int = 1024
     camera_height: int = 256
