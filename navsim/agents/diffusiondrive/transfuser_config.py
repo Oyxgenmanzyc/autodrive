@@ -1,10 +1,20 @@
 from dataclasses import dataclass
+import os
+from pathlib import Path
 from typing import Tuple, List
 
 import numpy as np
 from nuplan.common.maps.abstract_map import SemanticMapLayer
 from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
 from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
+
+
+def _default_asset_path(environment_name: str, filename: str) -> str:
+    explicit_path = os.environ.get(environment_name)
+    if explicit_path:
+        return explicit_path
+    experiment_root = os.environ.get("NAVSIM_EXP_ROOT")
+    return str(Path(experiment_root) / "pretrained" / filename) if experiment_root else ""
 
 
 @dataclass
@@ -15,8 +25,10 @@ class TransfuserConfig:
 
     image_architecture: str = "resnet34"
     lidar_architecture: str = "resnet34"
-    bkb_path: str = "/home/users/bencheng.liao/.cache/huggingface/hub/checkpoints/resnet34.a1_in1k/pytorch_model.bin"
-    plan_anchor_path: str = "/home/users/bencheng.liao/PlanWrapper/playground/visualization/kmeans_navsim_traj_20.npy"
+    bkb_path: str = _default_asset_path("DIFFUSIONDRIVE_BKB_PATH", "resnet34.a1_in1k.bin")
+    plan_anchor_path: str = _default_asset_path(
+        "DIFFUSIONDRIVE_PLAN_ANCHOR_PATH", "kmeans_navsim_traj_20.npy"
+    )
 
     latent: bool = False
     latent_rad_thresh: float = 4 * np.pi / 9

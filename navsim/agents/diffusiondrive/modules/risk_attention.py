@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from navsim.agents.diffusiondrive.modules.finite_trace import assert_finite
+
 
 class HistoricalRiskTemporalSelfAttention(nn.Module):
     """Encode explicit history risk tokens into temporal risk memory."""
@@ -32,9 +34,13 @@ class HistoricalRiskTemporalSelfAttention(nn.Module):
 
     def forward(self, history_risk_tokens: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         history_risk_tokens = torch.nan_to_num(history_risk_tokens.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        assert_finite("risk_memory.input", history_risk_tokens)
         valid = history_risk_tokens[..., -1:].clamp(0.0, 1.0)
         x = (self.token_embedding(history_risk_tokens) + self.time_embedding[:, : history_risk_tokens.shape[1]]) * valid
-        memory = torch.nan_to_num(self.encoder(x) * valid, nan=0.0, posinf=0.0, neginf=0.0)
+        assert_finite("risk_memory.embedding", x)
+        raw_memory = self.encoder(x) * valid
+        assert_finite("risk_memory.transformer", raw_memory)
+        memory = torch.nan_to_num(raw_memory, nan=0.0, posinf=0.0, neginf=0.0)
 
         denom = valid.sum(dim=1).clamp(min=1.0)
         pooled = memory.sum(dim=1) / denom
@@ -43,6 +49,7 @@ class HistoricalRiskTemporalSelfAttention(nn.Module):
             "urgency": self.urgency_head(pooled),
             "brake_need": self.brake_need_head(pooled),
         }
+        assert_finite("risk_memory.logits", *logits.values())
         return memory, logits
 
     @staticmethod
@@ -68,6 +75,7 @@ class HistoricalRiskTemporalSelfAttention(nn.Module):
         losses = []
         for label_idx, name in enumerate(("risk_trend", "urgency", "brake_need")):
             raw_loss = F.cross_entropy(logits[name], labels[:, label_idx].long(), reduction="none")
+            assert_finite(f"risk_memory.aux_loss.{name}", raw_loss)
             losses.append((raw_loss * valid).sum() / valid_sum.clamp(min=1.0))
         return weight * sum(losses)
 

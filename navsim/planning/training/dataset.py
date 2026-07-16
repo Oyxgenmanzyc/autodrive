@@ -76,7 +76,10 @@ class CacheOnlyDataset(torch.utils.data.Dataset):
         :param idx: index of sample to load.
         :return: tuple of feature and target dictionary
         """
-        return self._load_scene_with_token(self.tokens[idx])
+        token = self.tokens[idx]
+        features, targets = self._load_scene_with_token(token)
+        features["_cache_token"] = token
+        return features, targets
 
     @staticmethod
     def _load_valid_caches(
@@ -285,4 +288,5 @@ class Dataset(torch.utils.data.Dataset):
             for builder in self._target_builders:
                 targets.update(builder.compute_targets(scene))
 
+        features["_cache_token"] = token
         return (features, targets)

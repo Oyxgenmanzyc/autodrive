@@ -172,3 +172,35 @@ Cache and training
 Verification
 - Added focused tests for preparation-zone activation, zero normal-scene loss, and gradient isolation to the GT-matched mode.
 - Local PyTorch tests are not run; server smoke test, cache build, and full training are pending.
+
+3.22 training-readiness and success-metric audit
+Date
+- 2026-07-16
+
+Purpose
+- Remove static code paths that could prevent the experiment from training cleanly or falsely suggest success.
+- Preserve the isolated brake-timing hypothesis, 20 anchors, classifier selection, and standard PDM evaluation.
+
+Corrections
+- Replaced the brake-timing zero-displacement vector norm with a FP32 epsilon-smoothed squared-distance square root, removing the mixed-precision undefined derivative at a valid stationary point.
+- Switched B200 training to `bf16-mixed`; custom backbone attention now computes QK logits, softmax, and attention-value aggregation in FP32 before returning to the active dtype.
+- Removed original-author absolute asset paths. Anchors and offline ResNet weights now resolve from explicit environment variables or `$NAVSIM_EXP_ROOT/pretrained`, with actionable startup errors.
+- Versioned risk-history features as `transfuser_feature_risk_history_v1`; an old baseline feature cache can no longer silently omit `history_risk_tokens`.
+- Versioned the refined front-track target as `transfuser_target_brake_timing_v2`; a complete cache rebuild is required.
+- Training now fails immediately when either the train or validation cache resolves to zero compatible samples.
+- A future front track now stops being continuous when it leaves the configured longitudinal/lateral front corridor.
+- Enabled the documented 1.0 gradient-norm clipping in the default training config for long mixed-precision runs.
+- Validation inference now reports brake-timing metrics for both the GT-anchor-matched candidate and the trajectory actually selected by the classifier.
+- Epoch metrics are reduced from active-scene sums and counts across DDP ranks, so sparse active scenes are not diluted by zero-valued batches.
+
+Failure indicators
+- `val/brake_timing_active_count == 0` means the supervision/evaluation slice is invalid and no improvement claim is supported.
+- `val/brake_timing_onset_abs_error_s` measures the supervised GT-matched candidate; `val/brake_timing_selected_onset_abs_error_s` measures the actual selected output.
+- `val/brake_timing_selected_late_rate`, jerk, acceleration oscillation, and speed MAE expose timing gains that trade away comfort or motion quality.
+- The experiment is unsuccessful unless the standard held-out PDM score improves over its baseline without regressions in safety/progress components; lower training loss alone is not a success criterion.
+
+Verification
+- Added tests for active-scene sufficient statistics, selected-trajectory diagnostics, front-corridor continuity, and incompatible cache names.
+- Python AST parsing passed for all modified Python files; `git diff --check` passed.
+- Standalone YAML parsing was unavailable in the local shell because PyYAML is not installed.
+- Training and PyTorch tests were not run locally; server cache generation, smoke test, full training, and held-out PDM comparison remain required.

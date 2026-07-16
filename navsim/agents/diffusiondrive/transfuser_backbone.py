@@ -4,6 +4,7 @@ Implements the TransFuser vision backbone.
 
 import copy
 import math
+from pathlib import Path
 
 import timm
 import torch
@@ -11,6 +12,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from navsim.agents.diffusiondrive.transfuser_config import TransfuserConfig
+from navsim.agents.diffusiondrive.modules.finite_trace import assert_finite
 
 
 class TransfuserBackbone(nn.Module):
@@ -20,12 +22,24 @@ class TransfuserBackbone(nn.Module):
 
         super().__init__()
         self.config = config
-        try:
-            self.image_encoder = timm.create_model(config.image_architecture, pretrained=True, features_only=True)
-        except Exception as e:
-            print(f"Failed to load image encoder with error: {e}")
-            self.image_encoder = timm.create_model(config.image_architecture, pretrained=True, features_only=True,
-                                                   pretrained_cfg_overlay=dict(file=config.bkb_path))
+        if config.bkb_path and Path(config.bkb_path).is_file():
+            self.image_encoder = timm.create_model(
+                config.image_architecture,
+                pretrained=True,
+                features_only=True,
+                pretrained_cfg_overlay=dict(file=config.bkb_path),
+            )
+        else:
+            try:
+                self.image_encoder = timm.create_model(
+                    config.image_architecture, pretrained=True, features_only=True
+                )
+            except Exception as error:
+                raise FileNotFoundError(
+                    "ResNet-34 pretrained weights were unavailable from timm and no local file was found. "
+                    "Set DIFFUSIONDRIVE_BKB_PATH or place resnet34.a1_in1k.bin under "
+                    "$NAVSIM_EXP_ROOT/pretrained."
+                ) from error
         if config.use_ground_plane:
             in_channels = 2 * config.lidar_seq_len
         else:
@@ -68,6 +82,11 @@ class TransfuserBackbone(nn.Module):
                 for i in range(4)
             ]
         )
+        for fusion_index, transformer in enumerate(self.transformers):
+            for block_index, block in enumerate(transformer.blocks):
+                block.attn.trace_name = (
+                    f"backbone.fusion_{fusion_index}.block_{block_index}.self_attention"
+                )
         self.lidar_channel_to_img = nn.ModuleList(
             [
                 nn.Conv2d(
@@ -139,8 +158,11 @@ class TransfuserBackbone(nn.Module):
     def top_down(self, x):
 
         p5 = self.relu(self.c5_conv(x))
+        assert_finite("backbone.top_down.p5", p5)
         p4 = self.relu(self.up_conv5(self.upsample(p5)))
+        assert_finite("backbone.top_down.p4", p4)
         p3 = self.relu(self.up_conv4(self.upsample2(p4)))
+        assert_finite("backbone.top_down.p3", p3)
 
         return p3
 
@@ -152,6 +174,8 @@ class TransfuserBackbone(nn.Module):
             lidar_list (list): list of input LiDAR BEV
         """
         image_features, lidar_features = image, lidar
+        assert_finite("backbone.input.camera", image_features)
+        assert_finite("backbone.input.lidar", lidar_features)
 
         if self.config.latent:
             batch_size = lidar.shape[0]
@@ -165,15 +189,21 @@ class TransfuserBackbone(nn.Module):
         # In some architectures the stem is not a return layer, so we need to skip it.
         if len(self.image_encoder.return_layers) > 4:
             image_features = self.forward_layer_block(image_layers, self.image_encoder.return_layers, image_features)
+            assert_finite("backbone.image_stem", image_features)
         if len(self.lidar_encoder.return_layers) > 4:
             lidar_features = self.forward_layer_block(lidar_layers, self.lidar_encoder.return_layers, lidar_features)
+            assert_finite("backbone.lidar_stem", lidar_features)
 
         # Loop through the 4 blocks of the network.
         for i in range(4):
             image_features = self.forward_layer_block(image_layers, self.image_encoder.return_layers, image_features)
             lidar_features = self.forward_layer_block(lidar_layers, self.lidar_encoder.return_layers, lidar_features)
+            assert_finite(f"backbone.stage_{i}.image_encoder", image_features)
+            assert_finite(f"backbone.stage_{i}.lidar_encoder", lidar_features)
 
             image_features, lidar_features = self.fuse_features(image_features, lidar_features, i)
+            assert_finite(f"backbone.stage_{i}.image_fused", image_features)
+            assert_finite(f"backbone.stage_{i}.lidar_fused", lidar_features)
 
         if self.config.detect_boxes or self.config.use_bev_semantic:
             x4 = lidar_features
@@ -228,11 +258,19 @@ class TransfuserBackbone(nn.Module):
         """
         image_embd_layer = self.avgpool_img(image_features)
         lidar_embd_layer = self.avgpool_lidar(lidar_features)
+        assert_finite(f"backbone.fusion_{layer_idx}.pooled", image_embd_layer, lidar_embd_layer)
 
         lidar_embd_layer = self.lidar_channel_to_img[layer_idx](lidar_embd_layer)
+        assert_finite(f"backbone.fusion_{layer_idx}.lidar_projection", lidar_embd_layer)
 
         image_features_layer, lidar_features_layer = self.transformers[layer_idx](image_embd_layer, lidar_embd_layer)
+        assert_finite(
+            f"backbone.fusion_{layer_idx}.transformer",
+            image_features_layer,
+            lidar_features_layer,
+        )
         lidar_features_layer = self.img_channel_to_lidar[layer_idx](lidar_features_layer)
+        assert_finite(f"backbone.fusion_{layer_idx}.image_to_lidar", lidar_features_layer)
 
         image_features_layer = F.interpolate(
             image_features_layer,
@@ -320,10 +358,15 @@ class GPT(nn.Module):
         lidar_tensor = lidar_tensor.permute(0, 2, 3, 1).contiguous().view(bz, -1, self.n_embd)
 
         token_embeddings = torch.cat((image_tensor, lidar_tensor), dim=1)
+        assert_finite("backbone.gpt.token_embeddings", token_embeddings)
 
         x = self.drop(self.pos_emb + token_embeddings)
-        x = self.blocks(x)  # (B, an * T, C)
+        assert_finite("backbone.gpt.position_dropout", x)
+        for block_index, block in enumerate(self.blocks):
+            x = block(x)
+            assert_finite(f"backbone.gpt.block_{block_index}", x)
         x = self.ln_f(x)  # (B, an * T, C)
+        assert_finite("backbone.gpt.final_norm", x)
 
         image_tensor_out = (
             x[:, : self.seq_len * self.config.img_vert_anchors * self.config.img_horz_anchors, :]
@@ -364,6 +407,7 @@ class SelfAttention(nn.Module):
         # output projection
         self.proj = nn.Linear(n_embd, n_embd)
         self.n_head = n_head
+        self.trace_name = "backbone.self_attention"
 
     def forward(self, x):
         b, t, c = x.size()
@@ -373,16 +417,25 @@ class SelfAttention(nn.Module):
         k = self.key(x).view(b, t, self.n_head, c // self.n_head).transpose(1, 2)  # (b, nh, t, hs)
         q = self.query(x).view(b, t, self.n_head, c // self.n_head).transpose(1, 2)  # (b, nh, t, hs)
         v = self.value(x).view(b, t, self.n_head, c // self.n_head).transpose(1, 2)  # (b, nh, t, hs)
+        assert_finite(f"{self.trace_name}.qkv", q, k, v)
 
         # self-attend: (b, nh, t, hs) x (b, nh, hs, t) -> (b, nh, t, t)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = F.softmax(att, dim=-1)
-        att = self.attn_drop(att)
-        y = att @ v  # (b, nh, t, t) x (b, nh, t, hs) -> (b, nh, t, hs)
+        # Keep the score calculation and softmax in FP32. LayerNorm cannot
+        # prevent FP16 q@k logits from overflowing before normalization.
+        with torch.autocast(device_type=q.device.type, enabled=False):
+            att = (q.float() @ k.float().transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            assert_finite(f"{self.trace_name}.logits", att)
+            att = F.softmax(att, dim=-1)
+            assert_finite(f"{self.trace_name}.softmax", att)
+            att = self.attn_drop(att)
+            y = att @ v.float()
+        y = y.to(dtype=v.dtype)  # (b, nh, t, t) x (b, nh, t, hs) -> (b, nh, t, hs)
+        assert_finite(f"{self.trace_name}.weighted_value", y)
         y = y.transpose(1, 2).contiguous().view(b, t, c)  # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_drop(self.proj(y))
+        assert_finite(f"{self.trace_name}.output", y)
         return y
 
 

@@ -39,6 +39,14 @@ class TransfuserFeatureBuilder(AbstractFeatureBuilder):
 
     def get_unique_name(self) -> str:
         """Inherited, see superclass."""
+        if (
+            self._config.use_risk_gate
+            or self._config.use_historical_risk_attention
+            or self._config.use_temporal_risk_cross_attention
+            or self._config.use_risk_shadow_evaluator
+            or self._config.use_soft_risk_rescore
+        ):
+            return "transfuser_feature_risk_history_v1"
         return "transfuser_feature"
 
     def compute_features(self, agent_input: AgentInput) -> Dict[str, torch.Tensor]:
@@ -147,7 +155,9 @@ class TransfuserTargetBuilder(AbstractTargetBuilder):
     def get_unique_name(self) -> str:
         """Inherited, see superclass."""
         if self._config.use_step_brake_timing_loss:
-            return "transfuser_target_brake_timing_v1"
+            return "transfuser_target_brake_timing_v2"
+        if self._config.use_memory_aux_loss:
+            return "transfuser_target_risk_aux_v1"
         return "transfuser_target"
 
     def compute_targets(self, scene: Scene) -> Dict[str, torch.Tensor]:

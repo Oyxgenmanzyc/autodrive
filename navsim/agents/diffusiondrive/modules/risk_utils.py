@@ -337,6 +337,9 @@ def build_gt_brake_timing_context(scene: Any, config: Any) -> np.ndarray:
     origin_pose = np.asarray(current_frame.ego_status.ego_pose, dtype=np.float64)
     first_future_front = None
     continuous_steps = 0
+    x_min = float(_cfg(config, "risk_front_x_min", 1.0))
+    x_max = float(_cfg(config, "risk_front_x_max", 32.0))
+    y_abs = float(_cfg(config, "risk_front_y_abs", 1.8))
     for step in range(num_poses):
         frame_idx = current_idx + step + 1
         if frame_idx >= len(scene.frames):
@@ -346,8 +349,17 @@ def build_gt_brake_timing_context(scene: Any, config: Any) -> np.ndarray:
             track_idx = frame.annotations.track_tokens.index(front["track_token"])
         except ValueError:
             break
+        tracked_box = frame.annotations.boxes[track_idx]
+        tracked_name = frame.annotations.names[track_idx]
+        if (
+            tracked_name != "vehicle"
+            or float(tracked_box[0]) < x_min
+            or float(tracked_box[0]) > x_max
+            or abs(float(tracked_box[1])) > y_abs
+        ):
+            break
         transformed = _box_in_origin_frame(
-            frame.annotations.boxes[track_idx],
+            tracked_box,
             np.asarray(frame.ego_status.ego_pose, dtype=np.float64),
             origin_pose,
         )

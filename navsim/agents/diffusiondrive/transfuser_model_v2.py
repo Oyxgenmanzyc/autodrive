@@ -1,4 +1,5 @@
 from typing import Dict
+from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
@@ -18,7 +19,11 @@ from navsim.agents.diffusiondrive.modules.risk_attention import (
 )
 from navsim.agents.diffusiondrive.modules.risk_gate import select_risk_gated_mode
 from navsim.agents.diffusiondrive.modules.risk_shadow import evaluate_risk_shadow
-from navsim.agents.diffusiondrive.modules.risk_brake_timing import compute_brake_timing_loss
+from navsim.agents.diffusiondrive.modules.risk_brake_timing import (
+    compute_brake_timing_diagnostics,
+    compute_brake_timing_loss,
+)
+from navsim.agents.diffusiondrive.modules.finite_trace import assert_finite, assert_tree_finite
 from torch.nn import TransformerDecoder,TransformerDecoderLayer
 from typing import Any, List, Dict, Optional, Union
 class V2TransfuserModel(nn.Module):
@@ -106,19 +111,28 @@ class V2TransfuserModel(nn.Module):
         lidar_feature: torch.Tensor = features["lidar_feature"]
         status_feature: torch.Tensor = features["status_feature"]
         history_risk_tokens: Optional[torch.Tensor] = features.get("history_risk_tokens")
+        assert_finite("model.input.camera", camera_feature)
+        assert_finite("model.input.lidar", lidar_feature)
+        assert_finite("model.input.status", status_feature)
+        assert_finite("model.input.history_risk", history_risk_tokens)
 
         batch_size = status_feature.shape[0]
 
         bev_feature_upscale, bev_feature, _ = self._backbone(camera_feature, lidar_feature)
+        assert_finite("model.backbone.bev_upscale", bev_feature_upscale)
+        assert_finite("model.backbone.bev_fused", bev_feature)
         cross_bev_feature = bev_feature_upscale
         bev_spatial_shape = bev_feature_upscale.shape[2:]
         concat_cross_bev_shape = bev_feature.shape[2:]
         bev_feature = self._bev_downscale(bev_feature).flatten(-2, -1)
         bev_feature = bev_feature.permute(0, 2, 1)
         status_encoding = self._status_encoding(status_feature)
+        assert_finite("model.bev_downscale", bev_feature)
+        assert_finite("model.status_encoding", status_encoding)
 
         keyval = torch.concatenate([bev_feature, status_encoding[:, None]], dim=1)
         keyval += self._keyval_embedding.weight[None, ...]
+        assert_finite("model.decoder.keyval", keyval)
 
         concat_cross_bev = keyval[:,:-1].permute(0,2,1).contiguous().view(batch_size, -1, concat_cross_bev_shape[0], concat_cross_bev_shape[1])
         # upsample to the same shape as bev_feature_upscale
@@ -129,10 +143,13 @@ class V2TransfuserModel(nn.Module):
 
         cross_bev_feature = self.bev_proj(cross_bev_feature.flatten(-2,-1).permute(0,2,1))
         cross_bev_feature = cross_bev_feature.permute(0,2,1).contiguous().view(batch_size, -1, bev_spatial_shape[0], bev_spatial_shape[1])
+        assert_finite("model.cross_bev_feature", cross_bev_feature)
         query = self._query_embedding.weight[None, ...].repeat(batch_size, 1, 1)
         query_out = self._tf_decoder(query, keyval)
+        assert_finite("model.tf_decoder.query_out", query_out)
 
         bev_semantic_map = self._bev_semantic_head(bev_feature_upscale)
+        assert_finite("model.bev_semantic_map", bev_semantic_map)
         trajectory_query, agents_query = query_out.split(self._query_splits, dim=1)
 
         output: Dict[str, torch.Tensor] = {"bev_semantic_map": bev_semantic_map}
@@ -363,27 +380,36 @@ class CustomTransformerDecoderLayer(nn.Module):
                 history_risk_memory=None,
                 global_img=None):
         traj_feature = self.cross_bev_attention(traj_feature,noisy_traj_points,bev_feature,bev_spatial_shape)
+        assert_finite("trajectory_decoder.cross_bev", traj_feature)
         traj_feature = traj_feature + self.dropout(self.cross_agent_attention(traj_feature, agents_query,agents_query)[0])
+        assert_finite("trajectory_decoder.cross_agent_residual", traj_feature)
         traj_feature = self.norm1(traj_feature)
+        assert_finite("trajectory_decoder.norm1", traj_feature)
         
         # traj_feature = traj_feature + self.dropout(self.self_attn(traj_feature, traj_feature, traj_feature)[0])
 
         # 4.5 cross attention with  ego query
         traj_feature = traj_feature + self.dropout1(self.cross_ego_attention(traj_feature, ego_query,ego_query)[0])
+        assert_finite("trajectory_decoder.cross_ego_residual", traj_feature)
         traj_feature = self.norm2(traj_feature)
+        assert_finite("trajectory_decoder.norm2", traj_feature)
 
         if self.use_temporal_risk_cross_attention and history_risk_memory is not None:
             traj_feature = self.temporal_risk_attention(traj_feature, noisy_traj_points, history_risk_memory)
         
         # 4.6 feedforward network
         traj_feature = self.norm3(self.ffn(traj_feature))
+        assert_finite("trajectory_decoder.ffn_norm", traj_feature)
         # 4.8 modulate with time steps
         traj_feature = self.time_modulation(traj_feature, time_embed,global_cond=None,global_img=global_img)
+        assert_finite("trajectory_decoder.time_modulation", traj_feature)
         
         # 4.9 predict the offset & heading
         poses_reg, poses_cls = self.task_decoder(traj_feature) #bs,20,8,3; bs,20
+        assert_finite("trajectory_decoder.raw_prediction", poses_reg, poses_cls)
         poses_reg[...,:2] = poses_reg[...,:2] + noisy_traj_points
         poses_reg[..., StateSE2Index.HEADING] = poses_reg[..., StateSE2Index.HEADING].tanh() * np.pi
+        assert_finite("trajectory_decoder.refined_prediction", poses_reg, poses_cls)
 
         return poses_reg, poses_cls
 def _get_clones(module, N):
@@ -460,7 +486,18 @@ class TrajectoryHead(nn.Module):
         )
 
 
+        if not plan_anchor_path or not Path(plan_anchor_path).is_file():
+            raise FileNotFoundError(
+                "DiffusionDrive plan anchors were not found. Set DIFFUSIONDRIVE_PLAN_ANCHOR_PATH "
+                "or place kmeans_navsim_traj_20.npy under $NAVSIM_EXP_ROOT/pretrained."
+            )
         plan_anchor = np.load(plan_anchor_path)
+        expected_anchor_shape = (self.ego_fut_mode, self._num_poses, 2)
+        if plan_anchor.shape != expected_anchor_shape:
+            raise ValueError(
+                f"Expected plan anchors with shape {expected_anchor_shape}, got {plan_anchor.shape} "
+                f"from {plan_anchor_path}."
+            )
 
         self.plan_anchor = nn.Parameter(
             torch.tensor(plan_anchor, dtype=torch.float32),
@@ -565,6 +602,7 @@ class TrajectoryHead(nn.Module):
                 agent_states,
                 agent_labels,
                 bev_semantic_map,
+                targets,
             )
 
 
@@ -582,6 +620,8 @@ class TrajectoryHead(nn.Module):
         bs = ego_query.shape[0]
         device = ego_query.device
         history_risk_memory, risk_aux_loss = self._encode_history_risk(history_risk_tokens, targets)
+        assert_finite("trajectory.history_risk_memory", history_risk_memory)
+        assert_finite("trajectory.memory_aux_loss", risk_aux_loss)
         # 1. add truncated noise to the plan anchor
         plan_anchor = self.plan_anchor.unsqueeze(0).repeat(bs,1,1,1)
         odo_info_fut = self.norm_odo(plan_anchor)
@@ -597,6 +637,7 @@ class TrajectoryHead(nn.Module):
         ).float()
         noisy_traj_points = torch.clamp(noisy_traj_points, min=-1, max=1)
         noisy_traj_points = self.denorm_odo(noisy_traj_points)
+        assert_finite("trajectory.noisy_traj_points", noisy_traj_points)
 
         ego_fut_mode = noisy_traj_points.shape[1]
         # 2. proj noisy_traj_points to the query
@@ -604,9 +645,11 @@ class TrajectoryHead(nn.Module):
         traj_pos_embed = traj_pos_embed.flatten(-2)
         traj_feature = self.plan_anchor_encoder(traj_pos_embed)
         traj_feature = traj_feature.view(bs,ego_fut_mode,-1)
+        assert_finite("trajectory.initial_feature", traj_feature)
         # 3. embed the timesteps
         time_embed = self.time_mlp(timesteps)
         time_embed = time_embed.view(bs,1,-1)
+        assert_finite("trajectory.time_embedding", time_embed)
 
 
         # 4. begin the stacked decoder
@@ -622,11 +665,14 @@ class TrajectoryHead(nn.Module):
             history_risk_memory,
             global_img,
         )
+        assert_tree_finite("trajectory.decoder.poses_reg", poses_reg_list)
+        assert_tree_finite("trajectory.decoder.poses_cls", poses_cls_list)
 
         trajectory_loss_dict = {}
         ret_traj_loss = 0
         for idx, (poses_reg, poses_cls) in enumerate(zip(poses_reg_list, poses_cls_list)):
             trajectory_loss = self.loss_computer(poses_reg, poses_cls, targets, plan_anchor)
+            assert_finite(f"trajectory.loss.layer_{idx}", trajectory_loss)
             trajectory_loss_dict[f"trajectory_loss_{idx}"] = trajectory_loss
             ret_traj_loss += trajectory_loss
 
@@ -658,6 +704,7 @@ class TrajectoryHead(nn.Module):
         agent_states=None,
         agent_labels=None,
         bev_semantic_map=None,
+        targets=None,
     ) -> Dict[str, torch.Tensor]:
         step_num = 2
         bs = ego_query.shape[0]
@@ -743,6 +790,16 @@ class TrajectoryHead(nn.Module):
         gather_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
         best_reg = torch.gather(poses_reg, 1, gather_idx).squeeze(1)
         output = {"trajectory": best_reg}
+        if self._config.use_step_brake_timing_loss and targets is not None:
+            output.update(compute_brake_timing_loss(poses_reg, targets, self.plan_anchor, self._config))
+            output.update(
+                compute_brake_timing_diagnostics(
+                    best_reg,
+                    targets,
+                    self._config,
+                    prefix="brake_timing_selected",
+                )
+            )
         if risk_diagnostics:
             risk_diagnostics["risk_selected_mode"] = mode_idx.float()
             risk_diagnostics["risk_selection_changed"] = (mode_idx != raw_mode).float()

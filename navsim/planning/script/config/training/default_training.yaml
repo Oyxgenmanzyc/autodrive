@@ -38,7 +38,7 @@ trainer:
 
     accelerator: gpu  # distribution method
     strategy: ddp
-    precision: 16-mixed  # floating point precision
+    precision: bf16-mixed  # B200 supports BF16; it retains FP32-like exponent range
     num_nodes: 1  # Number of nodes used for training
 
     num_sanity_val_steps: 0  # number of validation steps to run before training begins
@@ -46,6 +46,6 @@ trainer:
 
     accumulate_grad_batches: 1  # accumulates gradients every n batches
     # track_grad_norm: -1  # logs the p-norm for inspection
-    gradient_clip_val: 0.0  # value to clip gradients
+    gradient_clip_val: 1.0  # prevent long mixed-precision runs from poisoning shared decoder weights
     gradient_clip_algorithm: norm  # [value, norm] method to clip gradients
     default_root_dir: ${output_dir}

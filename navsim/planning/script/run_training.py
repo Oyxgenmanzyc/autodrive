@@ -122,6 +122,15 @@ def main(cfg: DictConfig) -> None:
         train_data, val_data = build_datasets(cfg, agent)
 
     logger.info("Building Datasets")
+    if len(train_data) == 0:
+        raise RuntimeError(
+            "Training dataset is empty. Rebuild the cache with the current agent config; "
+            "3.22 requires transfuser_feature_risk_history_v1 and transfuser_target_brake_timing_v2."
+        )
+    if len(val_data) == 0:
+        raise RuntimeError(
+            "Validation dataset is empty. Rebuild the cache before training so success metrics are meaningful."
+        )
     train_dataloader = DataLoader(train_data, **cfg.dataloader.params, shuffle=True)
     logger.info("Num training samples: %d", len(train_data))
     val_dataloader = DataLoader(val_data, **cfg.dataloader.params, shuffle=False)
