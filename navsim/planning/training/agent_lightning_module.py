@@ -72,8 +72,19 @@ class AgentLightningModule(pl.LightningModule):
                 if owner == metric_prefix and key.endswith("_sum"):
                     derived[key[:-4]] = value / active_denom
 
-            for count_name in ("scene_count", "pre_risk_count", "gt_brake_count", "active_count"):
-                derived[f"{metric_prefix}_{count_name}"] = stats[f"{metric_prefix}_{count_name}"]
+            count_names = (
+                "scene_count",
+                "pre_risk_count",
+                "gt_brake_count",
+                "active_count",
+                "reliable_front_count",
+                "ttc_trigger_count",
+                "thw_trigger_count",
+            )
+            for count_name in count_names:
+                stats_key = f"{metric_prefix}_{count_name}"
+                if stats_key in stats:
+                    derived[stats_key] = stats[stats_key]
 
             for key, value in derived.items():
                 self.log(

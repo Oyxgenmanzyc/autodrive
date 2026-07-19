@@ -155,7 +155,7 @@ class TransfuserTargetBuilder(AbstractTargetBuilder):
     def get_unique_name(self) -> str:
         """Inherited, see superclass."""
         if self._config.use_step_brake_timing_loss:
-            return "transfuser_target_brake_timing_v2"
+            return "transfuser_target_brake_timing_v3"
         if self._config.use_memory_aux_loss:
             return "transfuser_target_risk_aux_v1"
         return "transfuser_target"

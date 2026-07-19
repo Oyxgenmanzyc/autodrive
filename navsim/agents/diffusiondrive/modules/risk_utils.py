@@ -322,12 +322,12 @@ def _speed_dependent_t1(ego_v: float) -> float:
 
 
 def build_gt_brake_timing_context(scene: Any, config: Any) -> np.ndarray:
-    """Build training-only TTC context for brake-timing supervision."""
+    """Build training-only TTC/THW trend context for brake-timing supervision."""
 
     num_poses = int(config.trajectory_sampling.num_poses)
     dt = max(float(_cfg(config, "risk_history_dt", 0.5)), 1e-3)
     ttc_max = float(_cfg(config, "risk_ttc_max", 10.0))
-    context = np.zeros(5, dtype=np.float32)
+    context = np.zeros(7, dtype=np.float32)
     current_idx = scene.scene_metadata.num_history_frames - 1
     current_frame = scene.frames[current_idx]
     front = _select_front_vehicle(current_frame.annotations, config, preferred_track_token=None)
@@ -373,7 +373,9 @@ def build_gt_brake_timing_context(scene: Any, config: Any) -> np.ndarray:
     )
     rel_v = max(ego_v - float(front["lead_v"]), 0.0)
     current_ttc = min(float(front["gap"]) / max(rel_v, 1e-3), ttc_max) if rel_v > 0.1 else ttc_max
+    current_thw = min(float(front["gap"]) / max(ego_v, 1e-3), ttc_max) if ego_v > 0.1 else ttc_max
     delayed_ttc = ttc_max
+    delayed_thw = ttc_max
     if first_future_front is not None:
         gt_ego = scene.get_future_trajectory(num_trajectory_frames=num_poses).poses
         delayed_gap = max(
@@ -386,8 +388,17 @@ def build_gt_brake_timing_context(scene: Any, config: Any) -> np.ndarray:
         delayed_rel_v = max((float(front["gap"]) - delayed_gap) / dt, 0.0)
         if delayed_rel_v > 0.1:
             delayed_ttc = min(delayed_gap / delayed_rel_v, ttc_max)
+        delayed_thw = min(delayed_gap / max(ego_v, 1e-3), ttc_max) if ego_v > 0.1 else ttc_max
 
-    context[:] = [ego_v, current_ttc, delayed_ttc, _speed_dependent_t1(ego_v), float(continuous_steps)]
+    context[:] = [
+        ego_v,
+        current_ttc,
+        delayed_ttc,
+        _speed_dependent_t1(ego_v),
+        float(continuous_steps),
+        current_thw,
+        delayed_thw,
+    ]
     return context
 
 

@@ -13,12 +13,12 @@ config:
 
   latent: False
   use_risk_gate: False
-  use_historical_risk_attention: True
+  use_historical_risk_attention: False
   use_temporal_risk_cross_attention: False
-  use_memory_aux_loss: True
+  use_memory_aux_loss: False
   use_step_brake_timing_loss: True
   use_risk_shadow_evaluator: False
   use_soft_risk_rescore: False
 
 checkpoint_path: null
-lr: 6e-4
+lr: 3e-4

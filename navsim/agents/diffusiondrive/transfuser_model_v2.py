@@ -22,6 +22,7 @@ from navsim.agents.diffusiondrive.modules.risk_shadow import evaluate_risk_shado
 from navsim.agents.diffusiondrive.modules.risk_brake_timing import (
     compute_brake_timing_diagnostics,
     compute_brake_timing_loss,
+    compute_output_brake_diagnostics,
 )
 from navsim.agents.diffusiondrive.modules.finite_trace import assert_finite, assert_tree_finite
 from torch.nn import TransformerDecoder,TransformerDecoderLayer
@@ -170,6 +171,16 @@ class V2TransfuserModel(nn.Module):
             bev_semantic_map=bev_semantic_map,
         )
         output.update(trajectory)
+
+        if not self.training:
+            # status_feature = command[4], ego_velocity[2], ego_acceleration[2].
+            output.update(
+                compute_output_brake_diagnostics(
+                    output["trajectory"],
+                    status_feature[:, 4],
+                    self._config,
+                )
+            )
 
         output.update(agents)
 

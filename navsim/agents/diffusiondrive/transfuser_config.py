@@ -82,6 +82,8 @@ class TransfuserConfig:
     brake_timing_temperature: float = 0.35
     brake_timing_profile_weight: float = 0.25
     brake_timing_preparation_time: float = 1.0
+    brake_timing_anticipation_horizon: float = 1.5
+    brake_timing_thw_threshold: float = 2.0
 
     # 3.20 stage-1 shadow evaluator. These settings add no trainable parameters.
     risk_shadow_agent_confidence: float = 0.35
