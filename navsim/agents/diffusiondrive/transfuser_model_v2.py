@@ -19,10 +19,12 @@ from navsim.agents.diffusiondrive.modules.risk_attention import (
 )
 from navsim.agents.diffusiondrive.modules.risk_gate import select_risk_gated_mode
 from navsim.agents.diffusiondrive.modules.risk_shadow import evaluate_risk_shadow
+from navsim.agents.diffusiondrive.modules.longitudinal_safety_shield import (
+    apply_longitudinal_safety_shield,
+)
 from navsim.agents.diffusiondrive.modules.risk_brake_timing import (
     compute_brake_timing_diagnostics,
     compute_brake_timing_loss,
-    compute_output_brake_diagnostics,
 )
 from navsim.agents.diffusiondrive.modules.finite_trace import assert_finite, assert_tree_finite
 from torch.nn import TransformerDecoder,TransformerDecoderLayer
@@ -171,16 +173,6 @@ class V2TransfuserModel(nn.Module):
             bev_semantic_map=bev_semantic_map,
         )
         output.update(trajectory)
-
-        if not self.training:
-            # status_feature = command[4], ego_velocity[2], ego_acceleration[2].
-            output.update(
-                compute_output_brake_diagnostics(
-                    output["trajectory"],
-                    status_feature[:, 4],
-                    self._config,
-                )
-            )
 
         output.update(agents)
 
@@ -798,9 +790,51 @@ class TrajectoryHead(nn.Module):
             mode_idx = select_risk_gated_mode(poses_reg, poses_cls, history_risk_tokens, self._config)
         else:
             mode_idx = raw_mode
-        gather_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
-        best_reg = torch.gather(poses_reg, 1, gather_idx).squeeze(1)
-        output = {"trajectory": best_reg}
+        gather_idx = mode_idx[...,None,None,None].repeat(
+            1,
+            1,
+            self._num_poses,
+            3,
+        )
+
+        best_reg = torch.gather(
+            poses_reg,
+            1,
+            gather_idx,
+        ).squeeze(1)
+
+        output = {
+            "trajectory": best_reg,
+        }
+
+        if (
+            self._config.use_longitudinal_safety_shield
+            and history_risk_tokens is not None
+        ):
+            raw_best_reg = best_reg
+
+            best_reg, shield_diagnostics = (
+                apply_longitudinal_safety_shield(
+                    raw_best_reg,
+                    history_risk_tokens,
+                    agent_states,
+                    agent_labels,
+                    self._config,
+                )
+            )
+
+            output["trajectory"] = best_reg
+
+            # 原始88.4轨迹作为同一次推理的精确反事实。
+            output["risk_counterfactual_trajectory"] = (
+                raw_best_reg
+            )
+
+            output["risk_counterfactual_active"] = (
+                shield_diagnostics["shield_active"]
+            )
+
+            output.update(shield_diagnostics)
         if self._config.use_step_brake_timing_loss and targets is not None:
             output.update(compute_brake_timing_loss(poses_reg, targets, self.plan_anchor, self._config))
             output.update(

@@ -204,30 +204,30 @@ Verification
 - Python AST parsing passed for all modified Python files; `git diff --check` passed.
 - Standalone YAML parsing was unavailable in the local shell because PyYAML is not installed.
 - Training and PyTorch tests were not run locally; server cache generation, smoke test, full training, and held-out PDM comparison remain required.
-
-3.22.2 Lightweight anticipatory brake-timing supervision
+3.22 Endpoint-Conditioned Risk-Aware Temporal Transport
 Date
-- 2026-07-18
+- 2026-07-22
 
-Evidence
-- The 3.22 checkpoint completed 100 finite epochs and scored 0.884617944 on 11,881 valid navtest scenarios.
-- Against the available 3.11 token-matched CSV, the net gains were mainly drivable-area compliance (+0.00993) and ego progress (+0.00990); collision (+0.00181) and TTC (+0.00253) gains were smaller and not uniformly positive.
-- Brake-timing supervision covered only 290 / 18,179 validation scenes (1.595%). Its mean GT onset was 0.0069 s, showing that the old gate mostly selected scenes already braking at the first future step rather than earlier preparation scenes.
-- Final selected-trajectory jerk was close to GT (0.629 versus 0.538), acceleration oscillation was 0.0192, and minimum acceleration was close to GT (-1.45 versus -1.57 m/s^2). There is no evidence for adding a separate jerk or hard-deceleration rule.
-- `risk_counterfactual_pdm_valid` was zero for every valid 3.22 PDM row and carried no diagnostic information.
-- Historical risk memory was encoded and supervised, but Temporal Risk Cross-Attention was disabled. Therefore this memory had no path into trajectory decoding or inference selection.
-- Its train loss remained nonzero (0.1565 to 0.0453) while global pre-clip gradient norms ranged from 119 to 1,367. Because clipping is global at 1.0, this disconnected auxiliary task could still perturb the scale of updates to the main model.
+Purpose
+- Replace sparse thresholded GT brake-onset imitation with a continuous longitudinal timing target.
+- Preserve the GT-matched mode's geometry and terminal driving intent while improving the intermediate speed profile in high-confidence following scenes.
 
 Core changes
-- Disable historical-risk attention and memory auxiliary loss in the 3.22.2 experiment defaults. This removes the unused temporal encoder, four-frame risk feature construction, and historical sensor/cache requirement from the active model.
-- Keep the original 20-mode classifier, trajectory regression, diffusion decoder, selected-mode logic, and GT soft brake-profile target unchanged.
-- Extend the training-only context with current/delayed THW and project the observed 0.5 s TTC/THW trend over a 1.5 s anticipation horizon.
-- Activate timing supervision when a continuously tracked front vehicle is projected to enter either the speed-dependent TTC preparation boundary or THW <= 2.0 s, and the GT trajectory contains sustained braking.
-- Normal samples and risky samples without GT sustained braking still receive zero brake-timing gradient.
-- Replace the always-zero counterfactual PDM column with output-only braking diagnostics: onset, minimum acceleration, jerk, acceleration oscillation, final speed, and progress. These diagnostics require no GT and do not change trajectory selection.
+- TargetBuilder now constructs a training-only ST upper bound from the tracked GT front vehicle projected onto the GT path.
+- A bounded minimum-jerk search selects the maximum feasible terminal progress under front-vehicle, speed, acceleration, and jerk constraints.
+- The resulting target re-samples the original GT polyline by safe progress s(t); lateral geometry and the 20-mode architecture are unchanged.
+- The 3.22 auxiliary loss supervises continuous progress transport, terminal progress, ST-bound violation, acceleration, and jerk for only the GT-matched mode.
+- Existing onset metrics remain available as diagnostics. No GT box, future track, or transport target enters FeatureBuilder or inference.
 
-Cache and verification
-- The target schema is versioned as `transfuser_target_brake_timing_v3`; a fresh cache is mandatory.
-- The feature builder returns to the baseline `transfuser_feature` schema because historical risk tokens are no longer model inputs.
-- The experiment YAML retains the server-validated 3.22 defaults: lr=3e-4, batch_size=32, and num_workers=16.
-- Local execution tests are not run by default. Server cache generation, focused unit tests, full training, and held-out PDM evaluation remain required.
+Cache and experiment requirements
+- Enabling use_endpoint_conditioned_temporal_transport requires a fresh cache because the target name is transfuser_target_temporal_transport_v1.
+- Keep use_longitudinal_safety_shield=False during training. The shield remains an independent inference fallback.
+
+Expected diagnostics
+- brake_timing_active_rate and brake_timing_transport_teacher_shift measure supervision coverage and target displacement.
+- brake_timing_transport_progress_mae, brake_timing_transport_terminal_error, and brake_timing_transport_safety_violation measure whether the generated GT-matched mode learned the transport target.
+- brake_timing_late_rate and brake_timing_early_rate remain timing diagnostics against the optimized target.
+
+Verification
+- Added focused unit coverage for transport loss, GT-matched gradient isolation, path-preserving transport targets, and cache separation.
+- Local static/unit verification is pending; full cache, training, and navtest verification run on the server.

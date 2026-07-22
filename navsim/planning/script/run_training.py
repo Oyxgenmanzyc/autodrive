@@ -144,6 +144,7 @@ def main(cfg: DictConfig) -> None:
         model=lightning_module,
         train_dataloaders=train_dataloader,
         val_dataloaders=val_dataloader,
+        ckpt_path=cfg.get("resume_ckpt", None),
     )
 
 

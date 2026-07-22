@@ -70,26 +70,8 @@ def _brake_timing_observations(
     per_scene_loss = profile_weight * profile_loss + (1.0 - profile_weight) * onset_loss
 
     current_ttc, delayed_ttc, t1, continuous_steps = context[:, 1], context[:, 2], context[:, 3], context[:, 4]
-    if context.shape[-1] >= 7:
-        current_thw, delayed_thw = context[:, 5], context[:, 6]
-    else:
-        current_thw = current_ttc.new_full(current_ttc.shape, 10.0)
-        delayed_thw = current_thw
     preparation_time = float(_cfg(config, "brake_timing_preparation_time", 1.0))
-    anticipation_horizon = float(_cfg(config, "brake_timing_anticipation_horizon", 1.5))
-    thw_threshold = float(_cfg(config, "brake_timing_thw_threshold", 2.0))
-    ttc_max = float(_cfg(config, "risk_ttc_max", 10.0))
-
-    # Project the observed half-second trend forward. This moves supervision to
-    # scenes approaching risk, instead of waiting until TTC is already critical.
-    ttc_drop_rate = ((current_ttc - delayed_ttc) / dt).clamp_min(0.0)
-    thw_drop_rate = ((current_thw - delayed_thw) / dt).clamp_min(0.0)
-    projected_ttc = (delayed_ttc - anticipation_horizon * ttc_drop_rate).clamp(0.0, ttc_max)
-    projected_thw = (delayed_thw - anticipation_horizon * thw_drop_rate).clamp_min(0.0)
-    reliable_front = continuous_steps >= 2.0
-    ttc_trigger = reliable_front & (projected_ttc <= t1 + preparation_time)
-    thw_trigger = reliable_front & (projected_thw <= thw_threshold)
-    pre_risk = reliable_front & (ttc_trigger | thw_trigger)
+    pre_risk = (continuous_steps >= 2.0) & (torch.minimum(current_ttc, delayed_ttc) <= t1 + preparation_time)
     gt_onset = _sustained_brake_onset(gt_acceleration, threshold)
     pred_onset = _sustained_brake_onset(pred_acceleration, threshold)
     gt_has_sustained_brake = gt_onset < gt_acceleration.shape[-1]
@@ -120,14 +102,98 @@ def _brake_timing_observations(
         "pred_accel_oscillation": pred_oscillation,
         "current_ttc": current_ttc,
         "delayed_ttc": delayed_ttc,
-        "current_thw": current_thw,
-        "delayed_thw": delayed_thw,
-        "projected_ttc": projected_ttc,
-        "projected_thw": projected_thw,
-        "ttc_trigger": ttc_trigger,
-        "thw_trigger": thw_trigger,
-        "reliable_front": reliable_front,
         "continuous_front_steps": continuous_steps,
+    }
+
+
+def _trajectory_progress(poses: torch.Tensor) -> torch.Tensor:
+    origin = torch.zeros_like(poses[..., :1, :2])
+    displacement = torch.diff(torch.cat([origin, poses[..., :2]], dim=-2), dim=-2)
+    distance_sq = displacement.float().square().sum(dim=-1)
+    epsilon_root = distance_sq.new_tensor(1e-6)
+    step_distance = torch.sqrt(distance_sq + epsilon_root.square()) - epsilon_root
+    return step_distance.clamp_min(0.0).cumsum(dim=-1)
+
+
+def _temporal_transport_observations(
+    poses: torch.Tensor,
+    gt_target: torch.Tensor,
+    transport_target: torch.Tensor,
+    context: torch.Tensor,
+    upper_s: torch.Tensor,
+    constraint_mask: torch.Tensor,
+    transport_valid: torch.Tensor,
+    config: Any,
+) -> Dict[str, torch.Tensor]:
+    """Measure the GT-matched mode against the endpoint-conditioned ST target."""
+
+    dt = max(float(_cfg(config, "risk_history_dt", 0.5)), 1e-3)
+    threshold = float(_cfg(config, "brake_timing_accel_threshold", -0.5))
+    ego_v = context[:, 0].clamp(min=0.0)
+    pred_dynamics = _trajectory_dynamics(poses, ego_v, dt)
+    teacher_dynamics = _trajectory_dynamics(transport_target, ego_v, dt)
+    gt_dynamics = _trajectory_dynamics(gt_target, ego_v, dt)
+    pred_progress = _trajectory_progress(poses)
+    teacher_progress = _trajectory_progress(transport_target)
+    gt_progress = _trajectory_progress(gt_target)
+    constraint_mask = constraint_mask.float().clamp(0.0, 1.0)
+    constraint_denom = constraint_mask.sum(dim=-1).clamp(min=1.0)
+
+    progress_loss = F.smooth_l1_loss(pred_progress, teacher_progress, reduction="none").mean(dim=-1)
+    terminal_loss = F.smooth_l1_loss(pred_progress[:, -1], teacher_progress[:, -1], reduction="none")
+    safety_excess = (pred_progress - upper_s).clamp_min(0.0)
+    safety_loss = (safety_excess.square() * constraint_mask).sum(dim=-1) / constraint_denom
+    acceleration_loss = F.smooth_l1_loss(
+        pred_dynamics["acceleration"], teacher_dynamics["acceleration"], reduction="none"
+    ).mean(dim=-1)
+    jerk_loss = F.smooth_l1_loss(pred_dynamics["jerk"], teacher_dynamics["jerk"], reduction="none").mean(dim=-1)
+    raw_loss = (
+        float(_cfg(config, "transport_progress_weight", 1.0)) * progress_loss
+        + float(_cfg(config, "transport_terminal_weight", 1.0)) * terminal_loss
+        + float(_cfg(config, "transport_safety_weight", 2.0)) * safety_loss
+        + float(_cfg(config, "transport_acceleration_weight", 0.10)) * acceleration_loss
+        + float(_cfg(config, "transport_jerk_weight", 0.05)) * jerk_loss
+    )
+
+    current_ttc, delayed_ttc, t1, continuous_steps = context[:, 1], context[:, 2], context[:, 3], context[:, 4]
+    preparation_time = float(_cfg(config, "brake_timing_preparation_time", 1.0))
+    pre_risk = (continuous_steps >= 2.0) & (torch.minimum(current_ttc, delayed_ttc) <= t1 + preparation_time)
+    teacher_onset = _sustained_brake_onset(teacher_dynamics["acceleration"], threshold)
+    pred_onset = _sustained_brake_onset(pred_dynamics["acceleration"], threshold)
+    teacher_has_sustained_brake = teacher_onset < teacher_dynamics["acceleration"].shape[-1]
+    active = transport_valid.reshape(-1) > 0.5
+    onset_error = (pred_onset - teacher_onset).float() * dt
+    pred_oscillation = (
+        (pred_dynamics["acceleration"][:, 1:] * pred_dynamics["acceleration"][:, :-1] < 0.0)
+        & (pred_dynamics["acceleration"][:, 1:].abs() > 0.2)
+        & (pred_dynamics["acceleration"][:, :-1].abs() > 0.2)
+    ).float().mean(dim=-1)
+
+    return {
+        "pre_risk": pre_risk,
+        "gt_has_sustained_brake": teacher_has_sustained_brake,
+        "active": active,
+        "raw_loss": raw_loss,
+        "gt_onset_s": teacher_onset.float() * dt,
+        "pred_onset_s": pred_onset.float() * dt,
+        "onset_error_s": onset_error,
+        "onset_abs_error_s": onset_error.abs(),
+        "late_rate": (onset_error > 0.25).float(),
+        "early_rate": (onset_error < -0.25).float(),
+        "speed_mae": (pred_dynamics["speed"] - teacher_dynamics["speed"]).abs().mean(dim=-1),
+        "pred_min_accel": pred_dynamics["acceleration"].min(dim=-1).values,
+        "gt_min_accel": teacher_dynamics["acceleration"].min(dim=-1).values,
+        "pred_jerk_abs": pred_dynamics["jerk"].abs().mean(dim=-1),
+        "gt_jerk_abs": teacher_dynamics["jerk"].abs().mean(dim=-1),
+        "pred_accel_oscillation": pred_oscillation,
+        "current_ttc": current_ttc,
+        "delayed_ttc": delayed_ttc,
+        "continuous_front_steps": continuous_steps,
+        "transport_progress_mae": (pred_progress - teacher_progress).abs().mean(dim=-1),
+        "transport_terminal_error": (pred_progress[:, -1] - teacher_progress[:, -1]).abs(),
+        "transport_safety_violation": safety_excess.max(dim=-1).values,
+        "transport_constraint_steps": constraint_mask.sum(dim=-1),
+        "transport_teacher_shift": (teacher_progress - gt_progress).abs().max(dim=-1).values,
     }
 
 
@@ -145,19 +211,9 @@ def _summarize_observations(prefix: str, values: Dict[str, torch.Tensor]) -> Dic
         f"{prefix}_pre_risk_rate": pre_risk.float().mean().detach(),
         f"{prefix}_gt_brake_rate": gt_has_sustained_brake.float().mean().detach(),
         f"{prefix}_active_rate": active.float().mean().detach(),
-        f"{prefix}_ttc_trigger_count": values["ttc_trigger"].float().sum().detach(),
-        f"{prefix}_thw_trigger_count": values["thw_trigger"].float().sum().detach(),
-        f"{prefix}_reliable_front_count": values["reliable_front"].float().sum().detach(),
     }
     for name, per_scene_value in values.items():
-        if name in {
-            "pre_risk",
-            "gt_has_sustained_brake",
-            "active",
-            "ttc_trigger",
-            "thw_trigger",
-            "reliable_front",
-        }:
+        if name in {"pre_risk", "gt_has_sustained_brake", "active"}:
             continue
         result[f"{prefix}_{name}"] = _masked_mean(per_scene_value, active).detach()
         result[f"{prefix}_{name}_sum"] = _masked_sum(per_scene_value, active).detach()
@@ -170,7 +226,7 @@ def compute_brake_timing_loss(
     plan_anchor: torch.Tensor,
     config: Any,
 ) -> Dict[str, torch.Tensor]:
-    """Supervise the GT-matched mode's soft brake onset in pre-risk following scenes."""
+    """Supervise the GT-matched mode's longitudinal timing in pre-risk scenes."""
 
     required = ("trajectory", "brake_timing_context")
     if not all(key in targets for key in required):
@@ -185,7 +241,36 @@ def compute_brake_timing_loss(
     matched_mode = anchor_distance.argmin(dim=-1)
     gather_index = matched_mode[:, None, None, None].expand(-1, 1, poses.shape[-2], poses.shape[-1])
     matched_poses = torch.gather(poses, 1, gather_index).squeeze(1)
-    observations = _brake_timing_observations(matched_poses, target, context, config)
+    transport_keys = (
+        "temporal_transport_target",
+        "temporal_transport_upper_s",
+        "temporal_transport_constraint_mask",
+        "temporal_transport_valid",
+    )
+    if all(key in targets for key in transport_keys):
+        observations = _temporal_transport_observations(
+            matched_poses,
+            target,
+            torch.nan_to_num(
+                targets["temporal_transport_target"].to(poses.device).float(), nan=0.0, posinf=0.0, neginf=0.0
+            ),
+            context,
+            torch.nan_to_num(
+                targets["temporal_transport_upper_s"].to(poses.device).float(), nan=0.0, posinf=0.0, neginf=0.0
+            ),
+            torch.nan_to_num(
+                targets["temporal_transport_constraint_mask"].to(poses.device).float(),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ),
+            torch.nan_to_num(
+                targets["temporal_transport_valid"].to(poses.device).float(), nan=0.0, posinf=0.0, neginf=0.0
+            ),
+            config,
+        )
+    else:
+        observations = _brake_timing_observations(matched_poses, target, context, config)
     raw_loss = _masked_mean(observations["raw_loss"], observations["active"])
     total_loss = float(_cfg(config, "brake_timing_loss_weight", 0.1)) * raw_loss
     result = _summarize_observations("brake_timing", observations)
@@ -221,35 +306,43 @@ def compute_brake_timing_diagnostics(
         posinf=0.0,
         neginf=0.0,
     )
-    observations = _brake_timing_observations(trajectory, target, context, config)
+    transport_keys = (
+        "temporal_transport_target",
+        "temporal_transport_upper_s",
+        "temporal_transport_constraint_mask",
+        "temporal_transport_valid",
+    )
+    if all(key in targets for key in transport_keys):
+        observations = _temporal_transport_observations(
+            trajectory,
+            target,
+            torch.nan_to_num(
+                targets["temporal_transport_target"].to(trajectory.device).float(),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ),
+            context,
+            torch.nan_to_num(
+                targets["temporal_transport_upper_s"].to(trajectory.device).float(),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ),
+            torch.nan_to_num(
+                targets["temporal_transport_constraint_mask"].to(trajectory.device).float(),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ),
+            torch.nan_to_num(
+                targets["temporal_transport_valid"].to(trajectory.device).float(),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ),
+            config,
+        )
+    else:
+        observations = _brake_timing_observations(trajectory, target, context, config)
     return _summarize_observations(prefix, observations)
-
-
-@torch.no_grad()
-def compute_output_brake_diagnostics(
-    trajectory: torch.Tensor,
-    ego_v: torch.Tensor,
-    config: Any,
-) -> Dict[str, torch.Tensor]:
-    """Describe selected-trajectory braking without GT or extra sensors."""
-
-    trajectory = torch.nan_to_num(trajectory.float(), nan=0.0, posinf=0.0, neginf=0.0)
-    ego_v = torch.nan_to_num(ego_v.float(), nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
-    dt = max(float(_cfg(config, "risk_history_dt", 0.5)), 1e-3)
-    threshold = float(_cfg(config, "brake_timing_accel_threshold", -0.5))
-    dynamics = _trajectory_dynamics(trajectory, ego_v, dt)
-    acceleration = dynamics["acceleration"]
-    onset = _sustained_brake_onset(acceleration, threshold)
-    oscillation = (
-        (acceleration[:, 1:] * acceleration[:, :-1] < 0.0)
-        & (acceleration[:, 1:].abs() > 0.2)
-        & (acceleration[:, :-1].abs() > 0.2)
-    ).float().mean(dim=-1)
-    return {
-        "brake_output_onset_s": onset.float() * dt,
-        "brake_output_min_accel": acceleration.min(dim=-1).values,
-        "brake_output_jerk_abs": dynamics["jerk"].abs().mean(dim=-1),
-        "brake_output_accel_oscillation": oscillation,
-        "brake_output_final_speed": dynamics["speed"][:, -1],
-        "brake_output_progress": trajectory[:, -1, 0],
-    }

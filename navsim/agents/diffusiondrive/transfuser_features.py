@@ -19,6 +19,7 @@ from navsim.agents.diffusiondrive.transfuser_config import TransfuserConfig
 from navsim.agents.diffusiondrive.modules.risk_utils import (
     build_gt_brake_timing_context,
     build_gt_history_risk_targets,
+    build_gt_temporal_transport_target,
     build_history_risk_tokens,
 )
 from navsim.common.dataclasses import AgentInput, Scene, Annotations
@@ -45,6 +46,7 @@ class TransfuserFeatureBuilder(AbstractFeatureBuilder):
             or self._config.use_temporal_risk_cross_attention
             or self._config.use_risk_shadow_evaluator
             or self._config.use_soft_risk_rescore
+            or self._config.use_longitudinal_safety_shield
         ):
             return "transfuser_feature_risk_history_v1"
         return "transfuser_feature"
@@ -68,6 +70,7 @@ class TransfuserFeatureBuilder(AbstractFeatureBuilder):
             or self._config.use_temporal_risk_cross_attention
             or self._config.use_risk_shadow_evaluator
             or self._config.use_soft_risk_rescore
+            or self._config.use_longitudinal_safety_shield
         ):
             features["history_risk_tokens"] = torch.tensor(
                 build_history_risk_tokens(agent_input, self._config),
@@ -154,8 +157,13 @@ class TransfuserTargetBuilder(AbstractTargetBuilder):
 
     def get_unique_name(self) -> str:
         """Inherited, see superclass."""
+        if (
+            self._config.use_step_brake_timing_loss
+            and getattr(self._config, "use_endpoint_conditioned_temporal_transport", False)
+        ):
+            return "transfuser_target_temporal_transport_v1"
         if self._config.use_step_brake_timing_loss:
-            return "transfuser_target_brake_timing_v3"
+            return "transfuser_target_brake_timing_v2"
         if self._config.use_memory_aux_loss:
             return "transfuser_target_risk_aux_v1"
         return "transfuser_target"
@@ -187,6 +195,20 @@ class TransfuserTargetBuilder(AbstractTargetBuilder):
             targets["brake_timing_context"] = torch.tensor(
                 build_gt_brake_timing_context(scene, self._config), dtype=torch.float32
             )
+            if getattr(self._config, "use_endpoint_conditioned_temporal_transport", False):
+                transport_target = build_gt_temporal_transport_target(scene, self._config)
+                targets["temporal_transport_target"] = torch.tensor(
+                    transport_target["target"], dtype=torch.float32
+                )
+                targets["temporal_transport_upper_s"] = torch.tensor(
+                    transport_target["upper_s"], dtype=torch.float32
+                )
+                targets["temporal_transport_constraint_mask"] = torch.tensor(
+                    transport_target["constraint_mask"], dtype=torch.float32
+                )
+                targets["temporal_transport_valid"] = torch.tensor(
+                    transport_target["valid"], dtype=torch.float32
+                )
 
         return targets
 

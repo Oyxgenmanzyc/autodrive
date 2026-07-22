@@ -52,6 +52,7 @@ class TransfuserAgent(AbstractAgent):
         self._checkpoint_path = checkpoint_path
         self._transfuser_model = TransfuserModel(config)
         self._last_risk_debug: Dict[str, float] = {}
+        self._last_risk_counterfactual_trajectory = None
         self.init_from_pretrained()
 
     def init_from_pretrained(self):
@@ -88,7 +89,40 @@ class TransfuserAgent(AbstractAgent):
             state_dict: Dict[str, Any] = torch.load(self._checkpoint_path, map_location=torch.device("cpu"))[
                 "state_dict"
             ]
-        self.load_state_dict({k.replace("agent.", ""): v for k, v in state_dict.items()})
+        cleaned_state = {
+            key.replace("agent.", ""): value
+            for key, value in state_dict.items()
+        }
+
+        incompatible = self.load_state_dict(
+            cleaned_state,
+            strict=False,
+        )
+
+        bad_missing = [
+            key
+            for key in incompatible.missing_keys
+            if "history_risk_encoder" not in key
+        ]
+
+        bad_unexpected = [
+            key
+            for key in incompatible.unexpected_keys
+            if "history_risk_encoder" not in key
+        ]
+
+        if bad_missing or bad_unexpected:
+            raise RuntimeError(
+                "Unexpected checkpoint mismatch. "
+                f"missing={bad_missing}, "
+                f"unexpected={bad_unexpected}"
+            )
+
+        if incompatible.unexpected_keys:
+            print(
+                "[shield] ignored legacy risk-only keys: "
+                f"{len(incompatible.unexpected_keys)}"
+            )
 
 
     def get_sensor_config(self) -> SensorConfig:
@@ -99,6 +133,7 @@ class TransfuserAgent(AbstractAgent):
             or self._config.use_temporal_risk_cross_attention
             or self._config.use_risk_shadow_evaluator
             or self._config.use_soft_risk_rescore
+            or self._config.use_longitudinal_safety_shield
         ):
             return SensorConfig.build_all_sensors(include=[3])
 
@@ -131,6 +166,12 @@ class TransfuserAgent(AbstractAgent):
         """Return scalar shadow-risk diagnostics for the current scenario."""
         return dict(self._last_risk_debug)
 
+    def get_risk_counterfactual_trajectory(self) -> Optional[Trajectory]:
+        """Return the selected top-k shadow candidate for an active risk scene."""
+        if self._last_risk_counterfactual_trajectory is None:
+            return None
+        return Trajectory(self._last_risk_counterfactual_trajectory.copy())
+
     def compute_trajectory(self, agent_input: AgentInput) -> Trajectory:
         """Compute a trajectory and retain inference-only risk diagnostics."""
         self.eval()
@@ -142,8 +183,22 @@ class TransfuserAgent(AbstractAgent):
         with torch.no_grad():
             predictions = self.forward(features)
             self._last_risk_debug = {}
+            self._last_risk_counterfactual_trajectory = None
+            counterfactual_active = predictions.get("risk_counterfactual_active")
+            counterfactual_trajectory = predictions.get("risk_counterfactual_trajectory")
+            if (
+                torch.is_tensor(counterfactual_active)
+                and torch.is_tensor(counterfactual_trajectory)
+                and float(counterfactual_active.detach().float().mean().cpu().item()) > 0.5
+            ):
+                self._last_risk_counterfactual_trajectory = (
+                    counterfactual_trajectory.squeeze(0).detach().cpu().numpy()
+                )
             for key, value in predictions.items():
-                if not key.startswith(("risk_", "brake_output_")):
+                if (
+                    key == "risk_counterfactual_trajectory"
+                    or not key.startswith(("risk_", "shield_"))
+                ):
                     continue
                 if torch.is_tensor(value):
                     self._last_risk_debug[key] = float(value.detach().float().mean().cpu().item())

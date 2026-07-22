@@ -54,8 +54,28 @@ class TransfuserConfig:
     use_temporal_risk_cross_attention: bool = False
     use_memory_aux_loss: bool = False
     use_step_brake_timing_loss: bool = False
+    use_endpoint_conditioned_temporal_transport: bool = False
     use_risk_shadow_evaluator: bool = False
     use_soft_risk_rescore: bool = False
+    use_longitudinal_safety_shield: bool = False
+
+    # Inference-only PDM-aligned longitudinal safety shield.
+    shield_min_reliability: float = 0.50
+    shield_agent_only_confidence: float = 0.75
+    shield_time_headway: float = 0.75
+    shield_min_gap: float = 2.5
+    shield_max_gap: float = 8.0
+    shield_hard_clearance: float = 1.5
+    shield_clearance_trigger_margin: float = 0.25
+    shield_min_decel: float = 0.8
+    shield_max_decel: float = 3.5
+    shield_decel_margin: float = 0.35
+    shield_brake_delay: float = 0.5
+    shield_accept_progress_reduction: float = 4.0
+    shield_min_clearance_gain: float = 0.75
+    shield_min_consecutive_unsafe_steps: int = 2
+    shield_after_safe_gap_ratio: float = 0.75
+    shield_absolute_max_progress_reduction: float = 5.0
 
     # LiDAR-based history risk token settings
     risk_history_num_frames: int = 4
@@ -82,8 +102,22 @@ class TransfuserConfig:
     brake_timing_temperature: float = 0.35
     brake_timing_profile_weight: float = 0.25
     brake_timing_preparation_time: float = 1.0
-    brake_timing_anticipation_horizon: float = 1.5
-    brake_timing_thw_threshold: float = 2.0
+
+    # 3.22 endpoint-conditioned risk-aware temporal transport supervision.
+    transport_progress_weight: float = 1.0
+    transport_terminal_weight: float = 1.0
+    transport_safety_weight: float = 2.0
+    transport_acceleration_weight: float = 0.10
+    transport_jerk_weight: float = 0.05
+    transport_min_gap: float = 1.5
+    transport_time_headway: float = 0.75
+    transport_max_gap: float = 8.0
+    transport_min_front_steps: int = 2
+    transport_min_progress_shift: float = 0.10
+    transport_max_speed: float = 30.0
+    transport_max_accel: float = 3.0
+    transport_max_decel: float = 4.0
+    transport_max_jerk: float = 6.0
 
     # 3.20 stage-1 shadow evaluator. These settings add no trainable parameters.
     risk_shadow_agent_confidence: float = 0.35
