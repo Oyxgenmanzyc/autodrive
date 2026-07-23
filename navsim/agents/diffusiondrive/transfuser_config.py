@@ -55,6 +55,7 @@ class TransfuserConfig:
     use_memory_aux_loss: bool = False
     use_step_brake_timing_loss: bool = False
     use_endpoint_conditioned_temporal_transport: bool = False
+    use_all_mode_risk_corridor: bool = False
     use_risk_shadow_evaluator: bool = False
     use_soft_risk_rescore: bool = False
     use_longitudinal_safety_shield: bool = False
@@ -118,6 +119,18 @@ class TransfuserConfig:
     transport_max_accel: float = 3.0
     transport_max_decel: float = 4.0
     transport_max_jerk: float = 6.0
+
+    # 3.22 all-mode longitudinal risk corridor supervision.
+    risk_corridor_safety_weight: float = 2.0
+    risk_corridor_late_weight: float = 0.5
+    risk_corridor_early_weight: float = 0.5
+    risk_corridor_decel_weight: float = 0.05
+    risk_corridor_jerk_weight: float = 0.05
+    risk_corridor_preparation_time: float = 1.0
+    risk_corridor_early_accel_threshold: float = -0.5
+    risk_corridor_max_decel: float = 4.0
+    risk_corridor_jerk_free: float = 4.0
+    risk_corridor_min_mode_steps: int = 2
 
     # 3.20 stage-1 shadow evaluator. These settings add no trainable parameters.
     risk_shadow_agent_confidence: float = 0.35

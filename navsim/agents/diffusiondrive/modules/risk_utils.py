@@ -515,6 +515,8 @@ def build_gt_temporal_transport_target(scene: Any, config: Any) -> Dict[str, np.
         "upper_s": np.full(num_poses, unconstrained_bound, dtype=np.float32),
         "constraint_mask": np.zeros(num_poses, dtype=np.float32),
         "valid": np.zeros(1, dtype=np.float32),
+        "front_boxes": np.zeros((num_poses, 4), dtype=np.float32),
+        "front_mask": np.zeros(num_poses, dtype=np.float32),
     }
 
     current_idx = scene.scene_metadata.num_history_frames - 1
@@ -553,6 +555,8 @@ def build_gt_temporal_transport_target(scene: Any, config: Any) -> Dict[str, np.
             np.asarray(frame.ego_status.ego_pose, dtype=np.float64),
             origin_pose,
         )
+        result["front_boxes"][step] = transformed[:4]
+        result["front_mask"][step] = 1.0
         continuous_steps += 1
         front_s, lateral_distance = _project_to_path(transformed[:2], trajectory[:, :2], gt_progress)
         overlap_limit = 0.5 * (ego_width + max(float(transformed[3]), 0.5)) + lateral_margin
@@ -561,6 +565,9 @@ def build_gt_temporal_transport_target(scene: Any, config: Any) -> Dict[str, np.
         desired_gap = min(max(min_gap, time_headway * max(float(gt_speed[step]), 0.0)), max_gap)
         upper_s[step] = max(front_s - 0.5 * max(float(transformed[2]), 0.5) - ego_front_offset - desired_gap, 0.0)
         constraint_mask[step] = 1.0
+
+    if getattr(config, "use_all_mode_risk_corridor", False):
+        return result
 
     context = build_gt_brake_timing_context(scene, config)
     pre_risk = bool(

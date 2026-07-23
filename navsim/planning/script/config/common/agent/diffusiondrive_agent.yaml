@@ -18,6 +18,7 @@ config:
   use_memory_aux_loss: False
   use_step_brake_timing_loss: False
   use_endpoint_conditioned_temporal_transport: False
+  use_all_mode_risk_corridor: False
   use_risk_shadow_evaluator: False
   use_soft_risk_rescore: False
   use_longitudinal_safety_shield: True

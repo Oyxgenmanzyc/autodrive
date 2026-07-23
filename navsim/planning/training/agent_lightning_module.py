@@ -62,18 +62,33 @@ class AgentLightningModule(pl.LightningModule):
             scene_count = stats[f"{metric_prefix}_scene_count"].clamp(min=1.0)
             active_count = stats[f"{metric_prefix}_active_count"]
             active_denom = active_count.clamp(min=1.0)
+            metric_denom = active_denom
             derived = {
                 f"{metric_prefix}_pre_risk_rate": stats[f"{metric_prefix}_pre_risk_count"] / scene_count,
                 f"{metric_prefix}_gt_brake_rate": stats[f"{metric_prefix}_gt_brake_count"] / scene_count,
                 f"{metric_prefix}_active_rate": active_count / scene_count,
             }
+            mode_count_key = f"{metric_prefix}_mode_count"
+            active_mode_count_key = f"{metric_prefix}_active_mode_count"
+            if mode_count_key in stats and active_mode_count_key in stats:
+                active_mode_count = stats[active_mode_count_key]
+                metric_denom = active_mode_count.clamp(min=1.0)
+                derived[f"{metric_prefix}_active_mode_rate"] = (
+                    active_mode_count / stats[mode_count_key].clamp(min=1.0)
+                )
+                derived[f"{metric_prefix}_active_modes_per_active_scene"] = (
+                    active_mode_count / active_denom
+                )
             for key, value in stats.items():
                 owner = next((prefix for prefix in metric_prefixes if key.startswith(f"{prefix}_")), None)
                 if owner == metric_prefix and key.endswith("_sum"):
-                    derived[key[:-4]] = value / active_denom
+                    derived[key[:-4]] = value / metric_denom
 
             for count_name in ("scene_count", "pre_risk_count", "gt_brake_count", "active_count"):
                 derived[f"{metric_prefix}_{count_name}"] = stats[f"{metric_prefix}_{count_name}"]
+            if mode_count_key in stats and active_mode_count_key in stats:
+                derived[mode_count_key] = stats[mode_count_key]
+                derived[active_mode_count_key] = stats[active_mode_count_key]
 
             for key, value in derived.items():
                 self.log(

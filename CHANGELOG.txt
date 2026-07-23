@@ -231,3 +231,34 @@ Expected diagnostics
 Verification
 - Added focused unit coverage for transport loss, GT-matched gradient isolation, path-preserving transport targets, and cache separation.
 - Local static/unit verification is pending; full cache, training, and navtest verification run on the server.
+
+3.22.8 All-mode risk-corridor loss
+Date
+- 2026-07-23
+
+Evidence from 3.22.7
+- Endpoint transport supervision covered only 663 / 85,109 training scenes (0.779%).
+- Training late-brake rate fell from 57.9% to 1.1%, but early-brake rate rose to 94.6%.
+- The loss supervised only the GT-matched mode and only the final decoder layer, while inference selected poses_cls.argmax().
+- Reconstructed raw PDM fell from 0.884954 (3.22.6) to 0.884182 (3.22.7).
+
+Purpose
+- Keep the 3.22 contribution as a training-only loss.
+- Make every front-conflicting mode learn a safe and correctly timed longitudinal response.
+- Preserve each mode's lateral geometry and leave non-conflicting lateral escape modes unconstrained.
+
+Core changes
+- Cache the tracked future front-vehicle boxes in the current ego frame for supervision only.
+- Replace point-target imitation with a mode-specific longitudinal risk corridor.
+- Penalize unsafe clearance, insufficient braking inside the preparation zone, braking before the preparation zone, excessive deceleration, and excessive jerk.
+- Disable the early-braking penalty where the GT trajectory already brakes for another scene constraint.
+- Apply the loss to every conflicting mode at every decoder refinement layer.
+- Keep the inference architecture, mode classifier, mode count, and diffusion process unchanged.
+- Add exact epoch diagnostics for active scenes, active modes, modes per active scene, early/late excess, required deceleration, and clearance violation.
+- Introduce cache schema transfuser_target_all_mode_risk_corridor_v1.
+
+Verification
+- Added focused tests for all-conflicting-mode gradients, lateral-escape preservation,
+  early-brake penalties, and GT-supported braking exemptions.
+- `git diff --check` passed.
+- Local PyTorch tests are not run by default; server cache smoke test and training validation are pending.

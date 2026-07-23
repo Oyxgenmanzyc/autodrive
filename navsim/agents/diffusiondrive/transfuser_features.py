@@ -159,6 +159,11 @@ class TransfuserTargetBuilder(AbstractTargetBuilder):
         """Inherited, see superclass."""
         if (
             self._config.use_step_brake_timing_loss
+            and getattr(self._config, "use_all_mode_risk_corridor", False)
+        ):
+            return "transfuser_target_all_mode_risk_corridor_v1"
+        if (
+            self._config.use_step_brake_timing_loss
             and getattr(self._config, "use_endpoint_conditioned_temporal_transport", False)
         ):
             return "transfuser_target_temporal_transport_v1"
@@ -195,20 +200,30 @@ class TransfuserTargetBuilder(AbstractTargetBuilder):
             targets["brake_timing_context"] = torch.tensor(
                 build_gt_brake_timing_context(scene, self._config), dtype=torch.float32
             )
-            if getattr(self._config, "use_endpoint_conditioned_temporal_transport", False):
+            if (
+                getattr(self._config, "use_endpoint_conditioned_temporal_transport", False)
+                or getattr(self._config, "use_all_mode_risk_corridor", False)
+            ):
                 transport_target = build_gt_temporal_transport_target(scene, self._config)
-                targets["temporal_transport_target"] = torch.tensor(
-                    transport_target["target"], dtype=torch.float32
+                targets["temporal_transport_front_boxes"] = torch.tensor(
+                    transport_target["front_boxes"], dtype=torch.float32
                 )
-                targets["temporal_transport_upper_s"] = torch.tensor(
-                    transport_target["upper_s"], dtype=torch.float32
+                targets["temporal_transport_front_mask"] = torch.tensor(
+                    transport_target["front_mask"], dtype=torch.float32
                 )
-                targets["temporal_transport_constraint_mask"] = torch.tensor(
-                    transport_target["constraint_mask"], dtype=torch.float32
-                )
-                targets["temporal_transport_valid"] = torch.tensor(
-                    transport_target["valid"], dtype=torch.float32
-                )
+                if not getattr(self._config, "use_all_mode_risk_corridor", False):
+                    targets["temporal_transport_target"] = torch.tensor(
+                        transport_target["target"], dtype=torch.float32
+                    )
+                    targets["temporal_transport_upper_s"] = torch.tensor(
+                        transport_target["upper_s"], dtype=torch.float32
+                    )
+                    targets["temporal_transport_constraint_mask"] = torch.tensor(
+                        transport_target["constraint_mask"], dtype=torch.float32
+                    )
+                    targets["temporal_transport_valid"] = torch.tensor(
+                        transport_target["valid"], dtype=torch.float32
+                    )
 
         return targets
 

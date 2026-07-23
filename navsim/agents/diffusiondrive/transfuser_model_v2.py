@@ -681,9 +681,19 @@ class TrajectoryHead(nn.Module):
 
         brake_timing_output: Dict[str, torch.Tensor] = {}
         if self._config.use_step_brake_timing_loss:
-            brake_timing_output = compute_brake_timing_loss(
-                poses_reg_list[-1], targets, plan_anchor, self._config
+            supervised_layers = (
+                poses_reg_list
+                if getattr(self._config, "use_all_mode_risk_corridor", False)
+                else poses_reg_list[-1:]
             )
+            layer_timing_outputs = [
+                compute_brake_timing_loss(poses_reg, targets, plan_anchor, self._config)
+                for poses_reg in supervised_layers
+            ]
+            brake_timing_output = layer_timing_outputs[-1]
+            brake_timing_output["brake_timing_loss"] = torch.stack(
+                [output["brake_timing_loss"] for output in layer_timing_outputs]
+            ).mean()
 
         mode_idx = poses_cls_list[-1].argmax(dim=-1)
         mode_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
