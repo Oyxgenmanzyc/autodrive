@@ -17,9 +17,16 @@ config:
   use_temporal_risk_cross_attention: False
   use_memory_aux_loss: True
   use_risk_aware_cls: True
+  risk_rank_inference_topk: 20
+  risk_rank_min_unsafe_probability_gain: 0.10
+  risk_rank_timing_loss_weight: 0.5
+  risk_rank_timing_min_progress_gain: 1.0
+  risk_rank_timing_min_decel_gain: 0.5
+  risk_rank_timing_max_decel_regression: 0.5
+  risk_rank_max_future_agents: 30
   use_step_brake_timing_loss: False
-  use_risk_shadow_evaluator: True
+  use_risk_shadow_evaluator: False
   use_soft_risk_rescore: False
 
 checkpoint_path: null
-lr: 6e-4
+lr: 3e-4

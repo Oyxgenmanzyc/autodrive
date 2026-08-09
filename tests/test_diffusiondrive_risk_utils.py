@@ -51,6 +51,8 @@ def _config() -> SimpleNamespace:
         risk_ego_front_offset=2.0,
         risk_ttc_max=10.0,
         risk_drac_max=6.0,
+        risk_trend_min_valid_frames=3,
+        trajectory_sampling=SimpleNamespace(num_poses=8),
         lidar_split_height=0.2,
         max_height_lidar=100.0,
         lidar_max_x=32.0,
@@ -79,16 +81,14 @@ def _frame(x: float, ego_v: float, lead_v: float) -> SimpleNamespace:
 class RiskUtilsTest(unittest.TestCase):
     def test_non_closing_relative_velocity_has_zero_drac(self):
         risk = compute_longitudinal_risk(gap=8.0, rel_v=-1.0, ego_v=5.0)
-
         self.assertEqual(risk["drac"], 0.0)
         self.assertEqual(risk["ttc"], 10.0)
 
     def test_low_speed_thw_is_capped(self):
-        risk = compute_longitudinal_risk(gap=20.0, rel_v=0.0, ego_v=0.0, ttc_max=10.0)
-
+        risk = compute_longitudinal_risk(gap=20.0, rel_v=0.0, ego_v=0.0)
         self.assertEqual(risk["thw"], 10.0)
 
-    def test_gap_shrink_generates_positive_relative_velocity(self):
+    def test_gap_shrink_emits_signed_and_closing_speed(self):
         agent_input = SimpleNamespace(
             ego_statuses=[_ego(), _ego(), _ego(), _ego()],
             lidars=[
@@ -98,45 +98,66 @@ class RiskUtilsTest(unittest.TestCase):
                 _lidar_with_front_points(8.0),
             ],
         )
-
         tokens = build_history_risk_tokens(agent_input, _config())
-        rel_v_idx = RISK_TOKEN_FIELDS.index("rel_v")
+        signed_idx = RISK_TOKEN_FIELDS.index("signed_rel_v")
+        closing_idx = RISK_TOKEN_FIELDS.index("closing_speed")
         drac_idx = RISK_TOKEN_FIELDS.index("drac")
         valid_idx = RISK_TOKEN_FIELDS.index("valid")
-
-        self.assertEqual(tokens.shape, (4, len(RISK_TOKEN_FIELDS)))
+        self.assertEqual(tokens.shape, (4, 10))
         self.assertTrue(np.all(tokens[:, valid_idx] == 1.0))
-        self.assertAlmostEqual(tokens[-1, rel_v_idx], 4.0)
+        self.assertAlmostEqual(tokens[-1, signed_idx], 4.0)
+        self.assertAlmostEqual(tokens[-1, closing_idx], 4.0)
         self.assertGreater(tokens[-1, drac_idx], 0.0)
+
+    def test_gap_growth_preserves_signed_lead_motion(self):
+        agent_input = SimpleNamespace(
+            ego_statuses=[_ego(), _ego(), _ego(), _ego()],
+            lidars=[
+                _lidar_with_front_points(8.0),
+                _lidar_with_front_points(10.0),
+                _lidar_with_front_points(12.0),
+                _lidar_with_front_points(14.0),
+            ],
+        )
+        tokens = build_history_risk_tokens(agent_input, _config())
+        signed_idx = RISK_TOKEN_FIELDS.index("signed_rel_v")
+        closing_idx = RISK_TOKEN_FIELDS.index("closing_speed")
+        self.assertAlmostEqual(tokens[-1, signed_idx], -4.0)
+        self.assertEqual(tokens[-1, closing_idx], 0.0)
 
     def test_invalid_lidar_does_not_emit_risk(self):
         agent_input = SimpleNamespace(
             ego_statuses=[_ego(), _ego(), _ego(), _ego()],
             lidars=[_empty_lidar(), _empty_lidar(), _empty_lidar(), _empty_lidar()],
         )
-
         tokens = build_history_risk_tokens(agent_input, _config())
-        valid_idx = RISK_TOKEN_FIELDS.index("valid")
-        drac_idx = RISK_TOKEN_FIELDS.index("drac")
+        self.assertTrue(np.all(tokens[:, -1] == 0.0))
+        self.assertTrue(np.all(tokens[:, RISK_TOKEN_FIELDS.index("drac")] == 0.0))
 
-        self.assertTrue(np.all(tokens[:, valid_idx] == 0.0))
-        self.assertTrue(np.all(tokens[:, drac_idx] == 0.0))
-
-    def test_gt_history_targets_emit_auxiliary_labels(self):
+    def test_gt_history_targets_only_use_observable_risk(self):
+        frames = [
+            _frame(16.0, ego_v=10.0, lead_v=6.0),
+            _frame(14.0, ego_v=10.0, lead_v=6.0),
+            _frame(12.0, ego_v=10.0, lead_v=6.0),
+            _frame(10.0, ego_v=10.0, lead_v=6.0),
+        ]
+        future_x = np.array([4.5, 8.0, 10.5, 12.0, 13.0, 13.5, 13.75, 14.0])
         scene = SimpleNamespace(
             scene_metadata=SimpleNamespace(num_history_frames=4),
-            frames=[
-                _frame(16.0, ego_v=10.0, lead_v=6.0),
-                _frame(14.0, ego_v=10.0, lead_v=6.0),
-                _frame(12.0, ego_v=10.0, lead_v=6.0),
-                _frame(10.0, ego_v=10.0, lead_v=6.0),
-            ],
+            frames=frames,
+            get_future_trajectory=lambda num_trajectory_frames: SimpleNamespace(
+                poses=np.stack(
+                    [future_x[:num_trajectory_frames], np.zeros(num_trajectory_frames), np.zeros(num_trajectory_frames)],
+                    axis=-1,
+                )
+            ),
         )
-
         targets = build_gt_history_risk_targets(scene, _config())
-
         self.assertEqual(targets["risk_aux_labels"].shape, (3,))
-        self.assertEqual(float(targets["risk_aux_valid"]), 1.0)
+        self.assertEqual(targets["risk_aux_label_valid"].shape, (3,))
+        self.assertEqual(float(targets["risk_aux_label_valid"][0]), 1.0)
+        self.assertLess(float(targets["risk_aux_raw"][0]), 0.0)
+        self.assertGreater(float(targets["risk_aux_raw"][1]), 0.0)
 
 
 if __name__ == "__main__":

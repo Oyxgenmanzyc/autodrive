@@ -21,6 +21,7 @@ from navsim.agents.diffusiondrive.modules.risk_shadow import evaluate_risk_shado
 from navsim.agents.diffusiondrive.modules.risk_mode_ranking import (
     RiskModeRankingHead,
     compute_risk_mode_ranking_loss,
+    select_risk_ranked_mode,
 )
 from torch.nn import TransformerDecoder,TransformerDecoderLayer
 from typing import Any, List, Dict, Optional, Union
@@ -504,7 +505,9 @@ class TrajectoryHead(nn.Module):
         if self.use_risk_aware_cls:
             if not self.use_historical_risk_attention:
                 raise ValueError("use_risk_aware_cls requires use_historical_risk_attention")
-            self.risk_mode_ranking_head = RiskModeRankingHead(d_model)
+            self.risk_mode_ranking_head = RiskModeRankingHead(
+                d_model, config.trajectory_sampling.num_poses
+            )
     def norm_odo(self, odo_info_fut):
         odo_info_fut_x = odo_info_fut[..., 0:1]
         odo_info_fut_y = odo_info_fut[..., 1:2]
@@ -527,14 +530,14 @@ class TrajectoryHead(nn.Module):
         if not self.use_historical_risk_attention or history_risk_tokens is None:
             return None, None
         history_risk_memory, risk_aux_logits = self.history_risk_encoder(history_risk_tokens)
-        risk_aux_loss = None
-        if self.training and self._config.use_memory_aux_loss and targets is not None:
-            risk_aux_loss = self.history_risk_encoder.compute_aux_loss(
+        risk_aux_output = None
+        if self._config.use_memory_aux_loss and targets is not None:
+            risk_aux_output = self.history_risk_encoder.compute_aux_outputs(
                 risk_aux_logits,
                 targets,
                 self._config.memory_aux_loss_weight,
             )
-        return history_risk_memory, risk_aux_loss
+        return history_risk_memory, risk_aux_output
 
     def forward(
         self,
@@ -574,6 +577,7 @@ class TrajectoryHead(nn.Module):
                 agent_states,
                 agent_labels,
                 bev_semantic_map,
+                targets,
             )
 
 
@@ -590,7 +594,7 @@ class TrajectoryHead(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         bs = ego_query.shape[0]
         device = ego_query.device
-        history_risk_memory, risk_aux_loss = self._encode_history_risk(history_risk_tokens, targets)
+        history_risk_memory, risk_aux_output = self._encode_history_risk(history_risk_tokens, targets)
         # 1. add truncated noise to the plan anchor
         plan_anchor = self.plan_anchor.unsqueeze(0).repeat(bs,1,1,1)
         odo_info_fut = self.norm_odo(plan_anchor)
@@ -643,27 +647,40 @@ class TrajectoryHead(nn.Module):
         selection_logits = poses_cls_list[-1]
         if self.use_risk_aware_cls:
             history_valid = history_risk_tokens[..., -1] if history_risk_tokens is not None else None
-            risk_delta = self.risk_mode_ranking_head(
+            risk_rank_logits = self.risk_mode_ranking_head(
                 final_traj_feature,
                 history_risk_memory,
                 history_valid,
+                poses=poses_reg_list[-1],
+                dt=self._config.risk_history_dt,
             )
+            unsafe_logits = risk_rank_logits["unsafe_logits"]
+            timing_logits = risk_rank_logits["timing_logits"]
             ranking_output = compute_risk_mode_ranking_loss(
                 poses_reg_list[-1],
                 poses_cls_list[-1],
-                risk_delta,
+                unsafe_logits,
+                timing_logits,
                 targets,
                 self._config,
             )
-            selection_logits = poses_cls_list[-1].detach() + risk_delta
-
-        mode_idx = selection_logits.argmax(dim=-1)
+            ranking_selection = select_risk_ranked_mode(
+                poses_cls_list[-1],
+                unsafe_logits,
+                self._config.risk_rank_inference_topk,
+                timing_logits=timing_logits,
+                poses=poses_reg_list[-1],
+                config=self._config,
+            )
+            mode_idx = ranking_selection["selected_mode"]
+        else:
+            mode_idx = selection_logits.argmax(dim=-1)
         mode_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
         best_reg = torch.gather(poses_reg_list[-1], 1, mode_idx).squeeze(1)
         output = {"trajectory": best_reg,"trajectory_loss":ret_traj_loss,"trajectory_loss_dict":trajectory_loss_dict}
-        if risk_aux_loss is not None:
-            output["memory_aux_loss"] = risk_aux_loss
-            output["trajectory_loss_dict"]["memory_aux_loss"] = risk_aux_loss
+        if risk_aux_output is not None:
+            output.update(risk_aux_output)
+            output["trajectory_loss_dict"]["memory_aux_loss"] = risk_aux_output["memory_aux_loss"]
         output.update(ranking_output)
         return output
 
@@ -679,11 +696,14 @@ class TrajectoryHead(nn.Module):
         agent_states=None,
         agent_labels=None,
         bev_semantic_map=None,
+        targets=None,
     ) -> Dict[str, torch.Tensor]:
         step_num = 2
         bs = ego_query.shape[0]
         device = ego_query.device
-        history_risk_memory, _ = self._encode_history_risk(history_risk_tokens)
+        history_risk_memory, risk_aux_output = self._encode_history_risk(
+            history_risk_tokens, targets
+        )
         self.diffusion_scheduler.set_timesteps(1000, device)
         step_ratio = 20 / step_num
         roll_timesteps = (np.arange(0, step_num) * step_ratio).round()[::-1].copy().astype(np.int64)
@@ -743,27 +763,114 @@ class TrajectoryHead(nn.Module):
                 sample=img
             ).prev_sample
         risk_diagnostics: Dict[str, torch.Tensor] = {}
+        ranking_output: Dict[str, torch.Tensor] = {}
         selection_logits = poses_cls
         base_mode = poses_cls.argmax(dim=-1)
         if self.use_risk_aware_cls:
             history_valid = history_risk_tokens[..., -1] if history_risk_tokens is not None else None
-            risk_delta = self.risk_mode_ranking_head(
+            risk_rank_logits = self.risk_mode_ranking_head(
                 final_traj_feature,
                 history_risk_memory,
                 history_valid,
+                poses=poses_reg,
+                dt=self._config.risk_history_dt,
             )
-            selection_logits = poses_cls + risk_delta
+            unsafe_logits = risk_rank_logits["unsafe_logits"]
+            timing_logits = risk_rank_logits["timing_logits"]
+            ranking_selection = select_risk_ranked_mode(
+                poses_cls,
+                unsafe_logits,
+                self._config.risk_rank_inference_topk,
+                timing_logits=timing_logits,
+                poses=poses_reg,
+                config=self._config,
+            )
+            selection_logits = ranking_selection["adjusted_logits"]
+            raw_mode = ranking_selection["selected_mode"]
             risk_diagnostics.update(
                 {
                     "risk_rank_base_mode": base_mode.float(),
-                    "risk_rank_delta_abs_mean": risk_delta.abs().mean(dim=-1),
-                    "risk_rank_delta_abs_max": risk_delta.abs().max(dim=-1).values,
+                    "risk_rank_unconstrained_mode": ranking_selection[
+                        "unconstrained_mode"
+                    ].float(),
+                    "risk_rank_unconstrained_topk_mode": ranking_selection[
+                        "unconstrained_topk_mode"
+                    ].float(),
+                    "risk_rank_selected_mode": raw_mode.float(),
+                    "risk_rank_selected_base_rank": ranking_selection[
+                        "selected_base_rank"
+                    ].float(),
+                    "risk_rank_guard_blocked": ranking_selection[
+                        "guard_blocked"
+                    ].float(),
+                    "risk_rank_path_guard_blocked": ranking_selection[
+                        "path_guard_blocked"
+                    ].float(),
+                    "risk_rank_eligible_candidate_count": ranking_selection[
+                        "eligible_candidate_count"
+                    ].float(),
+                    "risk_rank_predicted_safe_candidate_count": ranking_selection[
+                        "predicted_safe_candidate_count"
+                    ].float(),
+                    "risk_rank_qualified_candidate_count": ranking_selection[
+                        "qualified_candidate_count"
+                    ].float(),
+                    "risk_rank_safe_fallback_used": ranking_selection[
+                        "safe_fallback_used"
+                    ].float(),
+                    "risk_rank_base_unsafe_probability": ranking_selection[
+                        "base_unsafe_probability"
+                    ],
+                    "risk_rank_selected_unsafe_probability": ranking_selection[
+                        "selected_unsafe_probability"
+                    ],
+                    "risk_rank_selected_unsafe_probability_gain": ranking_selection[
+                        "selected_unsafe_probability_gain"
+                    ],
+                    "risk_rank_selected_timing_logit": ranking_selection[
+                        "selected_timing_logit"
+                    ],
+                    "risk_rank_proposed_lateral_distance": ranking_selection[
+                        "proposed_lateral_distance"
+                    ],
+                    "risk_rank_proposed_heading_distance": ranking_selection[
+                        "proposed_heading_distance"
+                    ],
+                    "risk_rank_proposed_progress_delta": ranking_selection[
+                        "proposed_progress_delta"
+                    ],
+                    "risk_rank_selected_lateral_distance": ranking_selection[
+                        "selected_lateral_distance"
+                    ],
+                    "risk_rank_selected_heading_distance": ranking_selection[
+                        "selected_heading_distance"
+                    ],
+                    "risk_rank_selected_progress_delta": ranking_selection[
+                        "selected_progress_delta"
+                    ],
+                    "risk_rank_unconstrained_selection_changed": (
+                        ranking_selection["unconstrained_mode"] != base_mode
+                    ).float(),
+                    "risk_rank_selection_changed": (raw_mode != base_mode).float(),
+                    "risk_rank_unsafe_probability_mean": unsafe_logits.sigmoid().mean(dim=-1),
+                    "risk_rank_unsafe_probability_max": unsafe_logits.sigmoid().max(dim=-1).values,
+                    "risk_rank_unsafe_probability_span": (
+                        unsafe_logits.sigmoid().max(dim=-1).values
+                        - unsafe_logits.sigmoid().min(dim=-1).values
+                    ),
                 }
             )
-        raw_mode = selection_logits.argmax(dim=-1)
-        if self.use_risk_aware_cls:
-            risk_diagnostics["risk_rank_selected_mode"] = raw_mode.float()
-            risk_diagnostics["risk_rank_selection_changed"] = (raw_mode != base_mode).float()
+            if targets is not None:
+                ranking_output = compute_risk_mode_ranking_loss(
+                    poses_reg,
+                    poses_cls,
+                    unsafe_logits,
+                    timing_logits,
+                    targets,
+                    self._config,
+                )
+        else:
+            raw_mode = base_mode
         shadow_enabled = self._config.use_risk_shadow_evaluator or self._config.use_soft_risk_rescore
         if shadow_enabled and history_risk_tokens is not None:
             proposed_mode, shadow_diagnostics = evaluate_risk_shadow(
@@ -785,9 +892,18 @@ class TrajectoryHead(nn.Module):
         gather_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
         best_reg = torch.gather(poses_reg, 1, gather_idx).squeeze(1)
         output = {"trajectory": best_reg}
+        if risk_aux_output is not None:
+            output.update(risk_aux_output)
+        output.update(ranking_output)
         if risk_diagnostics:
             risk_diagnostics["risk_selected_mode"] = mode_idx.float()
             risk_diagnostics["risk_selection_changed"] = (mode_idx != raw_mode).float()
+            rank_changed = raw_mode != base_mode
+            if bool(rank_changed.any().item()):
+                # Positive counterfactual_score_delta means risk ranking hurt PDM.
+                risk_diagnostics["risk_counterfactual_active"] = rank_changed.float()
+                risk_diagnostics["risk_counterfactual_mode"] = base_mode.float()
+                risk_diagnostics["risk_counterfactual_source"] = torch.ones_like(base_mode).float()
             if "risk_counterfactual_mode" in risk_diagnostics:
                 counterfactual_mode = risk_diagnostics["risk_counterfactual_mode"].long()
                 counterfactual_idx = counterfactual_mode[..., None, None, None].repeat(

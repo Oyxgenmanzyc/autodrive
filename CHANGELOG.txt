@@ -1,3 +1,33 @@
+## 3.21.9 - PDM-aligned risk selector
+- Six checkpoint evaluations (epochs 50/60/70/80/90/99) span only 0.882239--0.885528 PDM; epoch 90 is best, so checkpoint selection alone cannot provide a large gain.
+- Fix the disconnected history-risk training path: cache and consume per-label validity, remove future-braking prediction from the history-only auxiliary task, and allow selector losses to train risk memory while keeping generated mode features/poses detached.
+- Replace seven motion summaries with the full eight-step speed/acceleration profile plus compact progress/deceleration/jerk summaries.
+- Add a separate timing-quality head trained only among safe, path-compatible candidates; progress gain, peak-deceleration regression, and GT error are used in that order.
+- Upgrade unsafe supervision from one tracked front vehicle to oriented-box collision labels against up to 30 future GT objects, while retaining the longitudinal TTC proxy.
+- Remove GT-path filtering from unsafe supervision so all 20 inference candidates receive safety labels; GT-path filtering remains only for timing comparisons.
+- Replace the ineffective absolute 0.5 selector gate with a relative unsafe-probability gain. Preserve the base mode unless an eligible candidate improves predicted safety by at least 0.10, then use timing quality to choose among qualified candidates.
+- Keep lateral/heading route guards but remove progress as a hard veto. 3.21 still selects existing candidates and does not generate probing/creeping trajectories.
+- Add exact epoch counters for base/selected collision rate, rescuable-collision recall, new-collision rate, selection-change rate, future-agent collision coverage, and timing-head pair accuracy.
+- Bump the target cache name to `transfuser_target_risk_rank_v2`; a new cache and a fresh training run are required.
+
+## 3.21.6 - Longitudinal safety and brake-profile ranking
+- Keep the 3.21.5 base-path inference guard.
+- Replace onset-only pair labels with TTC/THW/DRAC/clearance-aware labels.
+- Add GT-aligned brake-magnitude and progress errors.
+- Treat only safety regressions that are both critical and worse than GT as hard negatives.
+- Log exact longitudinal pair statistics.
+
+## 3.21.5 - Base-path-compatible risk re-ranking
+- Restrict top-k risk re-ranking to candidates compatible with the base path.
+- Reject candidates with excessive lateral, heading, or progress deviation.
+- Always retain the original base mode as a valid fallback.
+- Add diagnostics for blocked risk proposals and selected path differences.
+
+## 3.21.4 - GT-aligned brake-onset ranking labels
+- 将“越早制动越优”的 pair 标签替换为“制动起点更接近 GT 越优”。
+- 仅在候选轨迹与 GT 路径兼容时产生排序监督，并记录精确 onset-error 指标。
+- 本地未验证；待云端 smoke test 与完整训练验证。
+
 3.20 第二个创新点：风险时序注意力与决策时机
 
 修改日期

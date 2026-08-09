@@ -246,5 +246,14 @@ class TransfuserAgent(AbstractAgent):
         return {'optimizer': optimizer, 'lr_scheduler': scheduler}
 
     def get_training_callbacks(self) -> List[pl.Callback]:
-        """Inherited, see superclass."""
-        return [TransfuserCallback(self._config)]
+        """Return visualization plus periodic checkpoints for PDM selection."""
+        checkpoint_every_10_epochs = pl.callbacks.ModelCheckpoint(
+            every_n_epochs=10,
+            save_top_k=-1,
+            save_last=True,
+            filename="epoch={epoch}-step={step}",
+        )
+        return [
+            TransfuserCallback(self._config),
+            checkpoint_every_10_epochs,
+        ]

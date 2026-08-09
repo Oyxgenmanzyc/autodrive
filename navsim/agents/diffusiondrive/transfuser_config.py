@@ -49,7 +49,7 @@ class TransfuserConfig:
     # LiDAR-based history risk token settings
     risk_history_num_frames: int = 4
     risk_history_dt: float = 0.5
-    risk_token_dim: int = 12
+    risk_token_dim: int = 10
     risk_front_x_min: float = 1.0
     risk_front_x_max: float = 32.0
     risk_front_y_abs: float = 1.8
@@ -62,6 +62,18 @@ class TransfuserConfig:
     risk_drac_max: float = 6.0
     risk_attention_layers: int = 1
     memory_aux_loss_weight: float = 0.2
+    risk_trend_min_valid_frames: int = 3
+    risk_ttc_slope_moderate: float = -0.35
+    risk_ttc_slope_severe: float = -0.90
+    risk_drac_slope_moderate: float = 0.25
+    risk_drac_slope_severe: float = 0.75
+    risk_urgency_ttc_warning: float = 4.0
+    risk_urgency_ttc_critical: float = 2.5
+    risk_urgency_ttc_emergency: float = 1.5
+    risk_urgency_drac_warning: float = 1.5
+    risk_urgency_drac_critical: float = 3.0
+    risk_urgency_drac_emergency: float = 5.0
+    risk_pair_ttc_warning_threshold: float = 4.0
     risk_gate_min_gap: float = 1.0
     risk_gate_cls_margin: float = 2.0
 
@@ -103,13 +115,38 @@ class TransfuserConfig:
 
     # 3.21 isolated risk-conditioned mode ranking.
     risk_rank_loss_weight: float = 0.2
-    risk_rank_normal_delta_weight: float = 0.01
     risk_rank_margin: float = 1.0
     risk_rank_lateral_tolerance: float = 0.75
     risk_rank_heading_tolerance: float = 0.20
-    risk_rank_progress_tolerance: float = 1.0
-    risk_rank_min_onset_step_gain: int = 1
+    # 仅在候选轨迹贴近 GT 路径时，比较其制动起点是否更接近 GT。
+    risk_rank_gt_lateral_tolerance: float = 1.50
+    risk_rank_gt_heading_tolerance: float = 0.35
     risk_rank_brake_accel_threshold: float = -0.5
+    risk_rank_inference_topk: int = 20
+    risk_rank_pair_loss_weight: float = 0.5
+    risk_rank_unsafe_pos_weight: float = 3.0
+    risk_rank_unsafe_ttc_threshold: float = 2.0
+    risk_rank_collision_clearance_threshold: float = 0.0
+    risk_rank_unsafe_probability_threshold: float = 0.5
+    # 3.21.9: intervene only when a candidate has a calibrated relative safety gain.
+    risk_rank_min_unsafe_probability_gain: float = 0.10
+    risk_rank_timing_loss_weight: float = 0.5
+    risk_rank_timing_min_progress_gain: float = 1.0
+    risk_rank_timing_min_decel_gain: float = 0.5
+    risk_rank_timing_max_decel_regression: float = 0.5
+    risk_rank_max_future_agents: int = 30
+    risk_rank_ego_length: float = 5.176
+    risk_rank_ego_width: float = 2.297
+    risk_rank_ego_rear_axle_to_center: float = 1.461
+    risk_rank_collision_margin: float = 0.0
+    risk_rank_gt_xy_weight: float = 1.0
+    risk_rank_gt_heading_weight: float = 0.5
+    risk_rank_min_gt_error_gain: float = 0.10
+
+    # The guard protects route intent; progress is a learned timing quantity, not a veto.
+    risk_rank_use_inference_path_guard: bool = True
+    risk_rank_inference_lateral_tolerance: float = 0.75
+    risk_rank_inference_heading_tolerance: float = 0.20
 
     camera_width: int = 1024
     camera_height: int = 256

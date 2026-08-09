@@ -5,23 +5,29 @@ import numpy as np
 from navsim.common.enums import LidarIndex
 
 
-RISK_TOKEN_DIM = 12
+RISK_TOKEN_DIM = 10
 RISK_TOKEN_FIELDS = (
     "gap",
-    "rel_v",
+    "signed_rel_v",
+    "closing_speed",
     "ego_v",
     "lead_v",
     "ego_a",
     "thw",
     "ttc",
     "drac",
-    "delta_thw",
-    "delta_ttc",
-    "delta_drac",
     "valid",
 )
 
-RISK_LABEL_NAMES = ("risk_trend", "urgency", "brake_need")
+RISK_LABEL_NAMES = (
+    "ttc_worsening",
+    "drac_worsening",
+    "urgency",
+)
+
+RISK_COLLISION_OBJECT_NAMES = frozenset(
+    {"vehicle", "pedestrian", "bicycle", "traffic_cone", "barrier", "generic_object"}
+)
 
 
 def _cfg(config: Any, name: str, default: Any) -> Any:
@@ -69,55 +75,73 @@ def tm_brake_thresholds(speed: float) -> Dict[str, float]:
     return {"t1": 0.83, "t2": 0.37}
 
 
+
 def classify_risk_labels(
     ttc: float,
     drac: float,
-    delta_ttc: float,
-    delta_drac: float,
-    ego_v: float,
+    ttc_slope: float,
+    drac_slope: float,
     valid: float,
-    step_margin: float = 0.5,
-    ttc_max: float = 10.0,
+    trend_valid: float,
+    config: Any,
 ) -> Dict[str, int]:
-    """Create discrete auxiliary labels from explicit risk metrics."""
+    """Create auxiliary labels from quantities observable in the history window.
 
-    if valid <= 0.5:
-        return {"risk_trend": 0, "urgency": 0, "brake_need": 0, "valid": 0}
+    Slopes are fitted over all consecutive valid history frames and are measured
+    per history frame.  The function deliberately does not use TM.
+    """
 
-    if delta_ttc <= -1.0 or delta_drac >= 1.0:
-        risk_trend = 2
-    elif delta_ttc < -0.25 or delta_drac > 0.25:
-        risk_trend = 1
+    current_valid = valid > 0.5
+    trend_is_valid = current_valid and trend_valid > 0.5
+
+    ttc_moderate = float(_cfg(config, "risk_ttc_slope_moderate", -0.35))
+    ttc_severe = float(_cfg(config, "risk_ttc_slope_severe", -0.90))
+    drac_moderate = float(_cfg(config, "risk_drac_slope_moderate", 0.25))
+    drac_severe = float(_cfg(config, "risk_drac_slope_severe", 0.75))
+
+    if trend_is_valid and ttc_slope <= ttc_severe:
+        ttc_worsening = 2
+    elif trend_is_valid and ttc_slope <= ttc_moderate:
+        ttc_worsening = 1
     else:
-        risk_trend = 0
+        ttc_worsening = 0
 
-    thresholds = tm_brake_thresholds(ego_v)
-    if drac >= 6.0:
+    if trend_is_valid and drac_slope >= drac_severe:
+        drac_worsening = 2
+    elif trend_is_valid and drac_slope >= drac_moderate:
+        drac_worsening = 1
+    else:
+        drac_worsening = 0
+
+    # Simple enlarged TTC zones.  DRAC is kept as an independent physical cue.
+    if not current_valid:
+        urgency = 0
+    elif (
+        ttc <= float(_cfg(config, "risk_urgency_ttc_emergency", 1.5))
+        or drac >= float(_cfg(config, "risk_urgency_drac_emergency", 5.0))
+    ):
         urgency = 3
-    elif ttc <= thresholds["t2"] + step_margin or drac >= 4.0:
+    elif (
+        ttc <= float(_cfg(config, "risk_urgency_ttc_critical", 2.5))
+        or drac >= float(_cfg(config, "risk_urgency_drac_critical", 3.0))
+    ):
         urgency = 2
-    elif ttc <= thresholds["t1"] + step_margin or drac >= 2.0 or ttc < ttc_max:
+    elif (
+        ttc <= float(_cfg(config, "risk_urgency_ttc_warning", 4.0))
+        or drac >= float(_cfg(config, "risk_urgency_drac_warning", 1.5))
+    ):
         urgency = 1
     else:
         urgency = 0
 
-    if drac < 1.0:
-        brake_need = 0
-    elif drac < 2.0:
-        brake_need = 1
-    elif drac < 4.0:
-        brake_need = 2
-    elif drac < 6.0:
-        brake_need = 3
-    else:
-        brake_need = 4
-
     return {
-        "risk_trend": int(risk_trend),
+        "ttc_worsening": int(ttc_worsening),
+        "drac_worsening": int(drac_worsening),
         "urgency": int(urgency),
-        "brake_need": int(brake_need),
-        "valid": 1,
+        "current_valid": int(current_valid),
+        "trend_valid": int(trend_is_valid),
     }
+
 
 
 def estimate_front_gap_from_lidar(lidar_pc: np.ndarray, config: Any) -> Dict[str, float]:
@@ -126,7 +150,8 @@ def estimate_front_gap_from_lidar(lidar_pc: np.ndarray, config: Any) -> Dict[str
     if lidar_pc is None or lidar_pc.size == 0:
         return {"gap": 0.0, "valid": 0.0}
 
-    points = lidar_pc[LidarIndex.POSITION].T
+    position_slice = slice(0, 3)
+    points = lidar_pc[position_slice].T
     if points.size == 0:
         return {"gap": 0.0, "valid": 0.0}
     finite_mask = np.isfinite(points).all(axis=1)
@@ -159,11 +184,32 @@ def estimate_front_gap_from_lidar(lidar_pc: np.ndarray, config: Any) -> Dict[str
     return {"gap": gap, "valid": 1.0}
 
 
+
+def _fit_valid_slope(values: List[float], valid: List[float], min_points: int = 3) -> Dict[str, float]:
+    """Fit a least-squares slope over the latest consecutive valid suffix."""
+
+    suffix_values: List[float] = []
+    for value, is_valid in zip(reversed(values), reversed(valid)):
+        if is_valid <= 0.5:
+            break
+        suffix_values.append(float(value))
+    suffix_values.reverse()
+    if len(suffix_values) < min_points:
+        return {"slope": 0.0, "valid": 0.0, "count": float(len(suffix_values))}
+
+    y = np.asarray(suffix_values, dtype=np.float64)
+    x = np.arange(y.shape[0], dtype=np.float64)
+    x = x - x.mean()
+    denominator = float(np.square(x).sum())
+    slope = 0.0 if denominator <= 1e-12 else float((x * (y - y.mean())).sum() / denominator)
+    return {"slope": slope, "valid": 1.0, "count": float(y.shape[0])}
+
+
 def build_history_risk_tokens(agent_input: Any, config: Any) -> np.ndarray:
-    """Build [K, F] risk tokens from history LiDAR and ego states available at inference."""
+    """Build raw history tokens; trend supervision is computed from multi-frame slopes."""
 
     history_frames = int(_cfg(config, "risk_history_num_frames", 4))
-    dt = float(_cfg(config, "risk_history_dt", 0.5))
+    dt = max(float(_cfg(config, "risk_history_dt", 0.5)), 1e-3)
     ttc_max = float(_cfg(config, "risk_ttc_max", 10.0))
     drac_max = float(_cfg(config, "risk_drac_max", 6.0))
 
@@ -173,78 +219,66 @@ def build_history_risk_tokens(agent_input: Any, config: Any) -> np.ndarray:
     entries: List[Dict[str, float]] = []
     for idx in range(start, start + num_available):
         ego_status = agent_input.ego_statuses[idx]
-        lidar = agent_input.lidars[idx]
-        gap_info = estimate_front_gap_from_lidar(lidar.lidar_pc, config)
+        gap_info = estimate_front_gap_from_lidar(agent_input.lidars[idx].lidar_pc, config)
         ego_velocity = np.asarray(ego_status.ego_velocity, dtype=np.float32)
         ego_acceleration = np.asarray(ego_status.ego_acceleration, dtype=np.float32)
-        ego_v = max(float(np.nan_to_num(ego_velocity[0], nan=0.0, posinf=0.0, neginf=0.0)), 0.0)
-        ego_a = float(np.nan_to_num(ego_acceleration[0], nan=0.0, posinf=0.0, neginf=0.0))
         entries.append(
             {
                 "gap": float(gap_info["gap"]),
                 "valid": float(gap_info["valid"]),
-                "ego_v": ego_v,
-                "ego_a": ego_a,
+                "ego_v": max(float(np.nan_to_num(ego_velocity[0], nan=0.0)), 0.0),
+                "ego_a": float(np.nan_to_num(ego_acceleration[0], nan=0.0)),
             }
         )
 
     pad_count = history_frames - len(entries)
     if pad_count > 0:
-        entries = [{"gap": 0.0, "valid": 0.0, "ego_v": 0.0, "ego_a": 0.0}] * pad_count + entries
+        entries = [
+            {"gap": 0.0, "valid": 0.0, "ego_v": 0.0, "ego_a": 0.0}
+        ] * pad_count + entries
 
     tokens = np.zeros((history_frames, RISK_TOKEN_DIM), dtype=np.float32)
-    prev_metrics = None
     for idx, entry in enumerate(entries):
-        prev_entry = entries[idx - 1] if idx > 0 else None
+        previous = entries[idx - 1] if idx > 0 else None
         valid = entry["valid"] > 0.5
-        prev_valid = prev_entry is not None and prev_entry["valid"] > 0.5
-        if valid and prev_valid:
-            rel_v = max((prev_entry["gap"] - entry["gap"]) / max(dt, 1e-3), 0.0)
-        else:
-            rel_v = 0.0
-
+        previous_valid = previous is not None and previous["valid"] > 0.5
+        signed_rel_v = (
+            (previous["gap"] - entry["gap"]) / dt
+            if valid and previous_valid
+            else 0.0
+        )
+        closing_speed = max(signed_rel_v, 0.0)
         if valid:
             metrics = compute_longitudinal_risk(
                 entry["gap"],
-                rel_v,
+                closing_speed,
                 entry["ego_v"],
                 ttc_max=ttc_max,
                 drac_max=drac_max,
             )
-            lead_v = entry["ego_v"] - rel_v
+            lead_v = max(entry["ego_v"] - signed_rel_v, 0.0)
         else:
             metrics = {"thw": 0.0, "ttc": ttc_max, "drac": 0.0}
             lead_v = 0.0
 
-        if valid and prev_metrics is not None:
-            delta_thw = metrics["thw"] - prev_metrics["thw"]
-            delta_ttc = metrics["ttc"] - prev_metrics["ttc"]
-            delta_drac = metrics["drac"] - prev_metrics["drac"]
-        else:
-            delta_thw = 0.0
-            delta_ttc = 0.0
-            delta_drac = 0.0
-
-        tokens[idx] = np.array(
+        tokens[idx] = np.asarray(
             [
                 entry["gap"],
-                rel_v,
+                signed_rel_v,
+                closing_speed,
                 entry["ego_v"],
                 lead_v,
                 entry["ego_a"],
                 metrics["thw"],
                 metrics["ttc"],
                 metrics["drac"],
-                delta_thw,
-                delta_ttc,
-                delta_drac,
                 entry["valid"],
             ],
             dtype=np.float32,
         )
-        prev_metrics = metrics if valid else None
 
     return np.nan_to_num(tokens, nan=0.0, posinf=0.0, neginf=0.0)
+
 
 
 def _select_history_front_track(scene: Any, config: Any) -> Optional[str]:
@@ -326,12 +360,64 @@ def _box_in_origin_frame(box: np.ndarray, frame_ego_pose: np.ndarray, origin_ego
     )
 
 
-def _speed_dependent_t1(ego_v: float) -> float:
-    if ego_v <= 10.0:
-        return 2.0
-    if ego_v < 25.0:
-        return 2.78 - 0.078 * ego_v
-    return 0.83
+
+def _simple_ttc_warning_threshold(config: Any) -> float:
+    """Single enlarged TTC threshold used only to activate ranking scenes."""
+
+    return float(_cfg(config, "risk_pair_ttc_warning_threshold", 4.0))
+
+
+def build_gt_future_agent_targets(scene: Any, config: Any) -> np.ndarray:
+    """Track nearby collision-relevant objects over the candidate horizon.
+
+    The returned boxes are training-only GT in the current ego frame with fields
+    ``x, y, heading, length, width, valid``.  Fixed padding keeps the cache schema
+    deterministic and permits vectorized candidate/agent overlap tests.
+    """
+
+    num_poses = int(config.trajectory_sampling.num_poses)
+    max_agents = int(_cfg(config, "risk_rank_max_future_agents", 30))
+    future_agents = np.zeros((num_poses, max_agents, 6), dtype=np.float32)
+    current_idx = scene.scene_metadata.num_history_frames - 1
+    current_frame = scene.frames[current_idx]
+    annotations = current_frame.annotations
+
+    tracks = []
+    for box, name, track_token in zip(
+        annotations.boxes, annotations.names, annotations.track_tokens
+    ):
+        if name not in RISK_COLLISION_OBJECT_NAMES or not track_token:
+            continue
+        x = float(np.nan_to_num(box[0], nan=0.0, posinf=0.0, neginf=0.0))
+        y = float(np.nan_to_num(box[1], nan=0.0, posinf=0.0, neginf=0.0))
+        if not (
+            float(_cfg(config, "lidar_min_x", -32.0)) <= x <= float(_cfg(config, "lidar_max_x", 32.0))
+            and float(_cfg(config, "lidar_min_y", -32.0)) <= y <= float(_cfg(config, "lidar_max_y", 32.0))
+        ):
+            continue
+        tracks.append((x * x + y * y, str(track_token)))
+    track_tokens = [token for _, token in sorted(tracks)[:max_agents]]
+    origin_pose = np.asarray(current_frame.ego_status.ego_pose, dtype=np.float64)
+
+    for step in range(num_poses):
+        frame_idx = current_idx + step + 1
+        if frame_idx >= len(scene.frames):
+            break
+        frame = scene.frames[frame_idx]
+        token_to_index = {
+            str(token): idx for idx, token in enumerate(frame.annotations.track_tokens)
+        }
+        for agent_idx, token in enumerate(track_tokens):
+            box_idx = token_to_index.get(token)
+            if box_idx is None:
+                continue
+            future_agents[step, agent_idx] = _box_in_origin_frame(
+                frame.annotations.boxes[box_idx],
+                np.asarray(frame.ego_status.ego_pose, dtype=np.float64),
+                origin_pose,
+            )
+    return future_agents
+
 
 
 def build_gt_future_front_targets(scene: Any, config: Any) -> Dict[str, np.ndarray]:
@@ -391,7 +477,7 @@ def build_gt_future_front_targets(scene: Any, config: Any) -> Dict[str, np.ndarr
         if delayed_rel_v > 0.1:
             delayed_ttc = min(delayed_gap / delayed_rel_v, ttc_max)
 
-    t1 = _speed_dependent_t1(ego_v)
+    t1 = _simple_ttc_warning_threshold(config)
     risk_active = float(
         continuous_steps >= 2
         and (current_ttc <= t1 or (current_ttc > t1 and delayed_ttc <= t1))
@@ -404,8 +490,9 @@ def build_gt_future_front_targets(scene: Any, config: Any) -> Dict[str, np.ndarr
     }
 
 
+
 def build_gt_history_risk_targets(scene: Any, config: Any) -> Dict[str, np.ndarray]:
-    """Build auxiliary risk labels from training-only GT boxes and velocities."""
+    """Build split history-trend labels and future GT braking supervision."""
 
     history_frames = int(_cfg(config, "risk_history_num_frames", 4))
     ttc_max = float(_cfg(config, "risk_ttc_max", 10.0))
@@ -417,65 +504,88 @@ def build_gt_history_risk_targets(scene: Any, config: Any) -> Dict[str, np.ndarr
     for frame_idx in range(start, scene.scene_metadata.num_history_frames):
         frame = scene.frames[frame_idx]
         front = _select_front_vehicle(frame.annotations, config, preferred_track_token)
-        ego_v = max(float(np.nan_to_num(frame.ego_status.ego_velocity[0], nan=0.0, posinf=0.0, neginf=0.0)), 0.0)
-        ego_a = float(np.nan_to_num(frame.ego_status.ego_acceleration[0], nan=0.0, posinf=0.0, neginf=0.0))
+        # Trend labels must describe one continuous target, not whichever object is closest.
+        if (
+            front is not None
+            and preferred_track_token
+            and front.get("track_token", "") != preferred_track_token
+        ):
+            front = None
+        ego_v = max(float(np.nan_to_num(frame.ego_status.ego_velocity[0], nan=0.0)), 0.0)
         if front is None:
-            entries.append({"gap": 0.0, "rel_v": 0.0, "ego_v": ego_v, "ego_a": ego_a, "valid": 0.0})
+            entries.append({"ttc": ttc_max, "drac": 0.0, "ego_v": ego_v, "valid": 0.0})
             continue
-        rel_v = max(ego_v - front["lead_v"], 0.0)
+        signed_rel_v = ego_v - float(front["lead_v"])
+        metrics = compute_longitudinal_risk(
+            front["gap"],
+            max(signed_rel_v, 0.0),
+            ego_v,
+            ttc_max=ttc_max,
+            drac_max=drac_max,
+        )
         entries.append(
             {
-                "gap": front["gap"],
-                "rel_v": rel_v,
+                "ttc": metrics["ttc"],
+                "drac": metrics["drac"],
                 "ego_v": ego_v,
-                "ego_a": ego_a,
                 "valid": 1.0,
             }
         )
 
     pad_count = history_frames - len(entries)
     if pad_count > 0:
-        entries = [{"gap": 0.0, "rel_v": 0.0, "ego_v": 0.0, "ego_a": 0.0, "valid": 0.0}] * pad_count + entries
+        entries = [
+            {"ttc": ttc_max, "drac": 0.0, "ego_v": 0.0, "valid": 0.0}
+        ] * pad_count + entries
 
-    prev_metrics = None
-    current_metrics = None
-    current_entry = entries[-1]
-    for entry in entries:
-        if entry["valid"] > 0.5:
-            metrics = compute_longitudinal_risk(
-                entry["gap"],
-                entry["rel_v"],
-                entry["ego_v"],
-                ttc_max=ttc_max,
-                drac_max=drac_max,
-            )
-        else:
-            metrics = {"thw": 0.0, "ttc": ttc_max, "drac": 0.0}
-        current_metrics = metrics
-        if entry is current_entry:
-            break
-        prev_metrics = metrics if entry["valid"] > 0.5 else None
-
-    if prev_metrics is None or current_entry["valid"] <= 0.5:
-        delta_ttc = 0.0
-        delta_drac = 0.0
-    else:
-        delta_ttc = current_metrics["ttc"] - prev_metrics["ttc"]
-        delta_drac = current_metrics["drac"] - prev_metrics["drac"]
-
-    labels = classify_risk_labels(
-        ttc=current_metrics["ttc"],
-        drac=current_metrics["drac"],
-        delta_ttc=delta_ttc,
-        delta_drac=delta_drac,
-        ego_v=current_entry["ego_v"],
-        valid=current_entry["valid"],
-        ttc_max=ttc_max,
+    ttc_fit = _fit_valid_slope(
+        [entry["ttc"] for entry in entries],
+        [entry["valid"] for entry in entries],
+        min_points=int(_cfg(config, "risk_trend_min_valid_frames", 3)),
     )
+    drac_fit = _fit_valid_slope(
+        [entry["drac"] for entry in entries],
+        [entry["valid"] for entry in entries],
+        min_points=int(_cfg(config, "risk_trend_min_valid_frames", 3)),
+    )
+    current = entries[-1]
+    labels = classify_risk_labels(
+        ttc=current["ttc"],
+        drac=current["drac"],
+        ttc_slope=ttc_fit["slope"],
+        drac_slope=drac_fit["slope"],
+        valid=current["valid"],
+        trend_valid=min(ttc_fit["valid"], drac_fit["valid"]),
+        config=config,
+    )
+
+    label_valid = np.asarray(
+        [
+            labels["trend_valid"],
+            labels["trend_valid"],
+            labels["current_valid"],
+        ],
+        dtype=np.float32,
+    )
+    raw = np.asarray(
+        [
+            ttc_fit["slope"],
+            drac_fit["slope"],
+            current["ttc"],
+            current["drac"],
+        ],
+        dtype=np.float32,
+    )
+
     return {
-        "risk_aux_labels": np.array(
-            [labels["risk_trend"], labels["urgency"], labels["brake_need"]],
+        "risk_aux_labels": np.asarray(
+            [
+                labels["ttc_worsening"],
+                labels["drac_worsening"],
+                labels["urgency"],
+            ],
             dtype=np.int64,
         ),
-        "risk_aux_valid": np.array(labels["valid"], dtype=np.float32),
+        "risk_aux_label_valid": label_valid,
+        "risk_aux_raw": raw,
     }

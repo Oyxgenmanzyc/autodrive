@@ -20,21 +20,37 @@ from navsim.agents.diffusiondrive.modules.risk_shadow import (
 class RiskAttentionGateTest(unittest.TestCase):
     def test_history_risk_attention_shape(self):
         module = HistoricalRiskTemporalSelfAttention(
-            token_dim=12,
+            token_dim=10,
             d_model=16,
             num_heads=4,
             num_layers=1,
             history_frames=4,
         )
-        tokens = torch.zeros(2, 4, 12)
+        tokens = torch.zeros(2, 4, 10)
         tokens[:, :, -1] = 1.0
 
         memory, logits = module(tokens)
 
         self.assertEqual(memory.shape, (2, 4, 16))
-        self.assertEqual(logits["risk_trend"].shape, (2, 3))
+        self.assertEqual(logits["ttc_worsening"].shape, (2, 3))
+        self.assertEqual(logits["drac_worsening"].shape, (2, 3))
         self.assertEqual(logits["urgency"].shape, (2, 4))
-        self.assertEqual(logits["brake_need"].shape, (2, 5))
+
+    def test_memory_aux_loss_accepts_observable_history_targets(self):
+        module = HistoricalRiskTemporalSelfAttention(10, 16, 4, 1, 4)
+        tokens = torch.zeros(2, 4, 10)
+        tokens[:, :, -1] = 1.0
+        _, logits = module(tokens)
+        output = module.compute_aux_outputs(
+            logits,
+            {
+                "risk_aux_labels": torch.tensor([[0, 1, 2], [1, 0, 1]]),
+                "risk_aux_label_valid": torch.ones(2, 3),
+            },
+            weight=0.2,
+        )
+        self.assertIsNotNone(output)
+        self.assertGreater(output["memory_aux_loss"].item(), 0.0)
 
     def test_temporal_risk_cross_attention_shape(self):
         module = TemporalRiskCrossAttention(d_model=16, num_heads=4)
