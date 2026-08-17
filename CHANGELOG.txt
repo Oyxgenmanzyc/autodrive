@@ -1,3 +1,30 @@
+3.20.10 高质量生成与保守风险筛选融合
+修改日期
+- 2026-08-17
+
+目标
+- 以总体 PDM 最优为目标，将 best 3.22 的候选轨迹生成与纵向安全修正，同 3.21 中可产生正向同场景贡献的候选筛选能力合并。
+- 不把筛选损失反向传播到候选轨迹生成器，避免 3.21.9 中“筛选器有小幅正贡献、但生成器退化导致总分下降”的问题再次出现。
+
+核心改动
+- 新增独立 RiskModeRankingHead；decoder mode feature 与 candidate poses 在筛选头内 detach，仅历史风险编码器和筛选头接收排序监督。
+- 训练标签使用连续未来前车状态和多目标有向框，联合学习 unsafe 分类、安全候选 pair ranking 与安全集合内的制动时机排序。
+- 推理只在三个条件同时满足时改选：原 3.22 模式被判为不安全、替代模式被判为明确安全、相对不安全概率下降至少 0.10。
+- 保留横向/航向路径守卫，禁止为了降低纵向风险而切换到明显不同的路线意图。
+- 若原模式已被 best 3.22 shield 成功接管，则优先保留该结果；3.21 只补充 shield 未介入的候选筛选场景。
+- 先完成模式筛选，再对选中模式运行 best 3.22 longitudinal safety shield；同时对原 classifier 模式运行完全相同的 shield。
+- 同一次 forward 中把“原 classifier 模式 + 相同 shield”作为精确 counterfactual，使 navtest CSV 直接衡量筛选器相对 best 3.22 的净 PDM 增益。
+- 目标缓存版本升级为 transfuser_target_combined_risk_selector_v1，避免复用旧 3.21/3.22 目标缓存造成字段不兼容。
+
+方向性指标
+- 训练/验证记录 unsafe accuracy/recall、safe recall、timing pair accuracy、base/selected collision rate、rescuable collision recall、new collision rate、selection change rate 与 collision delta。
+- navtest 重点判断 risk_counterfactual_pdm_delta、collision rescue/harm 数量和 intervention rate；若筛选 ON 相对 counterfactual 不为正，则不继续叠加模块，优先调高安全阈值或关闭筛选头。
+
+验证状态
+- 修改文件已通过 Python AST 静态解析。
+- 本地缺少 torch，PyTorch 单元测试留待 NAVSIM 云端环境执行。
+- 完整 cache、训练与 navtest PDM 验证待云端执行。
+
 3.20 第二个创新点：风险时序注意力与决策时机
 
 修改日期
@@ -204,61 +231,3 @@ Verification
 - Python AST parsing passed for all modified Python files; `git diff --check` passed.
 - Standalone YAML parsing was unavailable in the local shell because PyYAML is not installed.
 - Training and PyTorch tests were not run locally; server cache generation, smoke test, full training, and held-out PDM comparison remain required.
-3.22 Endpoint-Conditioned Risk-Aware Temporal Transport
-Date
-- 2026-07-22
-
-Purpose
-- Replace sparse thresholded GT brake-onset imitation with a continuous longitudinal timing target.
-- Preserve the GT-matched mode's geometry and terminal driving intent while improving the intermediate speed profile in high-confidence following scenes.
-
-Core changes
-- TargetBuilder now constructs a training-only ST upper bound from the tracked GT front vehicle projected onto the GT path.
-- A bounded minimum-jerk search selects the maximum feasible terminal progress under front-vehicle, speed, acceleration, and jerk constraints.
-- The resulting target re-samples the original GT polyline by safe progress s(t); lateral geometry and the 20-mode architecture are unchanged.
-- The 3.22 auxiliary loss supervises continuous progress transport, terminal progress, ST-bound violation, acceleration, and jerk for only the GT-matched mode.
-- Existing onset metrics remain available as diagnostics. No GT box, future track, or transport target enters FeatureBuilder or inference.
-
-Cache and experiment requirements
-- Enabling use_endpoint_conditioned_temporal_transport requires a fresh cache because the target name is transfuser_target_temporal_transport_v1.
-- Keep use_longitudinal_safety_shield=False during training. The shield remains an independent inference fallback.
-
-Expected diagnostics
-- brake_timing_active_rate and brake_timing_transport_teacher_shift measure supervision coverage and target displacement.
-- brake_timing_transport_progress_mae, brake_timing_transport_terminal_error, and brake_timing_transport_safety_violation measure whether the generated GT-matched mode learned the transport target.
-- brake_timing_late_rate and brake_timing_early_rate remain timing diagnostics against the optimized target.
-
-Verification
-- Added focused unit coverage for transport loss, GT-matched gradient isolation, path-preserving transport targets, and cache separation.
-- Local static/unit verification is pending; full cache, training, and navtest verification run on the server.
-
-3.22.8 All-mode risk-corridor loss
-Date
-- 2026-07-23
-
-Evidence from 3.22.7
-- Endpoint transport supervision covered only 663 / 85,109 training scenes (0.779%).
-- Training late-brake rate fell from 57.9% to 1.1%, but early-brake rate rose to 94.6%.
-- The loss supervised only the GT-matched mode and only the final decoder layer, while inference selected poses_cls.argmax().
-- Reconstructed raw PDM fell from 0.884954 (3.22.6) to 0.884182 (3.22.7).
-
-Purpose
-- Keep the 3.22 contribution as a training-only loss.
-- Make every front-conflicting mode learn a safe and correctly timed longitudinal response.
-- Preserve each mode's lateral geometry and leave non-conflicting lateral escape modes unconstrained.
-
-Core changes
-- Cache the tracked future front-vehicle boxes in the current ego frame for supervision only.
-- Replace point-target imitation with a mode-specific longitudinal risk corridor.
-- Penalize unsafe clearance, insufficient braking inside the preparation zone, braking before the preparation zone, excessive deceleration, and excessive jerk.
-- Disable the early-braking penalty where the GT trajectory already brakes for another scene constraint.
-- Apply the loss to every conflicting mode at every decoder refinement layer.
-- Keep the inference architecture, mode classifier, mode count, and diffusion process unchanged.
-- Add exact epoch diagnostics for active scenes, active modes, modes per active scene, early/late excess, required deceleration, and clearance violation.
-- Introduce cache schema transfuser_target_all_mode_risk_corridor_v1.
-
-Verification
-- Added focused tests for all-conflicting-mode gradients, lateral-escape preservation,
-  early-brake penalties, and GT-supported braking exemptions.
-- `git diff --check` passed.
-- Local PyTorch tests are not run by default; server cache smoke test and training validation are pending.

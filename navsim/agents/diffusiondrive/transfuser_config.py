@@ -54,11 +54,10 @@ class TransfuserConfig:
     use_temporal_risk_cross_attention: bool = False
     use_memory_aux_loss: bool = False
     use_step_brake_timing_loss: bool = False
-    use_endpoint_conditioned_temporal_transport: bool = False
-    use_all_mode_risk_corridor: bool = False
     use_risk_shadow_evaluator: bool = False
     use_soft_risk_rescore: bool = False
     use_longitudinal_safety_shield: bool = False
+    use_risk_aware_cls: bool = False
 
     # Inference-only PDM-aligned longitudinal safety shield.
     shield_min_reliability: float = 0.50
@@ -67,16 +66,48 @@ class TransfuserConfig:
     shield_min_gap: float = 2.5
     shield_max_gap: float = 8.0
     shield_hard_clearance: float = 1.5
-    shield_clearance_trigger_margin: float = 0.25
     shield_min_decel: float = 0.8
     shield_max_decel: float = 3.5
     shield_decel_margin: float = 0.35
     shield_brake_delay: float = 0.5
     shield_accept_progress_reduction: float = 4.0
     shield_min_clearance_gain: float = 0.75
-    shield_min_consecutive_unsafe_steps: int = 2
-    shield_after_safe_gap_ratio: float = 0.75
-    shield_absolute_max_progress_reduction: float = 5.0
+
+    # 3.20.10: isolated candidate selector trained on continuous future safety.
+    # Candidate generation is protected because selector inputs from the decoder
+    # and generated poses are detached inside RiskModeRankingHead.
+    risk_rank_loss_weight: float = 0.2
+    risk_rank_margin: float = 1.0
+    risk_rank_pair_loss_weight: float = 0.5
+    risk_rank_timing_loss_weight: float = 0.5
+    risk_rank_unsafe_pos_weight: float = 3.0
+    risk_rank_unsafe_ttc_threshold: float = 2.0
+    risk_rank_collision_clearance_threshold: float = 0.0
+    risk_rank_unsafe_probability_threshold: float = 0.50
+    risk_rank_candidate_safe_probability_threshold: float = 0.35
+    risk_rank_min_unsafe_probability_gain: float = 0.10
+    risk_rank_defer_to_base_shield: bool = True
+    risk_rank_inference_topk: int = 20
+    risk_rank_use_inference_path_guard: bool = True
+    risk_rank_inference_lateral_tolerance: float = 0.75
+    risk_rank_inference_heading_tolerance: float = 0.20
+    risk_rank_lateral_tolerance: float = 0.75
+    risk_rank_heading_tolerance: float = 0.20
+    risk_rank_gt_lateral_tolerance: float = 1.50
+    risk_rank_gt_heading_tolerance: float = 0.35
+    risk_rank_gt_xy_weight: float = 1.0
+    risk_rank_gt_heading_weight: float = 0.5
+    risk_rank_min_gt_error_gain: float = 0.10
+    risk_rank_brake_accel_threshold: float = -0.5
+    risk_rank_timing_min_progress_gain: float = 1.0
+    risk_rank_timing_min_decel_gain: float = 0.5
+    risk_rank_timing_max_decel_regression: float = 0.5
+    risk_rank_max_future_agents: int = 30
+    risk_rank_ego_length: float = 5.176
+    risk_rank_ego_width: float = 2.297
+    risk_rank_ego_rear_axle_to_center: float = 1.461
+    risk_rank_collision_margin: float = 0.0
+    risk_pair_ttc_warning_threshold: float = 4.0
 
     # LiDAR-based history risk token settings
     risk_history_num_frames: int = 4
@@ -103,34 +134,6 @@ class TransfuserConfig:
     brake_timing_temperature: float = 0.35
     brake_timing_profile_weight: float = 0.25
     brake_timing_preparation_time: float = 1.0
-
-    # 3.22 endpoint-conditioned risk-aware temporal transport supervision.
-    transport_progress_weight: float = 1.0
-    transport_terminal_weight: float = 1.0
-    transport_safety_weight: float = 2.0
-    transport_acceleration_weight: float = 0.10
-    transport_jerk_weight: float = 0.05
-    transport_min_gap: float = 1.5
-    transport_time_headway: float = 0.75
-    transport_max_gap: float = 8.0
-    transport_min_front_steps: int = 2
-    transport_min_progress_shift: float = 0.10
-    transport_max_speed: float = 30.0
-    transport_max_accel: float = 3.0
-    transport_max_decel: float = 4.0
-    transport_max_jerk: float = 6.0
-
-    # 3.22 all-mode longitudinal risk corridor supervision.
-    risk_corridor_safety_weight: float = 2.0
-    risk_corridor_late_weight: float = 0.5
-    risk_corridor_early_weight: float = 0.5
-    risk_corridor_decel_weight: float = 0.05
-    risk_corridor_jerk_weight: float = 0.05
-    risk_corridor_preparation_time: float = 1.0
-    risk_corridor_early_accel_threshold: float = -0.5
-    risk_corridor_max_decel: float = 4.0
-    risk_corridor_jerk_free: float = 4.0
-    risk_corridor_min_mode_steps: int = 2
 
     # 3.20 stage-1 shadow evaluator. These settings add no trainable parameters.
     risk_shadow_agent_confidence: float = 0.35

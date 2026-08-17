@@ -18,8 +18,9 @@ from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
 from navsim.agents.diffusiondrive.transfuser_config import TransfuserConfig
 from navsim.agents.diffusiondrive.modules.risk_utils import (
     build_gt_brake_timing_context,
+    build_gt_future_agent_targets,
+    build_gt_future_front_targets,
     build_gt_history_risk_targets,
-    build_gt_temporal_transport_target,
     build_history_risk_tokens,
 )
 from navsim.common.dataclasses import AgentInput, Scene, Annotations
@@ -157,16 +158,8 @@ class TransfuserTargetBuilder(AbstractTargetBuilder):
 
     def get_unique_name(self) -> str:
         """Inherited, see superclass."""
-        if (
-            self._config.use_step_brake_timing_loss
-            and getattr(self._config, "use_all_mode_risk_corridor", False)
-        ):
-            return "transfuser_target_all_mode_risk_corridor_v1"
-        if (
-            self._config.use_step_brake_timing_loss
-            and getattr(self._config, "use_endpoint_conditioned_temporal_transport", False)
-        ):
-            return "transfuser_target_temporal_transport_v1"
+        if self._config.use_risk_aware_cls:
+            return "transfuser_target_combined_risk_selector_v1"
         if self._config.use_step_brake_timing_loss:
             return "transfuser_target_brake_timing_v2"
         if self._config.use_memory_aux_loss:
@@ -200,30 +193,20 @@ class TransfuserTargetBuilder(AbstractTargetBuilder):
             targets["brake_timing_context"] = torch.tensor(
                 build_gt_brake_timing_context(scene, self._config), dtype=torch.float32
             )
-            if (
-                getattr(self._config, "use_endpoint_conditioned_temporal_transport", False)
-                or getattr(self._config, "use_all_mode_risk_corridor", False)
-            ):
-                transport_target = build_gt_temporal_transport_target(scene, self._config)
-                targets["temporal_transport_front_boxes"] = torch.tensor(
-                    transport_target["front_boxes"], dtype=torch.float32
-                )
-                targets["temporal_transport_front_mask"] = torch.tensor(
-                    transport_target["front_mask"], dtype=torch.float32
-                )
-                if not getattr(self._config, "use_all_mode_risk_corridor", False):
-                    targets["temporal_transport_target"] = torch.tensor(
-                        transport_target["target"], dtype=torch.float32
-                    )
-                    targets["temporal_transport_upper_s"] = torch.tensor(
-                        transport_target["upper_s"], dtype=torch.float32
-                    )
-                    targets["temporal_transport_constraint_mask"] = torch.tensor(
-                        transport_target["constraint_mask"], dtype=torch.float32
-                    )
-                    targets["temporal_transport_valid"] = torch.tensor(
-                        transport_target["valid"], dtype=torch.float32
-                    )
+        if self._config.use_risk_aware_cls:
+            ranking_targets = build_gt_future_front_targets(scene, self._config)
+            targets["risk_front_future"] = torch.tensor(
+                ranking_targets["risk_front_future"], dtype=torch.float32
+            )
+            targets["risk_pair_context"] = torch.tensor(
+                ranking_targets["risk_pair_context"], dtype=torch.float32
+            )
+            targets["risk_pair_scene_active"] = torch.tensor(
+                ranking_targets["risk_pair_scene_active"], dtype=torch.float32
+            )
+            targets["risk_future_agents"] = torch.tensor(
+                build_gt_future_agent_targets(scene, self._config), dtype=torch.float32
+            )
 
         return targets
 

@@ -9,10 +9,7 @@ from navsim.agents.diffusiondrive.modules.risk_brake_timing import (
     compute_brake_timing_diagnostics,
     compute_brake_timing_loss,
 )
-from navsim.agents.diffusiondrive.modules.risk_utils import (
-    build_gt_brake_timing_context,
-    build_gt_temporal_transport_target,
-)
+from navsim.agents.diffusiondrive.modules.risk_utils import build_gt_brake_timing_context
 from navsim.agents.diffusiondrive.transfuser_features import (
     TransfuserFeatureBuilder,
     TransfuserTargetBuilder,
@@ -27,11 +24,6 @@ def _config():
         brake_timing_profile_weight=0.25,
         brake_timing_preparation_time=1.0,
         brake_timing_loss_weight=0.1,
-        transport_progress_weight=1.0,
-        transport_terminal_weight=1.0,
-        transport_safety_weight=2.0,
-        transport_acceleration_weight=0.10,
-        transport_jerk_weight=0.05,
     )
 
 
@@ -60,33 +52,6 @@ class BrakeTimingLossTest(unittest.TestCase):
         context = torch.tensor([[6.0, 3.0, 2.5, 2.0, 8.0]])
         return poses, anchors, {"trajectory": target, "brake_timing_context": context}
 
-    @staticmethod
-    def _add_transport_targets(targets):
-        teacher = targets["trajectory"].clone()
-        teacher[:, :, 0] = teacher[:, :, 0] * 0.8
-        targets.update(
-            {
-                "temporal_transport_target": teacher,
-                "temporal_transport_upper_s": teacher[:, :, 0] + 0.2,
-                "temporal_transport_constraint_mask": torch.ones_like(teacher[:, :, 0]),
-                "temporal_transport_valid": torch.ones(teacher.shape[0], 1),
-            }
-        )
-
-    @staticmethod
-    def _add_corridor_targets(targets, front_x=15.0):
-        batch_size, num_poses = targets["trajectory"].shape[:2]
-        front_boxes = torch.zeros(batch_size, num_poses, 4)
-        front_boxes[..., 0] = front_x
-        front_boxes[..., 2] = 4.0
-        front_boxes[..., 3] = 2.0
-        targets.update(
-            {
-                "temporal_transport_front_boxes": front_boxes,
-                "temporal_transport_front_mask": torch.ones(batch_size, num_poses),
-            }
-        )
-
     def test_preparation_zone_activates_loss(self):
         poses, anchors, targets = self._inputs()
         poses.data[:, 0, :, 0] += torch.linspace(0.0, 2.0, 8)
@@ -108,85 +73,6 @@ class BrakeTimingLossTest(unittest.TestCase):
         output["brake_timing_loss"].backward()
         self.assertGreater(float(poses.grad[:, 0].abs().sum()), 0.0)
         self.assertEqual(float(poses.grad[:, 1].abs().sum()), 0.0)
-
-    def test_transport_loss_uses_continuous_progress_target(self):
-        poses, anchors, targets = self._inputs()
-        self._add_transport_targets(targets)
-        poses.data[:, 0, :, 0] += 2.0
-
-        output = compute_brake_timing_loss(poses, targets, anchors, _config())
-
-        self.assertEqual(float(output["brake_timing_active_rate"]), 1.0)
-        self.assertGreater(float(output["brake_timing_transport_progress_mae"]), 0.0)
-        self.assertGreater(float(output["brake_timing_transport_safety_violation"]), 0.0)
-        self.assertGreater(float(output["brake_timing_loss"]), 0.0)
-
-    def test_transport_loss_only_updates_gt_matched_mode(self):
-        poses, anchors, targets = self._inputs()
-        self._add_transport_targets(targets)
-        poses.data[:, 0, :, 0] += 2.0
-        output = compute_brake_timing_loss(poses, targets, anchors, _config())
-
-        output["brake_timing_loss"].backward()
-
-        self.assertGreater(float(poses.grad[:, 0].abs().sum()), 0.0)
-        self.assertEqual(float(poses.grad[:, 1].abs().sum()), 0.0)
-
-    def test_all_mode_corridor_updates_every_conflicting_mode(self):
-        poses, anchors, targets = self._inputs()
-        poses.data[:, 1, :, 1] = 0.5
-        self._add_corridor_targets(targets)
-        config = _config()
-        config.use_all_mode_risk_corridor = True
-
-        output = compute_brake_timing_loss(poses, targets, anchors, config)
-        output["brake_timing_loss"].backward()
-
-        self.assertEqual(float(output["brake_timing_active_mode_count"]), 2.0)
-        self.assertGreater(float(poses.grad[:, 0].abs().sum()), 0.0)
-        self.assertGreater(float(poses.grad[:, 1].abs().sum()), 0.0)
-
-    def test_all_mode_corridor_preserves_lateral_escape_mode(self):
-        poses, anchors, targets = self._inputs()
-        poses.data[:, 1, :, 1] = 4.0
-        self._add_corridor_targets(targets)
-        config = _config()
-        config.use_all_mode_risk_corridor = True
-
-        output = compute_brake_timing_loss(poses, targets, anchors, config)
-        output["brake_timing_loss"].backward()
-
-        self.assertEqual(float(output["brake_timing_active_mode_count"]), 1.0)
-        self.assertGreater(float(poses.grad[:, 0].abs().sum()), 0.0)
-        self.assertEqual(float(poses.grad[:, 1].abs().sum()), 0.0)
-
-    def test_all_mode_corridor_penalizes_braking_before_preparation_zone(self):
-        poses, anchors, targets = self._inputs()
-        gt_speed = torch.full((8,), 6.0)
-        gt_x = torch.cumsum(gt_speed * 0.5, dim=0)
-        targets["trajectory"] = torch.stack(
-            [gt_x, torch.zeros_like(gt_x), torch.zeros_like(gt_x)],
-            dim=-1,
-        ).unsqueeze(0)
-        self._add_corridor_targets(targets, front_x=20.0)
-        config = _config()
-        config.use_all_mode_risk_corridor = True
-
-        output = compute_brake_timing_loss(poses, targets, anchors, config)
-
-        self.assertGreater(float(output["brake_timing_corridor_early_brake_excess"]), 0.0)
-        self.assertGreater(float(output["brake_timing_corridor_early_loss"]), 0.0)
-
-    def test_all_mode_corridor_does_not_penalize_gt_supported_early_braking(self):
-        poses, anchors, targets = self._inputs()
-        self._add_corridor_targets(targets, front_x=20.0)
-        config = _config()
-        config.use_all_mode_risk_corridor = True
-
-        output = compute_brake_timing_loss(poses, targets, anchors, config)
-
-        self.assertEqual(float(output["brake_timing_corridor_early_brake_excess"]), 0.0)
-        self.assertEqual(float(output["brake_timing_corridor_early_loss"]), 0.0)
 
     def test_stationary_trajectory_has_finite_zero_displacement_gradient(self):
         poses = torch.zeros(1, 8, 3, requires_grad=True)
@@ -307,57 +193,6 @@ class BrakeTimingLossTest(unittest.TestCase):
 
         self.assertEqual(float(context[4]), 0.0)
 
-    def test_transport_target_preserves_gt_path_geometry(self):
-        box = [15.0, 0.0, 0.0, 4.0, 2.0, 1.5, 0.0]
-        frames = [
-            SimpleNamespace(
-                annotations=self._annotations([box], ["front"]),
-                ego_status=SimpleNamespace(
-                    ego_pose=np.array([0.0, 0.0, 0.0]),
-                    ego_velocity=np.array([6.0, 0.0]),
-                ),
-            )
-            for _ in range(9)
-        ]
-        scene = SimpleNamespace(
-            scene_metadata=SimpleNamespace(num_history_frames=1),
-            frames=frames,
-            get_future_trajectory=lambda num_trajectory_frames: SimpleNamespace(
-                poses=np.stack(
-                    [np.array([3.0 * (step + 1), 0.0, 0.0]) for step in range(num_trajectory_frames)]
-                )
-            ),
-        )
-        config = SimpleNamespace(
-            trajectory_sampling=SimpleNamespace(num_poses=8),
-            risk_history_dt=0.5,
-            brake_timing_preparation_time=1.0,
-            transport_min_gap=1.5,
-            transport_time_headway=0.75,
-            transport_max_gap=8.0,
-            transport_min_front_steps=2,
-            transport_min_progress_shift=0.10,
-            transport_max_speed=30.0,
-            transport_max_accel=10.0,
-            transport_max_decel=10.0,
-            transport_max_jerk=30.0,
-        )
-
-        transport = build_gt_temporal_transport_target(scene, config)
-
-        self.assertEqual(float(transport["valid"][0]), 1.0)
-        self.assertEqual(float(transport["front_mask"].sum()), 8.0)
-        self.assertTrue(np.allclose(transport["front_boxes"][:, 0], 15.0))
-        self.assertGreater(float(transport["target"][0, 0]), 2.0)
-        self.assertTrue(np.allclose(transport["target"][:, 1], 0.0))
-        self.assertTrue(np.all(np.diff(transport["target"][:, 0]) >= -1e-5))
-        self.assertTrue(
-            np.all(
-                transport["target"][:, 0][transport["constraint_mask"] > 0.5]
-                <= transport["upper_s"][transport["constraint_mask"] > 0.5] + 1e-4
-            )
-        )
-
     def test_cache_names_separate_incompatible_risk_data(self):
         config = SimpleNamespace(
             use_risk_gate=False,
@@ -365,10 +200,7 @@ class BrakeTimingLossTest(unittest.TestCase):
             use_temporal_risk_cross_attention=False,
             use_risk_shadow_evaluator=False,
             use_soft_risk_rescore=False,
-            use_longitudinal_safety_shield=False,
             use_step_brake_timing_loss=True,
-            use_endpoint_conditioned_temporal_transport=True,
-            use_all_mode_risk_corridor=True,
             use_memory_aux_loss=True,
         )
 
@@ -378,7 +210,7 @@ class BrakeTimingLossTest(unittest.TestCase):
         )
         self.assertEqual(
             TransfuserTargetBuilder(config).get_unique_name(),
-            "transfuser_target_all_mode_risk_corridor_v1",
+            "transfuser_target_brake_timing_v2",
         )
 
 

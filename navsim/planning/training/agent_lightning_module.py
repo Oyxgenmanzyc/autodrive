@@ -25,6 +25,7 @@ class AgentLightningModule(pl.LightningModule):
         self.agent = agent
         self._finite_trace_context = "not-started"
         self._brake_timing_epoch_stats = {"train": {}, "val": {}}
+        self._risk_rank_epoch_stats = {"train": {}, "val": {}}
 
     def _reset_brake_timing_epoch_stats(self, logging_prefix: str) -> None:
         self._brake_timing_epoch_stats[logging_prefix] = {}
@@ -62,33 +63,18 @@ class AgentLightningModule(pl.LightningModule):
             scene_count = stats[f"{metric_prefix}_scene_count"].clamp(min=1.0)
             active_count = stats[f"{metric_prefix}_active_count"]
             active_denom = active_count.clamp(min=1.0)
-            metric_denom = active_denom
             derived = {
                 f"{metric_prefix}_pre_risk_rate": stats[f"{metric_prefix}_pre_risk_count"] / scene_count,
                 f"{metric_prefix}_gt_brake_rate": stats[f"{metric_prefix}_gt_brake_count"] / scene_count,
                 f"{metric_prefix}_active_rate": active_count / scene_count,
             }
-            mode_count_key = f"{metric_prefix}_mode_count"
-            active_mode_count_key = f"{metric_prefix}_active_mode_count"
-            if mode_count_key in stats and active_mode_count_key in stats:
-                active_mode_count = stats[active_mode_count_key]
-                metric_denom = active_mode_count.clamp(min=1.0)
-                derived[f"{metric_prefix}_active_mode_rate"] = (
-                    active_mode_count / stats[mode_count_key].clamp(min=1.0)
-                )
-                derived[f"{metric_prefix}_active_modes_per_active_scene"] = (
-                    active_mode_count / active_denom
-                )
             for key, value in stats.items():
                 owner = next((prefix for prefix in metric_prefixes if key.startswith(f"{prefix}_")), None)
                 if owner == metric_prefix and key.endswith("_sum"):
-                    derived[key[:-4]] = value / metric_denom
+                    derived[key[:-4]] = value / active_denom
 
             for count_name in ("scene_count", "pre_risk_count", "gt_brake_count", "active_count"):
                 derived[f"{metric_prefix}_{count_name}"] = stats[f"{metric_prefix}_{count_name}"]
-            if mode_count_key in stats and active_mode_count_key in stats:
-                derived[mode_count_key] = stats[mode_count_key]
-                derived[active_mode_count_key] = stats[active_mode_count_key]
 
             for key, value in derived.items():
                 self.log(
@@ -99,6 +85,80 @@ class AgentLightningModule(pl.LightningModule):
                     prog_bar=key.endswith(("active_rate", "onset_abs_error_s", "late_rate")),
                     sync_dist=False,
                 )
+
+    def _reset_risk_rank_epoch_stats(self, logging_prefix: str) -> None:
+        self._risk_rank_epoch_stats[logging_prefix] = {}
+
+    def _update_risk_rank_epoch_stats(
+        self,
+        logging_prefix: str,
+        loss_dict: Dict[str, Tensor],
+    ) -> None:
+        stats = self._risk_rank_epoch_stats[logging_prefix]
+        for key, value in loss_dict.items():
+            if not key.startswith("risk_rank_stat_"):
+                continue
+            if not torch.is_tensor(value) or value.numel() != 1:
+                continue
+            detached = value.detach().float()
+            stats[key] = stats.get(key, torch.zeros_like(detached)) + detached
+
+    def _log_risk_rank_epoch_stats(self, logging_prefix: str) -> None:
+        """Log exact selector outcomes needed to decide whether it is worth keeping."""
+
+        stats = self._risk_rank_epoch_stats[logging_prefix]
+        if not stats:
+            return
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            for value in stats.values():
+                torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM)
+
+        reference = next(iter(stats.values()))
+
+        def get(name: str) -> Tensor:
+            return stats.get(name, torch.zeros_like(reference))
+
+        scene_count = get("risk_rank_stat_scene_count").clamp(min=1.0)
+        valid_mode_count = get("risk_rank_stat_valid_mode_count").clamp(min=1.0)
+        unsafe_count = get("risk_rank_stat_unsafe_true_count").clamp(min=1.0)
+        safe_count = get("risk_rank_stat_safe_true_count").clamp(min=1.0)
+        quality_pair_count = get("risk_rank_stat_quality_pair_count").clamp(min=1.0)
+        rescuable_count = get(
+            "risk_rank_stat_rescuable_collision_scene_count"
+        ).clamp(min=1.0)
+        base_noncollision_count = (
+            scene_count - get("risk_rank_stat_base_collision_scene_count")
+        ).clamp(min=1.0)
+        metrics = {
+            "risk_rank_exact_active_scene_rate": get("risk_rank_stat_active_scene_count") / scene_count,
+            "risk_rank_exact_pair_scene_rate": get("risk_rank_stat_pair_scene_count") / scene_count,
+            "risk_rank_exact_unsafe_rate": get("risk_rank_stat_unsafe_mode_count") / valid_mode_count,
+            "risk_rank_exact_unsafe_accuracy": get("risk_rank_stat_correct_mode_count") / valid_mode_count,
+            "risk_rank_exact_unsafe_recall": get("risk_rank_stat_unsafe_true_positive_count") / unsafe_count,
+            "risk_rank_exact_safe_recall": get("risk_rank_stat_safe_true_negative_count") / safe_count,
+            "risk_rank_exact_timing_pair_accuracy": get("risk_rank_stat_timing_pair_correct_count") / quality_pair_count,
+            "risk_rank_exact_base_timing_pair_accuracy": get("risk_rank_stat_base_quality_pair_correct_count") / quality_pair_count,
+            "risk_rank_exact_base_collision_rate": get("risk_rank_stat_base_collision_scene_count") / scene_count,
+            "risk_rank_exact_selected_collision_rate": get("risk_rank_stat_selected_collision_scene_count") / scene_count,
+            "risk_rank_exact_rescuable_collision_recall": get("risk_rank_stat_rescued_collision_scene_count") / rescuable_count,
+            "risk_rank_exact_new_collision_rate": get("risk_rank_stat_new_collision_scene_count") / base_noncollision_count,
+            "risk_rank_exact_selection_change_rate": get("risk_rank_stat_selection_change_count") / scene_count,
+            "risk_rank_exact_collision_delta": (
+                get("risk_rank_stat_selected_collision_scene_count")
+                - get("risk_rank_stat_base_collision_scene_count")
+            ) / scene_count,
+            "risk_rank_exact_rescued_collision_count": get("risk_rank_stat_rescued_collision_scene_count"),
+            "risk_rank_exact_new_collision_count": get("risk_rank_stat_new_collision_scene_count"),
+        }
+        for key, value in metrics.items():
+            self.log(
+                f"{logging_prefix}/{key}",
+                value,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=key.endswith(("collision_delta", "selection_change_rate")),
+                sync_dist=False,
+            )
 
     def _set_finite_trace_context(self, features: Dict[str, Tensor], logging_prefix: str, batch_idx: int) -> None:
         tokens = features.get("_cache_token", [])
@@ -154,6 +214,7 @@ class AgentLightningModule(pl.LightningModule):
         except FloatingPointError as error:
             self._raise_with_context(error)
         self._update_brake_timing_epoch_stats(logging_prefix, loss_dict)
+        self._update_risk_rank_epoch_stats(logging_prefix, loss_dict)
         batch_size = next(value.shape[0] for value in features.values() if torch.is_tensor(value))
         progress_bar_keys = {
             "loss",
@@ -162,9 +223,14 @@ class AgentLightningModule(pl.LightningModule):
             "brake_timing_active_rate",
             "brake_timing_onset_abs_error_s",
             "brake_timing_late_rate",
+            "risk_mode_ranking_loss",
+            "risk_rank_unsafe_accuracy",
+            "risk_rank_rescuable_collision_recall",
         }
         for k, v in loss_dict.items():
             if v is not None:
+                if k.startswith("risk_rank_stat_"):
+                    continue
                 if k.startswith("brake_timing"):
                     if k in progress_bar_keys:
                         self.log(
@@ -208,15 +274,19 @@ class AgentLightningModule(pl.LightningModule):
 
     def on_train_epoch_start(self) -> None:
         self._reset_brake_timing_epoch_stats("train")
+        self._reset_risk_rank_epoch_stats("train")
 
     def on_validation_epoch_start(self) -> None:
         self._reset_brake_timing_epoch_stats("val")
+        self._reset_risk_rank_epoch_stats("val")
 
     def on_train_epoch_end(self) -> None:
         self._log_brake_timing_epoch_stats("train")
+        self._log_risk_rank_epoch_stats("train")
 
     def on_validation_epoch_end(self) -> None:
         self._log_brake_timing_epoch_stats("val")
+        self._log_risk_rank_epoch_stats("val")
 
     def on_before_optimizer_step(self, optimizer) -> None:
         """Stop before a non-finite gradient can poison model parameters."""

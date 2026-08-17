@@ -23,6 +23,10 @@ RISK_TOKEN_FIELDS = (
 
 RISK_LABEL_NAMES = ("risk_trend", "urgency", "brake_need")
 
+RISK_COLLISION_OBJECT_NAMES = frozenset(
+    {"vehicle", "pedestrian", "bicycle", "traffic_cone", "barrier", "generic_object"}
+)
+
 
 def _cfg(config: Any, name: str, default: Any) -> Any:
     return getattr(config, name, default)
@@ -308,7 +312,6 @@ def _box_in_origin_frame(box: np.ndarray, frame_ego_pose: np.ndarray, origin_ego
             origin_cos * delta_x + origin_sin * delta_y,
             -origin_sin * delta_x + origin_cos * delta_y,
             float(box[3]),
-            float(box[4]),
         ],
         dtype=np.float32,
     )
@@ -392,225 +395,179 @@ def build_gt_brake_timing_context(scene: Any, config: Any) -> np.ndarray:
     return context
 
 
-def _cumulative_path_progress(path_xy: np.ndarray) -> np.ndarray:
-    points = np.concatenate([np.zeros((1, 2), dtype=np.float32), path_xy.astype(np.float32)], axis=0)
-    return np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1)).astype(np.float32)
-
-
-def _project_to_path(point_xy: np.ndarray, path_xy: np.ndarray, progress: np.ndarray) -> tuple[float, float]:
-    """Project a point onto the fixed GT path and return longitudinal/lateral coordinates."""
-
-    points = np.concatenate([np.zeros((1, 2), dtype=np.float32), path_xy.astype(np.float32)], axis=0)
-    starts, ends = points[:-1], points[1:]
-    segments = ends - starts
-    length_sq = np.maximum((segments * segments).sum(axis=1), 1e-6)
-    raw_ratio = ((point_xy[None] - starts) * segments).sum(axis=1) / length_sq
-    ratio = np.clip(raw_ratio, 0.0, 1.0)
-    projections = starts + ratio[:, None] * segments
-    index = int(np.argmin(((projections - point_xy[None]) ** 2).sum(axis=1)))
-    if index == len(segments) - 1 and raw_ratio[index] > 1.0:
-        ratio[index] = raw_ratio[index]
-        projections[index] = starts[index] + ratio[index] * segments[index]
-    segment_length = float(np.sqrt(length_sq[index]))
-    return float(progress[index] + ratio[index] * segment_length), float(
-        np.linalg.norm(projections[index] - point_xy)
-    )
-
-
-def _minimum_jerk_progress(
-    terminal_progress: float,
-    initial_speed: float,
-    terminal_speed: float,
-    num_poses: int,
-    dt: float,
+def _box6_in_origin_frame(
+    box: np.ndarray,
+    frame_ego_pose: np.ndarray,
+    origin_ego_pose: np.ndarray,
 ) -> np.ndarray:
-    """Create a minimum-jerk longitudinal profile with fixed start/end state."""
+    """Transform a box to ``x, y, heading, length, width, valid`` in origin ego."""
 
-    horizon = num_poses * dt
-    system = np.array(
+    frame_x, frame_y, frame_heading = [float(value) for value in frame_ego_pose]
+    origin_x, origin_y, origin_heading = [float(value) for value in origin_ego_pose]
+    local_x = float(np.nan_to_num(box[0], nan=0.0, posinf=0.0, neginf=0.0))
+    local_y = float(np.nan_to_num(box[1], nan=0.0, posinf=0.0, neginf=0.0))
+    local_heading = float(np.nan_to_num(box[2], nan=0.0, posinf=0.0, neginf=0.0))
+    frame_cos, frame_sin = np.cos(frame_heading), np.sin(frame_heading)
+    global_x = frame_x + frame_cos * local_x - frame_sin * local_y
+    global_y = frame_y + frame_sin * local_x + frame_cos * local_y
+    delta_x, delta_y = global_x - origin_x, global_y - origin_y
+    origin_cos, origin_sin = np.cos(origin_heading), np.sin(origin_heading)
+    heading = np.arctan2(
+        np.sin(frame_heading + local_heading - origin_heading),
+        np.cos(frame_heading + local_heading - origin_heading),
+    )
+    return np.array(
         [
-            [horizon**3, horizon**4, horizon**5],
-            [3.0 * horizon**2, 4.0 * horizon**3, 5.0 * horizon**4],
-            [6.0 * horizon, 12.0 * horizon**2, 20.0 * horizon**3],
+            origin_cos * delta_x + origin_sin * delta_y,
+            -origin_sin * delta_x + origin_cos * delta_y,
+            heading,
+            float(box[3]),
+            float(box[4]),
+            1.0,
         ],
-        dtype=np.float64,
-    )
-    target = np.array(
-        [terminal_progress - initial_speed * horizon, terminal_speed - initial_speed, 0.0],
-        dtype=np.float64,
-    )
-    try:
-        c3, c4, c5 = np.linalg.solve(system, target)
-    except np.linalg.LinAlgError:
-        return np.full(num_poses, np.nan, dtype=np.float32)
-    time = np.arange(1, num_poses + 1, dtype=np.float64) * dt
-    progress = initial_speed * time + c3 * time**3 + c4 * time**4 + c5 * time**5
-    # A feasible stop near the horizon can produce a sub-centimeter polynomial
-    # overshoot in finite precision. Progress must remain forward-only because
-    # the target reuses the original path geometry rather than reversing on it.
-    return np.maximum.accumulate(progress).astype(np.float32)
-
-
-def _sample_path_by_progress(path: np.ndarray, progress: np.ndarray, query: np.ndarray) -> np.ndarray:
-    """Sample the original GT geometry at a new monotonic progress schedule."""
-
-    points = np.concatenate([np.zeros((1, 2), dtype=np.float32), path[:, :2].astype(np.float32)], axis=0)
-    headings = np.concatenate([np.zeros(1, dtype=np.float32), path[:, 2].astype(np.float32)])
-    path_progress = np.concatenate([np.zeros(1, dtype=np.float32), progress.astype(np.float32)])
-    sampled = np.zeros_like(path, dtype=np.float32)
-    for index, value in enumerate(query):
-        upper = int(np.clip(np.searchsorted(path_progress, value, side="left"), 1, len(path_progress) - 1))
-        lower = upper - 1
-        denominator = max(float(path_progress[upper] - path_progress[lower]), 1e-6)
-        ratio = float(np.clip((value - path_progress[lower]) / denominator, 0.0, 1.0))
-        sampled[index, :2] = points[lower] + ratio * (points[upper] - points[lower])
-        heading_delta = np.arctan2(
-            np.sin(headings[upper] - headings[lower]),
-            np.cos(headings[upper] - headings[lower]),
-        )
-        sampled[index, 2] = headings[lower] + ratio * heading_delta
-    return sampled
-
-
-def _transport_profile_is_feasible(
-    progress: np.ndarray,
-    upper_bounds: np.ndarray,
-    initial_speed: float,
-    config: Any,
-    dt: float,
-) -> bool:
-    if not np.isfinite(progress).all() or np.any(np.diff(progress) < -1e-4):
-        return False
-    speed = np.diff(np.concatenate([np.zeros(1, dtype=np.float32), progress])) / dt
-    acceleration = np.diff(np.concatenate([[initial_speed], speed])) / dt
-    jerk = np.diff(acceleration) / dt
-    return bool(
-        np.all(progress <= upper_bounds + 1e-3)
-        and np.all(speed >= -1e-4)
-        and np.all(speed <= float(_cfg(config, "transport_max_speed", 30.0)))
-        and np.all(acceleration >= -float(_cfg(config, "transport_max_decel", 4.0)))
-        and np.all(acceleration <= float(_cfg(config, "transport_max_accel", 3.0)))
-        and np.all(np.abs(jerk) <= float(_cfg(config, "transport_max_jerk", 6.0)))
-    )
-
-
-def build_gt_temporal_transport_target(scene: Any, config: Any) -> Dict[str, np.ndarray]:
-    """Build a GT-only, endpoint-conditioned longitudinal transport target.
-
-    The target preserves the GT polyline geometry and optimizes only its progress
-    schedule. Future tracked boxes supply an ST upper bound during training; they
-    are never exposed through model features at inference.
-    """
-
-    num_poses = int(config.trajectory_sampling.num_poses)
-    dt = max(float(_cfg(config, "risk_history_dt", 0.5)), 1e-3)
-    trajectory = np.asarray(
-        scene.get_future_trajectory(num_trajectory_frames=num_poses).poses,
         dtype=np.float32,
     )
-    gt_progress = _cumulative_path_progress(trajectory[:, :2])
-    unconstrained_bound = max(float(gt_progress[-1]), 1.0) + 100.0
-    result = {
-        "target": trajectory.copy(),
-        "upper_s": np.full(num_poses, unconstrained_bound, dtype=np.float32),
-        "constraint_mask": np.zeros(num_poses, dtype=np.float32),
-        "valid": np.zeros(1, dtype=np.float32),
-        "front_boxes": np.zeros((num_poses, 4), dtype=np.float32),
-        "front_mask": np.zeros(num_poses, dtype=np.float32),
-    }
 
+
+def build_gt_future_agent_targets(scene: Any, config: Any) -> np.ndarray:
+    """Build fixed-shape future object boxes for candidate collision supervision."""
+
+    num_poses = int(config.trajectory_sampling.num_poses)
+    max_agents = int(_cfg(config, "risk_rank_max_future_agents", 30))
+    future_agents = np.zeros((num_poses, max_agents, 6), dtype=np.float32)
     current_idx = scene.scene_metadata.num_history_frames - 1
     current_frame = scene.frames[current_idx]
-    front = _select_front_vehicle(current_frame.annotations, config, preferred_track_token=None)
-    if front is None or not front["track_token"]:
-        return result
+    annotations = current_frame.annotations
 
+    tracks = []
+    for box, name, track_token in zip(
+        annotations.boxes, annotations.names, annotations.track_tokens
+    ):
+        if name not in RISK_COLLISION_OBJECT_NAMES or not track_token:
+            continue
+        x = float(np.nan_to_num(box[0], nan=0.0, posinf=0.0, neginf=0.0))
+        y = float(np.nan_to_num(box[1], nan=0.0, posinf=0.0, neginf=0.0))
+        if not (
+            float(_cfg(config, "lidar_min_x", -32.0))
+            <= x
+            <= float(_cfg(config, "lidar_max_x", 32.0))
+            and float(_cfg(config, "lidar_min_y", -32.0))
+            <= y
+            <= float(_cfg(config, "lidar_max_y", 32.0))
+        ):
+            continue
+        tracks.append((x * x + y * y, str(track_token)))
+    track_tokens = [token for _, token in sorted(tracks)[:max_agents]]
     origin_pose = np.asarray(current_frame.ego_status.ego_pose, dtype=np.float64)
-    initial_speed = max(float(np.nan_to_num(current_frame.ego_status.ego_velocity[0])), 0.0)
-    gt_speed = np.diff(np.concatenate([[0.0], gt_progress])) / dt
-    terminal_speed = max(float(gt_speed[-1]), 0.0)
-    upper_s = result["upper_s"]
-    constraint_mask = result["constraint_mask"]
-    continuous_steps = 0
-    ego_width = float(_cfg(config, "risk_shadow_ego_width", 2.0))
-    lateral_margin = float(_cfg(config, "risk_shadow_lateral_margin", 0.3))
-    min_gap = float(_cfg(config, "transport_min_gap", 1.5))
-    time_headway = float(_cfg(config, "transport_time_headway", 0.75))
-    max_gap = float(_cfg(config, "transport_max_gap", 8.0))
-    ego_front_offset = float(_cfg(config, "risk_ego_front_offset", 2.0))
 
     for step in range(num_poses):
         frame_idx = current_idx + step + 1
         if frame_idx >= len(scene.frames):
             break
         frame = scene.frames[frame_idx]
-        try:
-            track_idx = frame.annotations.track_tokens.index(front["track_token"])
-        except ValueError:
+        token_to_index = {
+            str(token): idx for idx, token in enumerate(frame.annotations.track_tokens)
+        }
+        for agent_idx, token in enumerate(track_tokens):
+            box_idx = token_to_index.get(token)
+            if box_idx is None:
+                continue
+            future_agents[step, agent_idx] = _box6_in_origin_frame(
+                frame.annotations.boxes[box_idx],
+                np.asarray(frame.ego_status.ego_pose, dtype=np.float64),
+                origin_pose,
+            )
+    return future_agents
+
+
+def build_gt_future_front_targets(scene: Any, config: Any) -> Dict[str, np.ndarray]:
+    """Build continuous future lead-vehicle targets for pairwise mode mining."""
+
+    num_poses = int(config.trajectory_sampling.num_poses)
+    dt = max(float(_cfg(config, "risk_history_dt", 0.5)), 1e-3)
+    ttc_max = float(_cfg(config, "risk_ttc_max", 10.0))
+    future_front = np.zeros((num_poses, 6), dtype=np.float32)
+    context = np.zeros(5, dtype=np.float32)
+    current_idx = scene.scene_metadata.num_history_frames - 1
+    current_frame = scene.frames[current_idx]
+    front = _select_front_vehicle(
+        current_frame.annotations, config, preferred_track_token=None
+    )
+    if front is None or not front["track_token"]:
+        return {
+            "risk_front_future": future_front,
+            "risk_pair_context": context,
+            "risk_pair_scene_active": np.array(0.0, dtype=np.float32),
+        }
+
+    origin_pose = np.asarray(current_frame.ego_status.ego_pose, dtype=np.float64)
+    continuous_steps = 0
+    for step in range(num_poses):
+        frame_idx = current_idx + step + 1
+        if frame_idx >= len(scene.frames):
             break
-        if frame.annotations.names[track_idx] != "vehicle":
+        frame = scene.frames[frame_idx]
+        token_to_index = {
+            str(token): idx for idx, token in enumerate(frame.annotations.track_tokens)
+        }
+        box_idx = token_to_index.get(str(front["track_token"]))
+        if box_idx is None:
             break
-        transformed = _box_in_origin_frame(
-            frame.annotations.boxes[track_idx],
+        future_front[step] = _box6_in_origin_frame(
+            frame.annotations.boxes[box_idx],
             np.asarray(frame.ego_status.ego_pose, dtype=np.float64),
             origin_pose,
         )
-        result["front_boxes"][step] = transformed[:4]
-        result["front_mask"][step] = 1.0
         continuous_steps += 1
-        front_s, lateral_distance = _project_to_path(transformed[:2], trajectory[:, :2], gt_progress)
-        overlap_limit = 0.5 * (ego_width + max(float(transformed[3]), 0.5)) + lateral_margin
-        if lateral_distance > overlap_limit:
-            continue
-        desired_gap = min(max(min_gap, time_headway * max(float(gt_speed[step]), 0.0)), max_gap)
-        upper_s[step] = max(front_s - 0.5 * max(float(transformed[2]), 0.5) - ego_front_offset - desired_gap, 0.0)
-        constraint_mask[step] = 1.0
 
-    if getattr(config, "use_all_mode_risk_corridor", False):
-        return result
-
-    context = build_gt_brake_timing_context(scene, config)
-    pre_risk = bool(
-        continuous_steps >= int(_cfg(config, "transport_min_front_steps", 2))
-        and min(float(context[1]), float(context[2]))
-        <= float(context[3]) + float(_cfg(config, "brake_timing_preparation_time", 1.0))
+    ego_v = max(
+        float(
+            np.nan_to_num(
+                current_frame.ego_status.ego_velocity[0],
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+        ),
+        0.0,
     )
-    if not pre_risk or constraint_mask.sum() <= 0.0:
-        return result
-
-    constrained_indices = np.flatnonzero(constraint_mask > 0.5)
-    if len(constrained_indices) >= 2:
-        last_index, previous_index = constrained_indices[-1], constrained_indices[-2]
-        boundary_speed = max(
-            float((upper_s[last_index] - upper_s[previous_index]) / ((last_index - previous_index) * dt)),
-            0.0,
+    rel_v = max(ego_v - float(front["lead_v"]), 0.0)
+    current_ttc = (
+        min(float(front["gap"]) / max(rel_v, 1e-3), ttc_max)
+        if rel_v > 0.1
+        else ttc_max
+    )
+    delayed_ttc = ttc_max
+    if continuous_steps > 0:
+        gt_ego = scene.get_future_trajectory(num_trajectory_frames=num_poses).poses
+        delayed_gap = max(
+            float(future_front[0, 0])
+            - 0.5 * float(future_front[0, 3])
+            - float(gt_ego[0, 0])
+            - float(_cfg(config, "risk_ego_front_offset", 2.0)),
+            1e-3,
         )
-        terminal_speed = min(terminal_speed, boundary_speed)
+        delayed_rel_v = max((float(front["gap"]) - delayed_gap) / dt, 0.0)
+        if delayed_rel_v > 0.1:
+            delayed_ttc = min(delayed_gap / delayed_rel_v, ttc_max)
 
-    best_progress = None
-    for terminal_progress in np.linspace(float(gt_progress[-1]), 0.0, num=33):
-        candidate = _minimum_jerk_progress(
-            terminal_progress,
-            initial_speed,
-            terminal_speed,
-            num_poses,
-            dt,
-        )
-        if _transport_profile_is_feasible(candidate, upper_s, initial_speed, config, dt):
-            best_progress = candidate
-            break
-    if best_progress is None:
-        return result
-
-    max_shift = float(np.max(np.abs(best_progress - gt_progress)))
-    if max_shift < float(_cfg(config, "transport_min_progress_shift", 0.10)):
-        return result
-
-    result["target"] = _sample_path_by_progress(trajectory, gt_progress, best_progress)
-    result["upper_s"] = upper_s.astype(np.float32)
-    result["constraint_mask"] = constraint_mask.astype(np.float32)
-    result["valid"][0] = 1.0
-    return result
+    warning_ttc = float(_cfg(config, "risk_pair_ttc_warning_threshold", 4.0))
+    risk_active = float(
+        continuous_steps >= 2
+        and (current_ttc <= warning_ttc or delayed_ttc <= warning_ttc)
+    )
+    context[:] = [
+        ego_v,
+        current_ttc,
+        delayed_ttc,
+        warning_ttc,
+        float(continuous_steps),
+    ]
+    return {
+        "risk_front_future": future_front,
+        "risk_pair_context": context,
+        "risk_pair_scene_active": np.array(risk_active, dtype=np.float32),
+    }
 
 
 def build_gt_history_risk_targets(scene: Any, config: Any) -> Dict[str, np.ndarray]:

@@ -20,33 +20,6 @@ def _cfg(config: Any, name: str, default: Any) -> Any:
     return getattr(config, name, default)
 
 
-def _has_consecutive_true(
-    mask: torch.Tensor,
-    required_steps: int,
-) -> torch.Tensor:
-    """Return whether every sample has a persistent unsafe interval."""
-
-    required_steps = max(int(required_steps), 1)
-
-    if required_steps == 1:
-        return mask.any(dim=-1)
-
-    if mask.shape[-1] < required_steps:
-        return torch.zeros(
-            mask.shape[0],
-            dtype=torch.bool,
-            device=mask.device,
-        )
-
-    windows = mask.unfold(
-        dimension=-1,
-        size=required_steps,
-        step=1,
-    )
-
-    return windows.all(dim=-1).any(dim=-1)
-
-
 def _polyline_arclength(
     xy: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -414,68 +387,28 @@ def apply_longitudinal_safety_shield(
         )
     )
 
-    minimum_unsafe_steps = max(
-        int(
-            _cfg(
-                config,
-                "shield_min_consecutive_unsafe_steps",
-                2,
-            )
-        ),
-        1,
-    )
+    clearance_violation = minimum_clearance_before < safe_gap
 
-    unsafe_before = (
-        lateral_overlap
-        & (
-            clearance_before_steps
-            < safe_gap[:, None]
-        )
-    )
-
-    persistent_unsafe_before = _has_consecutive_true(
-        unsafe_before,
-        minimum_unsafe_steps,
-    )
-
-    hard_clearance = float(
-        _cfg(
-            config,
-            "shield_hard_clearance",
-            1.5,
-        )
-    )
-
-    clearance_trigger_margin = float(
-        _cfg(
-            config,
-            "shield_clearance_trigger_margin",
-            0.25,
-        )
-    )
-
-    # 只放宽进入候选修正阶段的阈值：
-    # 默认由1.50m放宽到1.75m。
-    near_hard_clearance = (
-        minimum_clearance_before
-        < (
-            hard_clearance
-            + clearance_trigger_margin
-        )
-    )
-
-    risk_signal = (
-        time_risk["trigger"]
-        | time_risk["emergency"]
-        | near_hard_clearance
-    )
-
-    # 即使是emergency，也必须确认原轨迹存在持续危险。
     trigger = (
         reliable_front
         & lateral_overlap.any(dim=-1)
-        & persistent_unsafe_before
-        & risk_signal
+        & (
+            time_risk["emergency"]
+            | (
+                time_risk["trigger"]
+                & clearance_violation
+            )
+            | (
+                minimum_clearance_before
+                < float(
+                    _cfg(
+                        config,
+                        "shield_hard_clearance",
+                        1.5,
+                    )
+                )
+            )
+        )
     )
 
     relative_velocity = (
@@ -587,44 +520,6 @@ def apply_longitudinal_safety_shield(
         dim=-1,
     ).values
 
-    after_safe_gap_ratio = float(
-        _cfg(
-            config,
-            "shield_after_safe_gap_ratio",
-            0.75,
-        )
-    )
-
-    required_clearance_after = torch.maximum(
-        raw_trajectory.new_full(
-            (batch_size,),
-            hard_clearance,
-        ),
-        safe_gap * after_safe_gap_ratio,
-    )
-
-    unsafe_after = (
-        candidate_lateral_overlap
-        & (
-            clearance_after_steps
-            < required_clearance_after[:, None]
-        )
-    )
-
-    persistent_unsafe_after = _has_consecutive_true(
-        unsafe_after,
-        minimum_unsafe_steps,
-    )
-
-    # 修正后不得继续存在连续危险，并且最小间距需要达到要求。
-    safety_resolved = (
-        (~persistent_unsafe_after)
-        & (
-            minimum_clearance_after
-            >= required_clearance_after
-        )
-    )
-
     clearance_gain = (
         minimum_clearance_after
         - minimum_clearance_before
@@ -643,43 +538,11 @@ def apply_longitudinal_safety_shield(
         - progress_after
     ).clamp_min(0.0)
 
-    normal_progress_limit = float(
-        _cfg(
-            config,
-            "shield_accept_progress_reduction",
-            4.0,
-        )
-    )
-
-    absolute_progress_limit = float(
-        _cfg(
-            config,
-            "shield_absolute_max_progress_reduction",
-            5.0,
-        )
-    )
-
-    absolute_progress_ok = (
-        progress_reduction
-        <= absolute_progress_limit
-    )
-
-    normal_progress_ok = (
-        time_risk["emergency"]
-        | (
-            progress_reduction
-            <= normal_progress_limit
-        )
-    )
-
-    progress_limit_ok = (
-        absolute_progress_ok
-        & normal_progress_ok
-    )
-
+    # Only accept a correction that materially improves predicted clearance.
+    # Emergency scenes are allowed to sacrifice more progress because collision
+    # and DAC are multiplicative PDM terms.
     accept = (
         trigger
-        & safety_resolved
         & (
             clearance_gain
             >= float(
@@ -690,7 +553,19 @@ def apply_longitudinal_safety_shield(
                 )
             )
         )
-        & progress_limit_ok
+        & (
+            time_risk["emergency"]
+            | (
+                progress_reduction
+                <= float(
+                    _cfg(
+                        config,
+                        "shield_accept_progress_reduction",
+                        4.0,
+                    )
+                )
+            )
+        )
     )
 
     shielded_trajectory = torch.where(

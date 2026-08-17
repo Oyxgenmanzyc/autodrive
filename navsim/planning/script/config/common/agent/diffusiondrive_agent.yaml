@@ -13,19 +13,19 @@ config:
 
   latent: False
   use_risk_gate: False
-  use_historical_risk_attention: False
+  use_historical_risk_attention: True
   use_temporal_risk_cross_attention: False
-  use_memory_aux_loss: False
+  use_memory_aux_loss: True
   use_step_brake_timing_loss: False
-  use_endpoint_conditioned_temporal_transport: False
-  use_all_mode_risk_corridor: False
   use_risk_shadow_evaluator: False
   use_soft_risk_rescore: False
   use_longitudinal_safety_shield: True
-  shield_absolute_max_progress_reduction: 5.0
-  shield_after_safe_gap_ratio: 0.75
-  shield_min_consecutive_unsafe_steps: 2
-  shield_clearance_trigger_margin: 0.25
+  use_risk_aware_cls: True
+  risk_rank_inference_topk: 20
+  risk_rank_unsafe_probability_threshold: 0.50
+  risk_rank_candidate_safe_probability_threshold: 0.35
+  risk_rank_min_unsafe_probability_gain: 0.10
+  risk_rank_defer_to_base_shield: True
 
 checkpoint_path: null
 lr: 3e-4
