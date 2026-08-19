@@ -253,6 +253,10 @@ class TransfuserAgent(AbstractAgent):
         """Inherited, see superclass."""
         return self.get_coslr_optimizers()
 
+    def get_temporal_optimization_parameters(self):
+        """Returns the trajectory-head parameters refined by temporal supervision."""
+        return self._transfuser_model._trajectory_head.parameters()
+
     def get_step_lr_optimizers(self):
         optimizer = torch.optim.Adam(self._transfuser_model.parameters(), lr=self._lr, weight_decay=self._config.weight_decay)
         scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=self._config.lr_steps, gamma=0.1)

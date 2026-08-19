@@ -350,6 +350,7 @@ def test_temporal_rank_adds_loss_without_changing_classification_target():
 
     energy_info = loss_computer._energy_supervision(
         poses_reg,
+        poses_cls,
         target["trajectory"],
         dist,
         cls_target,
@@ -370,6 +371,7 @@ def test_temporal_rank_does_not_use_mode_outside_gt_topk():
 
     energy_info = loss_computer._energy_supervision(
         poses_reg,
+        poses_cls,
         target["trajectory"],
         dist,
         cls_target,
@@ -389,6 +391,7 @@ def test_temporal_rank_uses_detached_energy_but_backprops_to_logits():
 
     energy_info = loss_computer._energy_supervision(
         poses_reg,
+        poses_cls,
         target["trajectory"],
         dist,
         cls_target,
@@ -412,6 +415,7 @@ def test_temporal_comfort_rank_can_use_comfort_inside_gt_topk():
 
     energy_info = loss_computer._energy_supervision(
         poses_reg,
+        poses_cls,
         target["trajectory"],
         dist,
         cls_target,
@@ -436,6 +440,7 @@ def test_tiny_temporal_aux_can_apply_to_selected_gt_mode():
 
     energy_info = loss_computer._energy_supervision(
         poses_reg,
+        poses_cls,
         target["trajectory"],
         dist,
         cls_target,

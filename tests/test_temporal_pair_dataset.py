@@ -8,7 +8,10 @@ from navsim.planning.training.dataset import (
     _previous_ego_delta_in_current_frame,
     dump_feature_target_to_pickle,
 )
-from navsim.planning.training.agent_lightning_module import TemporalPairAgentLightningModule
+from navsim.planning.training.agent_lightning_module import (
+    TemporalPairAgentLightningModule,
+    project_auxiliary_gradients,
+)
 
 
 class _Builder:
@@ -40,6 +43,29 @@ def test_previous_ego_delta_is_current_frame_displacement():
     delta = _previous_ego_delta_in_current_frame(_frame("prev", 0.0), _frame("curr", 1.0))
 
     assert torch.allclose(torch.tensor(delta), torch.tensor([1.0, 0.0]))
+
+
+def test_gt_protection_projects_conflicting_temporal_gradient():
+    primary = [torch.tensor([1.0, 0.0])]
+    temporal = [torch.tensor([-1.0, 1.0])]
+
+    protected, metrics = project_auxiliary_gradients(primary, temporal, max_norm_ratio=0.05)
+
+    assert torch.allclose(protected[0], torch.tensor([0.0, 0.05]), atol=1e-6)
+    assert metrics["gt_protection_conflict"] == 1.0
+    assert metrics["gt_protection_applied_ratio"] <= 0.050001
+
+
+def test_gt_protection_caps_aligned_temporal_gradient_without_reversing_it():
+    primary = [torch.tensor([1.0, 0.0])]
+    temporal = [torch.tensor([2.0, 0.0])]
+
+    protected, metrics = project_auxiliary_gradients(primary, temporal, max_norm_ratio=0.05)
+
+    assert torch.allclose(protected[0], torch.tensor([0.05, 0.0]), atol=1e-6)
+    assert torch.dot(primary[0], protected[0]) >= 0.0
+    assert metrics["gt_protection_conflict"] == 0.0
+    assert metrics["gt_protection_applied_ratio"] <= 0.050001
 
 
 def test_temporal_pair_index_requires_adjacent_filtered_samples():

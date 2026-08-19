@@ -3,9 +3,86 @@ import torch
 import inspect
 
 from torch import Tensor
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from navsim.agents.abstract_agent import AbstractAgent
+
+
+def project_auxiliary_gradients(
+    primary_gradients: Sequence[Optional[Tensor]],
+    auxiliary_gradients: Sequence[Optional[Tensor]],
+    max_norm_ratio: float = 0.05,
+    eps: float = 1e-12,
+) -> Tuple[List[Optional[Tensor]], Dict[str, Tensor]]:
+    """Projects an auxiliary gradient away from conflict with the primary objective."""
+    if len(primary_gradients) != len(auxiliary_gradients):
+        raise ValueError("primary_gradients and auxiliary_gradients must have the same length")
+
+    reference = next(
+        (gradient for gradient in (*primary_gradients, *auxiliary_gradients) if gradient is not None),
+        None,
+    )
+    if reference is None:
+        raise ValueError("at least one gradient tensor is required")
+
+    device = reference.device
+    primary_norm_sq = torch.zeros((), device=device, dtype=torch.float32)
+    auxiliary_norm_sq = torch.zeros((), device=device, dtype=torch.float32)
+    dot_product = torch.zeros((), device=device, dtype=torch.float32)
+    for primary_gradient, auxiliary_gradient in zip(primary_gradients, auxiliary_gradients):
+        if primary_gradient is not None:
+            primary_norm_sq = primary_norm_sq + primary_gradient.detach().float().square().sum()
+        if auxiliary_gradient is not None:
+            auxiliary_norm_sq = auxiliary_norm_sq + auxiliary_gradient.detach().float().square().sum()
+        if primary_gradient is not None and auxiliary_gradient is not None:
+            dot_product = dot_product + (
+                primary_gradient.detach().float() * auxiliary_gradient.detach().float()
+            ).sum()
+
+    # A negative coefficient removes only the component that would increase
+    # the primary loss to first order. Aligned auxiliary gradients are kept.
+    conflict_coefficient = torch.minimum(
+        dot_product / (primary_norm_sq + eps),
+        torch.zeros_like(dot_product),
+    )
+    projected_gradients: List[Optional[Tensor]] = []
+    for primary_gradient, auxiliary_gradient in zip(primary_gradients, auxiliary_gradients):
+        if auxiliary_gradient is None:
+            projected_gradients.append(None)
+        elif primary_gradient is None:
+            projected_gradients.append(auxiliary_gradient)
+        else:
+            projected_gradients.append(
+                auxiliary_gradient
+                - conflict_coefficient.to(dtype=auxiliary_gradient.dtype) * primary_gradient
+            )
+
+    projected_norm_sq = torch.zeros((), device=device, dtype=torch.float32)
+    for gradient in projected_gradients:
+        if gradient is not None:
+            projected_norm_sq = projected_norm_sq + gradient.detach().float().square().sum()
+
+    primary_norm = torch.sqrt(primary_norm_sq)
+    auxiliary_norm = torch.sqrt(auxiliary_norm_sq)
+    projected_norm = torch.sqrt(projected_norm_sq)
+    max_auxiliary_norm = float(max_norm_ratio) * primary_norm
+    scale = torch.clamp(max_auxiliary_norm / (projected_norm + eps), max=1.0)
+    protected_gradients = [
+        None if gradient is None else gradient * scale.to(dtype=gradient.dtype)
+        for gradient in projected_gradients
+    ]
+
+    metrics = {
+        "gt_protection_active": (auxiliary_norm > eps).to(dtype=torch.float32),
+        "gt_protection_conflict": (dot_product < 0.0).to(dtype=torch.float32),
+        "gt_protection_cosine": dot_product / (primary_norm * auxiliary_norm + eps),
+        "gt_protection_primary_grad_norm": primary_norm,
+        "gt_protection_temporal_grad_norm": auxiliary_norm,
+        "gt_protection_raw_ratio": auxiliary_norm / (primary_norm + eps),
+        "gt_protection_applied_ratio": projected_norm * scale / (primary_norm + eps),
+        "gt_protection_scale": scale,
+    }
+    return protected_gradients, {key: value.detach() for key, value in metrics.items()}
 
 
 class AgentLightningModule(pl.LightningModule):
@@ -78,6 +155,75 @@ class TemporalPairAgentLightningModule(AgentLightningModule):
         self._energy_loss_threshold = 15.0
         self._energy_loss_relative_threshold = 0.05
         self._energy_force_start_epoch = 85
+        self._temporal_gradient_max_ratio = 0.05
+
+    def _apply_gt_protected_temporal_gradient(
+        self,
+        loss_dict: Dict[str, Tensor],
+    ) -> Dict[str, Tensor]:
+        primary_loss = loss_dict.get("primary_loss")
+        connection_loss = loss_dict.get("temporal_connection_loss")
+        parameter_getter = getattr(self.agent, "get_temporal_optimization_parameters", None)
+        if (
+            primary_loss is None
+            or connection_loss is None
+            or not primary_loss.requires_grad
+            or not connection_loss.requires_grad
+            or parameter_getter is None
+        ):
+            return {}
+
+        if connection_loss.detach().abs().item() <= 1e-12:
+            zero = primary_loss.detach().new_zeros(())
+            return {
+                "gt_protection_active": zero,
+                "gt_protection_conflict": zero,
+                "gt_protection_cosine": zero,
+                "gt_protection_primary_grad_norm": zero,
+                "gt_protection_temporal_grad_norm": zero,
+                "gt_protection_raw_ratio": zero,
+                "gt_protection_applied_ratio": zero,
+                "gt_protection_scale": zero,
+            }
+
+        parameters = [parameter for parameter in parameter_getter() if parameter.requires_grad]
+        if not parameters:
+            return {}
+
+        primary_gradients = torch.autograd.grad(
+            primary_loss,
+            parameters,
+            retain_graph=True,
+            allow_unused=True,
+        )
+        connection_gradients = torch.autograd.grad(
+            connection_loss,
+            parameters,
+            retain_graph=True,
+            allow_unused=True,
+        )
+        if all(gradient is None for gradient in (*primary_gradients, *connection_gradients)):
+            return {}
+
+        protected_gradients, metrics = project_auxiliary_gradients(
+            primary_gradients,
+            connection_gradients,
+            max_norm_ratio=self._temporal_gradient_max_ratio,
+        )
+        surrogate_connection_loss = primary_loss.new_zeros(())
+        for parameter, protected_gradient in zip(parameters, protected_gradients):
+            if protected_gradient is not None:
+                surrogate_connection_loss = surrogate_connection_loss + (
+                    parameter * protected_gradient.detach()
+                ).sum()
+
+        # Preserve the reported scalar loss while replacing only its temporal
+        # gradient with the protected trajectory-head gradient.
+        protected_connection_loss = surrogate_connection_loss + (
+            connection_loss - surrogate_connection_loss
+        ).detach()
+        loss_dict["loss"] = primary_loss + protected_connection_loss
+        return metrics
 
     @staticmethod
     def _should_start_energy_from_history(
@@ -210,12 +356,24 @@ class TemporalPairAgentLightningModule(AgentLightningModule):
         )
         loss_dict = self.agent.compute_loss(curr_features, curr_targets, curr_prediction)
         batch_size = self._batch_size(curr_features)
+        protection_metrics = {}
         if logging_prefix == "train":
+            protection_metrics = self._apply_gt_protected_temporal_gradient(loss_dict)
             self._accumulate_original_trajectory_loss(loss_dict, batch_size)
             if energy_ramp_override is not None:
                 self.log(
                     "train/energy_ramp_override",
                     energy_ramp_override,
+                    on_step=True,
+                    on_epoch=True,
+                    prog_bar=False,
+                    sync_dist=True,
+                    batch_size=batch_size,
+                )
+            for metric_name, metric_value in protection_metrics.items():
+                self.log(
+                    f"train/{metric_name}",
+                    metric_value,
                     on_step=True,
                     on_epoch=True,
                     prog_bar=False,

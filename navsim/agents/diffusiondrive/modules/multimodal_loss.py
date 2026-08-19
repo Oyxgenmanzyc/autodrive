@@ -167,6 +167,7 @@ class LossComputer(nn.Module):
     def _energy_supervision(
         self,
         poses_reg: Tensor,
+        poses_cls: Tensor,
         target_traj: Tensor,
         dist: Tensor,
         cls_target: Tensor,
@@ -308,6 +309,7 @@ class LossComputer(nn.Module):
         target_classes_onehot.scatter_(1, cls_target.unsqueeze(1), 1)
         energy_info = self._energy_supervision(
             poses_reg,
+            poses_cls,
             target_traj,
             dist,
             mode_idx_flat,
@@ -330,11 +332,16 @@ class LossComputer(nn.Module):
         # Combine classification and regression losses
         ret_loss = loss_cls + reg_loss
         if energy_info is not None:
-            ret_loss = ret_loss + energy_info["temporal_rank_loss"]
+            original_loss = loss_cls + reg_loss
+            connection_loss = energy_info["temporal_rank_loss"]
+            ret_loss = original_loss + connection_loss
             logged_energy_info = {
                 key: value.detach() if torch.is_tensor(value) else value
                 for key, value in energy_info.items()
             }
-            logged_energy_info["trajectory_original_loss"] = (loss_cls + reg_loss).detach()
+            # Keep these two terms differentiable so the training wrapper can
+            # protect the original objective from conflicting temporal gradients.
+            logged_energy_info["trajectory_original_loss"] = original_loss
+            logged_energy_info["trajectory_connection_loss"] = connection_loss
             return ret_loss, logged_energy_info
         return ret_loss

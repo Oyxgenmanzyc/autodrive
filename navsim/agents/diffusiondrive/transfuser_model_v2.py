@@ -942,6 +942,7 @@ class TrajectoryHead(nn.Module):
         trajectory_loss_dict = {}
         ret_traj_loss = 0
         ret_original_traj_loss = 0
+        ret_connection_traj_loss = 0
         for idx, (poses_reg, poses_cls) in enumerate(zip(poses_reg_list, poses_cls_list)):
             trajectory_loss_output = self.loss_computer(
                 poses_reg,
@@ -954,24 +955,38 @@ class TrajectoryHead(nn.Module):
                 trajectory_loss, energy_loss_dict = trajectory_loss_output
                 original_trajectory_loss = energy_loss_dict.get(
                     "trajectory_original_loss",
-                    trajectory_loss.detach(),
+                    trajectory_loss,
+                )
+                connection_trajectory_loss = energy_loss_dict.get(
+                    "trajectory_connection_loss",
+                    trajectory_loss * 0.0,
                 )
                 for key, value in energy_loss_dict.items():
-                    if key != "trajectory_scaled_energy_aux_loss":
+                    if key not in ("trajectory_original_loss", "trajectory_connection_loss"):
                         trajectory_loss_dict[f"{key}_{idx}"] = value
             else:
                 trajectory_loss = trajectory_loss_output
-                original_trajectory_loss = trajectory_loss.detach()
+                original_trajectory_loss = trajectory_loss
+                connection_trajectory_loss = trajectory_loss * 0.0
             trajectory_loss_dict[f"trajectory_original_loss_{idx}"] = original_trajectory_loss.detach()
+            trajectory_loss_dict[f"trajectory_connection_loss_{idx}"] = connection_trajectory_loss.detach()
             trajectory_loss_dict[f"trajectory_loss_{idx}"] = trajectory_loss
             ret_traj_loss += trajectory_loss
             ret_original_traj_loss += original_trajectory_loss
+            ret_connection_traj_loss += connection_trajectory_loss
 
         mode_idx = poses_cls_list[-1].argmax(dim=-1)
         mode_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
         best_reg = torch.gather(poses_reg_list[-1], 1, mode_idx).squeeze(1)
         trajectory_loss_dict["trajectory_original_loss"] = ret_original_traj_loss.detach()
-        output = {"trajectory": best_reg,"trajectory_loss":ret_traj_loss,"trajectory_loss_dict":trajectory_loss_dict}
+        trajectory_loss_dict["trajectory_connection_loss"] = ret_connection_traj_loss.detach()
+        output = {
+            "trajectory": best_reg,
+            "trajectory_loss": ret_traj_loss,
+            "trajectory_original_loss": ret_original_traj_loss,
+            "trajectory_connection_loss": ret_connection_traj_loss,
+            "trajectory_loss_dict": trajectory_loss_dict,
+        }
         output.update(temporal_metrics)
         return output
 

@@ -482,3 +482,38 @@ CHANGELOG.txt
 
 与论文撰写的关系：
 3.12 可表述为 “Temporal Pairwise Ranking Distillation”。它把历史连接性从直接轨迹惩罚改为 GT top-K 内的弱排序监督，更接近 metric learning / ranking loss 思想，避免 3.9 中 soft target 和 auxiliary regression 对原始 DiffusionDrive 监督造成强干扰。
+
+修改主题：3.1.01 GT-Protected Temporal Optimization
+修改日期：2026-08-19
+
+修改目的：
+基于 3.14 ranking + tiny selected-mode temporal auxiliary，引入非对称多目标梯度保护。原始 DiffusionDrive 监督始终是主目标；历史连接监督只允许做细调，不能以一阶梯度方向损害主目标。该版本不替换 GT best mode、不改变 eval/PDM 选择逻辑，也不修改 temporal compatibility cost。
+
+涉及文件：
+navsim/agents/diffusiondrive/modules/multimodal_loss.py
+navsim/agents/diffusiondrive/transfuser_agent.py
+navsim/agents/diffusiondrive/transfuser_loss.py
+navsim/agents/diffusiondrive/transfuser_model_v2.py
+navsim/planning/training/agent_lightning_module.py
+tests/test_diffusiondrive_factorized_temporal_compat.py
+tests/test_temporal_pair_dataset.py
+CHANGELOG.txt
+
+核心改动：
+1. 将训练损失显式拆分为 primary_loss 与 temporal_connection_loss。primary_loss 保留原始 trajectory classification/regression、agent detection、BEV semantic 与 diffusion 目标；temporal_connection_loss 只包含 3.14 的 top-K pairwise ranking 和 tiny selected-mode temporal auxiliary。
+2. GT best mode assignment、one-hot classification target 和原始 best-mode regression 均保持不变，连接性不再有机会替换主监督标签。
+3. 只在 trajectory head 参数上分别计算 primary gradient 与 temporal gradient，感知骨干、检测分支和 BEV 分支不接收 temporal auxiliary 梯度。
+4. 当两组梯度点积小于 0 时，只投影 temporal gradient 中与 primary gradient 冲突的分量；primary gradient 完全不修改。
+5. 投影后的 temporal gradient 范数最多为 primary gradient 范数的 5%，即使两者方向一致，连接监督也只能作为细调信号。
+6. 使用 surrogate loss 保持前向显示的总 loss 数值不变，同时让 Lightning 自动优化、AMP、DDP 和现有 optimizer/scheduler 继续使用原训练流程。
+7. 新增诊断日志：gt_protection_active、gt_protection_conflict、gt_protection_cosine、gt_protection_primary_grad_norm、gt_protection_temporal_grad_norm、gt_protection_raw_ratio、gt_protection_applied_ratio、gt_protection_scale。
+8. 修正 3.14 中 _energy_supervision() 未显式接收 poses_cls 的接口缺陷，确保 ranking loss 启动后能对分类 logits 反向传播。
+
+预期影响：
+3.1.01 将“GT 是粗准焦、历史连接是细准焦”落实为梯度级约束，而不是继续依赖更小的标量 loss 权重。连接目标与原始目标一致时允许小幅更新；发生冲突时删除有害分量；无论是否冲突都限制为主梯度的 5%。这不能保证 PDM 一定提升，但能显著降低 3.5-3.9 中 auxiliary loss 带偏主训练方向和引发不稳定的风险。
+
+测试/验证结果：
+按实验约定，本地不运行 pytest、manual runner 或 smoke。轻量测试已补充冲突投影、同向梯度限幅，以及 3.14 ranking logits 接口覆盖；等待服务器 smoke/full validation。
+
+与论文撰写的关系：
+该版本可表述为 “GT-Protected Temporal Fine Adjustment”。方法属于面向主目标优先级的非对称梯度协调：历史连接不是与 imitation objective 平权竞争的第二目标，而是在不牺牲原始监督一阶下降方向的约束下，对 trajectory head 进行有限幅度的时序细化。

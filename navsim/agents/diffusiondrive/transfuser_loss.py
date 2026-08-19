@@ -31,16 +31,27 @@ def transfuser_loss(
         diffusion_loss = predictions['diffusion_loss']
     else:
         diffusion_loss = 0
-    loss = (
-        config.trajectory_weight * trajectory_loss
+    if "trajectory_original_loss" in predictions and "trajectory_connection_loss" in predictions:
+        trajectory_original_loss = predictions["trajectory_original_loss"]
+        trajectory_connection_loss = predictions["trajectory_connection_loss"]
+    else:
+        trajectory_original_loss = trajectory_loss
+        trajectory_connection_loss = trajectory_loss * 0.0
+
+    primary_loss = (
+        config.trajectory_weight * trajectory_original_loss
         + config.diff_loss_weight * diffusion_loss
         + config.agent_class_weight * agent_class_loss
         + config.agent_box_weight * agent_box_loss
         + config.bev_semantic_weight * bev_semantic_loss
     )
+    connection_loss = config.trajectory_weight * trajectory_connection_loss
+    loss = primary_loss + connection_loss
     loss_dict = {
         'loss': loss,
         'trajectory_loss': config.trajectory_weight*trajectory_loss,
+        'primary_loss': primary_loss,
+        'temporal_connection_loss': connection_loss,
         'diffusion_loss': config.diff_loss_weight*diffusion_loss,
         'agent_class_loss': config.agent_class_weight*agent_class_loss,
         'agent_box_loss': config.agent_box_weight*agent_box_loss,
