@@ -11,12 +11,7 @@ class WarmupCosLR(_LRScheduler):
         self.lr = lr
         self.epochs = epochs
         self.warmup_epochs = warmup_epochs
-        try:
-            super(WarmupCosLR, self).__init__(
-                optimizer, last_epoch=last_epoch, verbose=verbose
-            )
-        except TypeError:
-            super(WarmupCosLR, self).__init__(optimizer, last_epoch=last_epoch)
+        super(WarmupCosLR, self).__init__(optimizer, last_epoch, verbose)
 
     def state_dict(self):
         """Returns the state of the scheduler as a :class:`dict`.

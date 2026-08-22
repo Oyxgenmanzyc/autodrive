@@ -1,6 +1,5 @@
 from typing import Any, List, Dict, Optional, Union
 
-import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import Optimizer
@@ -52,18 +51,6 @@ class TransfuserAgent(AbstractAgent):
 
         self._checkpoint_path = checkpoint_path
         self._transfuser_model = TransfuserModel(config)
-        self._previous_trajectory: Optional[np.ndarray] = None
-        self._temporal_reset_distance = 5.0
-        self._last_temporal_reference_active = False
-        self._last_previous_ego_delta_active = False
-        self._last_temporal_rescore_active = 0.0
-        self._last_temporal_rescore_changed = 0.0
-        self._last_temporal_rescore_selected_cost = 0.0
-        self._last_temporal_rescore_base_cost = 0.0
-        self._last_temporal_rescore_topk_min_cost = 0.0
-        self._last_temporal_rescore_cls_margin = 0.0
-        self._last_temporal_rescore_selected_mode = 0.0
-        self._last_temporal_rescore_base_mode = 0.0
         self.init_from_pretrained()
 
     @staticmethod
@@ -93,7 +80,6 @@ class TransfuserAgent(AbstractAgent):
                 print(f"Missing keys when loading pretrained weights: {unexpected_missing}")
             if unexpected_keys:
                 print(f"Unexpected keys when loading pretrained weights: {unexpected_keys}")
-            print(f"Loaded checkpoint from: {self._checkpoint_path}")
         else:
             print("No checkpoint path provided. Initializing from scratch.")
     def name(self) -> str:
@@ -110,7 +96,6 @@ class TransfuserAgent(AbstractAgent):
             ]
         state_dict = {k.replace("agent.", ""): v for k, v in state_dict.items()}
         self.load_state_dict(self._without_checkpoint_anchor(state_dict), strict=False)
-        print(f"Initialized agent from checkpoint: {self._checkpoint_path}")
 
 
     def get_sensor_config(self) -> SensorConfig:
@@ -125,128 +110,9 @@ class TransfuserAgent(AbstractAgent):
         """Inherited, see superclass."""
         return [TransfuserFeatureBuilder(config=self._config)]
 
-    def forward(
-        self,
-        features: Dict[str, torch.Tensor],
-        targets: Dict[str, torch.Tensor]=None,
-        previous_trajectory: Optional[torch.Tensor]=None,
-        previous_ego_delta: Optional[torch.Tensor]=None,
-        training_epoch: Optional[int]=None,
-        energy_ramp_override: Optional[torch.Tensor]=None,
-    ) -> Dict[str, torch.Tensor]:
+    def forward(self, features: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]=None) -> Dict[str, torch.Tensor]:
         """Inherited, see superclass."""
-        return self._transfuser_model(
-            features,
-            targets=targets,
-            previous_trajectory=previous_trajectory,
-            previous_ego_delta=previous_ego_delta,
-            training_epoch=training_epoch,
-            energy_ramp_override=energy_ramp_override,
-        )
-
-    def reset_temporal_context(self) -> None:
-        """Clears cached inference trajectory before starting an unrelated scene."""
-        self._previous_trajectory = None
-        self._last_temporal_reference_active = False
-        self._last_previous_ego_delta_active = False
-        self._last_temporal_rescore_active = 0.0
-        self._last_temporal_rescore_changed = 0.0
-        self._last_temporal_rescore_selected_cost = 0.0
-        self._last_temporal_rescore_base_cost = 0.0
-        self._last_temporal_rescore_topk_min_cost = 0.0
-        self._last_temporal_rescore_cls_margin = 0.0
-        self._last_temporal_rescore_selected_mode = 0.0
-        self._last_temporal_rescore_base_mode = 0.0
-
-    def _build_temporal_reference(self, agent_input: AgentInput) -> Optional[np.ndarray]:
-        if self._previous_trajectory is None or len(agent_input.ego_statuses) < 2:
-            return None
-
-        previous_ego_pose = agent_input.ego_statuses[-2].ego_pose
-        previous_xy = self._previous_trajectory[:, :2]
-        cos_h = np.cos(previous_ego_pose[2])
-        sin_h = np.sin(previous_ego_pose[2])
-        rotation = np.array([[cos_h, -sin_h], [sin_h, cos_h]], dtype=np.float32)
-        previous_xy_in_current = previous_xy @ rotation.T + previous_ego_pose[:2].astype(np.float32)
-
-        if previous_xy_in_current.shape[0] < 3:
-            return None
-        if np.linalg.norm(previous_xy_in_current[0]) > self._temporal_reset_distance:
-            return None
-
-        near_horizon_points = 3
-        temporal_reference = previous_xy_in_current[:near_horizon_points]
-        return temporal_reference.astype(np.float32)
-
-    def _build_previous_ego_delta(self, agent_input: AgentInput) -> Optional[np.ndarray]:
-        if len(agent_input.ego_statuses) < 2:
-            return None
-
-        previous_ego_pose = agent_input.ego_statuses[-2].ego_pose
-        return (-previous_ego_pose[:2]).astype(np.float32)
-
-    def get_temporal_debug_info(self) -> Dict[str, Any]:
-        return {
-            "temporal_reference_active": self._last_temporal_reference_active,
-            "previous_ego_delta_active": self._last_previous_ego_delta_active,
-            "temporal_rescore_active": self._last_temporal_rescore_active,
-            "temporal_rescore_changed": self._last_temporal_rescore_changed,
-            "temporal_rescore_selected_cost": self._last_temporal_rescore_selected_cost,
-            "temporal_rescore_base_cost": self._last_temporal_rescore_base_cost,
-            "temporal_rescore_topk_min_cost": self._last_temporal_rescore_topk_min_cost,
-            "temporal_rescore_cls_margin": self._last_temporal_rescore_cls_margin,
-            "temporal_rescore_selected_mode": self._last_temporal_rescore_selected_mode,
-            "temporal_rescore_base_mode": self._last_temporal_rescore_base_mode,
-        }
-
-    @staticmethod
-    def _prediction_scalar(predictions: Dict[str, torch.Tensor], key: str) -> float:
-        value = predictions.get(key)
-        if value is None:
-            return 0.0
-        if torch.is_tensor(value):
-            return float(value.detach().float().mean().cpu().item())
-        return float(value)
-
-    def compute_trajectory(self, agent_input: AgentInput) -> Trajectory:
-        """
-        Computes trajectory while passing the previous prediction as a temporal continuity reference.
-        """
-        self.eval()
-        features: Dict[str, torch.Tensor] = {}
-        for builder in self.get_feature_builders():
-            features.update(builder.compute_features(agent_input))
-
-        features = {k: v.unsqueeze(0) for k, v in features.items()}
-        previous_trajectory = self._build_temporal_reference(agent_input)
-        previous_trajectory_tensor = None
-        if previous_trajectory is not None:
-            previous_trajectory_tensor = torch.tensor(previous_trajectory).unsqueeze(0)
-        previous_ego_delta = self._build_previous_ego_delta(agent_input)
-        previous_ego_delta_tensor = None
-        if previous_ego_delta is not None:
-            previous_ego_delta_tensor = torch.tensor(previous_ego_delta).unsqueeze(0)
-        self._last_temporal_reference_active = previous_trajectory_tensor is not None
-        self._last_previous_ego_delta_active = previous_ego_delta_tensor is not None
-
-        with torch.no_grad():
-            predictions = self.forward(
-                features,
-                previous_trajectory=previous_trajectory_tensor,
-                previous_ego_delta=previous_ego_delta_tensor,
-            )
-            self._last_temporal_rescore_active = self._prediction_scalar(predictions, "temporal_rescore_active")
-            self._last_temporal_rescore_changed = self._prediction_scalar(predictions, "temporal_rescore_changed")
-            self._last_temporal_rescore_selected_cost = self._prediction_scalar(predictions, "temporal_rescore_selected_cost")
-            self._last_temporal_rescore_base_cost = self._prediction_scalar(predictions, "temporal_rescore_base_cost")
-            self._last_temporal_rescore_topk_min_cost = self._prediction_scalar(predictions, "temporal_rescore_topk_min_cost")
-            self._last_temporal_rescore_cls_margin = self._prediction_scalar(predictions, "temporal_rescore_cls_margin")
-            self._last_temporal_rescore_selected_mode = self._prediction_scalar(predictions, "temporal_rescore_selected_mode")
-            self._last_temporal_rescore_base_mode = self._prediction_scalar(predictions, "temporal_rescore_base_mode")
-            poses = predictions["trajectory"].squeeze(0).numpy()
-
-        self._previous_trajectory = poses.copy()
-        return Trajectory(poses)
+        return self._transfuser_model(features,targets=targets)
         
     def compute_loss(
         self,
@@ -260,10 +126,6 @@ class TransfuserAgent(AbstractAgent):
     def get_optimizers(self) -> Union[Optimizer, Dict[str, Union[Optimizer, LRScheduler]]]:
         """Inherited, see superclass."""
         return self.get_coslr_optimizers()
-
-    def get_temporal_optimization_parameters(self):
-        """Returns the trajectory-head parameters refined by temporal supervision."""
-        return self._transfuser_model._trajectory_head.parameters()
 
     def get_step_lr_optimizers(self):
         optimizer = torch.optim.Adam(self._transfuser_model.parameters(), lr=self._lr, weight_decay=self._config.weight_decay)

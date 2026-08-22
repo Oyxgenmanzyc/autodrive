@@ -2,6 +2,8 @@
 
 本实现把 anchor 学习与 DiffusionDrive 训练彻底解耦。第一版固定使用 `navtrain` 的 GT 轨迹离线生成 anchor，训练和推理期间不更新 anchor。
 
+本分支以原版 DiffusionDrive 为模型基线，只修改 anchor 的离线生成、加载和候选数量 K。它不包含 temporal-pair 数据集、GT-protected gradient、temporal energy/ranking loss、跨帧历史轨迹或 temporal rescore。
+
 ## 1. 提取 navtrain GT
 
 在已配置 `OPENSCENE_DATA_ROOT` 的 NAVSIM 环境中执行：
@@ -76,3 +78,5 @@ python navsim/planning/script/run_training.py \
 ```
 
 模型会从文件 shape 自动推导 K。加载旧 checkpoint 时不会恢复 checkpoint 内的 20-anchor tensor，因此不会覆盖当前配置选择的新 bank。计算量和显存仍近似随 K 线性增长，第一轮建议依次验证 K=40/64、80/128，而不是直接使用数百个候选。
+
+训练使用原版 `AgentLightningModule` 和普通 `CacheOnlyDataset`。只要数据集版本、split、trajectory sampling 和 Transfuser feature/target 配置不变，原版或 3.1.01 已生成的 `transfuser_feature` / `transfuser_target` 缓存都可复用；不要在本分支训练命令中设置 `temporal_pair_training=true`。

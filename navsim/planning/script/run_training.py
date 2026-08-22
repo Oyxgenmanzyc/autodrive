@@ -11,8 +11,8 @@ import pytorch_lightning as pl
 from navsim.agents.abstract_agent import AbstractAgent
 from navsim.common.dataclasses import SceneFilter
 from navsim.common.dataloader import SceneLoader
-from navsim.planning.training.dataset import CacheOnlyDataset, Dataset, TemporalPairCacheOnlyDataset
-from navsim.planning.training.agent_lightning_module import AgentLightningModule, TemporalPairAgentLightningModule
+from navsim.planning.training.dataset import CacheOnlyDataset, Dataset
+from navsim.planning.training.agent_lightning_module import AgentLightningModule
 
 logger = logging.getLogger(__name__)
 
@@ -92,45 +92,12 @@ def main(cfg: DictConfig) -> None:
     logger.info("Building Agent")
     agent: AbstractAgent = instantiate(cfg.agent)
 
-    temporal_pair_training = bool(cfg.get("temporal_pair_training", False))
     logger.info("Building Lightning Module")
-    lightning_module = (
-        TemporalPairAgentLightningModule(agent=agent)
-        if temporal_pair_training
-        else AgentLightningModule(agent=agent)
+    lightning_module = AgentLightningModule(
+        agent=agent,
     )
 
-    if temporal_pair_training:
-        logger.info("Using temporal pair training from cached data")
-        assert cfg.use_cache_without_dataset, "temporal_pair_training currently requires use_cache_without_dataset=True"
-        assert (
-            not cfg.force_cache_computation
-        ), "force_cache_computation must be False when using temporal pair training"
-        assert cfg.cache_path is not None, "cache_path must be provided when using temporal pair training"
-
-        train_scene_filter: SceneFilter = instantiate(cfg.train_test_split.scene_filter)
-        val_scene_filter: SceneFilter = instantiate(cfg.train_test_split.scene_filter)
-        train_data = TemporalPairCacheOnlyDataset(
-            cache_path=cfg.cache_path,
-            data_path=cfg.navsim_log_path,
-            scene_filter=train_scene_filter,
-            feature_builders=agent.get_feature_builders(),
-            target_builders=agent.get_target_builders(),
-            log_names=cfg.train_logs,
-            pair_index_cache_path=cfg.temporal_pair_index_cache_path,
-            split_name="train",
-        )
-        val_data = TemporalPairCacheOnlyDataset(
-            cache_path=cfg.cache_path,
-            data_path=cfg.navsim_log_path,
-            scene_filter=val_scene_filter,
-            feature_builders=agent.get_feature_builders(),
-            target_builders=agent.get_target_builders(),
-            log_names=cfg.val_logs,
-            pair_index_cache_path=cfg.temporal_pair_index_cache_path,
-            split_name="val",
-        )
-    elif cfg.use_cache_without_dataset:
+    if cfg.use_cache_without_dataset:
         logger.info("Using cached data without building SceneLoader")
         assert (
             not cfg.force_cache_computation
