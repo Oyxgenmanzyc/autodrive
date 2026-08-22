@@ -66,6 +66,11 @@ class TransfuserAgent(AbstractAgent):
         self._last_temporal_rescore_base_mode = 0.0
         self.init_from_pretrained()
 
+    @staticmethod
+    def _without_checkpoint_anchor(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """Keep the anchor bank selected by config instead of restoring a checkpoint asset."""
+        return {key: value for key, value in state_dict.items() if not key.endswith("plan_anchor")}
+
     def init_from_pretrained(self):
         # import ipdb; ipdb.set_trace()
         if self._checkpoint_path:
@@ -78,12 +83,14 @@ class TransfuserAgent(AbstractAgent):
             
             # Remove 'agent.' prefix from keys if present
             state_dict = {k.replace('agent.', ''): v for k, v in state_dict.items()}
+            state_dict = self._without_checkpoint_anchor(state_dict)
             
             # Load state dict and get info about missing and unexpected keys
             missing_keys, unexpected_keys = self.load_state_dict(state_dict, strict=False)
             
-            if missing_keys:
-                print(f"Missing keys when loading pretrained weights: {missing_keys}")
+            unexpected_missing = [key for key in missing_keys if not key.endswith("plan_anchor")]
+            if unexpected_missing:
+                print(f"Missing keys when loading pretrained weights: {unexpected_missing}")
             if unexpected_keys:
                 print(f"Unexpected keys when loading pretrained weights: {unexpected_keys}")
             print(f"Loaded checkpoint from: {self._checkpoint_path}")
@@ -101,7 +108,8 @@ class TransfuserAgent(AbstractAgent):
             state_dict: Dict[str, Any] = torch.load(self._checkpoint_path, map_location=torch.device("cpu"))[
                 "state_dict"
             ]
-        self.load_state_dict({k.replace("agent.", ""): v for k, v in state_dict.items()})
+        state_dict = {k.replace("agent.", ""): v for k, v in state_dict.items()}
+        self.load_state_dict(self._without_checkpoint_anchor(state_dict), strict=False)
         print(f"Initialized agent from checkpoint: {self._checkpoint_path}")
 
 

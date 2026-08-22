@@ -517,3 +517,49 @@ CHANGELOG.txt
 
 与论文撰写的关系：
 该版本可表述为 “GT-Protected Temporal Fine Adjustment”。方法属于面向主目标优先级的非对称梯度协调：历史连接不是与 imitation objective 平权竞争的第二目标，而是在不牺牲原始监督一阶下降方向的约束下，对 trajectory head 进行有限幅度的时序细化。
+
+修改主题：3.1.02 NAVSIM Adaptive Multimodal Anchor Bank
+修改日期：2026-08-22
+
+修改目的：
+基于 navtrain GT 离线学习固定 Anchor Bank，将 anchor 数量和覆盖范围从原始固定 20 模态扩展为数据驱动结果。第一版严格分离 anchor preprocessing 与 DiffusionDrive 训练，先验证 Anchor Bank 自身的 coverage/ADE 改善，再进行 Base Expansion 与 Base+Residual 两阶段消融；不在线更新 anchor，不改 temporal ranking、GT protection 或最终 PDM mode selection 语义。
+
+涉及文件：
+navsim/agents/diffusiondrive/anchors/__init__.py
+navsim/agents/diffusiondrive/anchors/metrics.py
+navsim/agents/diffusiondrive/anchors/base_expander.py
+navsim/agents/diffusiondrive/anchors/residual_codebook.py
+navsim/agents/diffusiondrive/anchors/composer.py
+navsim/agents/diffusiondrive/anchors/io.py
+scripts/anchors/extract_navsim_trajectories.py
+scripts/anchors/build_anchor_bank.py
+scripts/anchors/analyze_anchor_bank.py
+navsim/agents/diffusiondrive/transfuser_model_v2.py
+navsim/agents/diffusiondrive/transfuser_agent.py
+navsim/agents/diffusiondrive/modules/multimodal_loss.py
+tests/test_adaptive_anchor_bank.py
+tests/test_diffusiondrive_factorized_temporal_compat.py
+docs/adaptive_anchor_bank.md
+CHANGELOG.txt
+
+核心改动：
+1. 新增 navtrain GT 提取脚本，复用 navtrain scene filter 的 log/token/route/滑窗语义，从 trainval 原始日志直接生成与模型一致的 `[N,8,2]` ego-local XY trajectory，不依赖相机、LiDAR 或 map API。
+2. 新增纯 NumPy anchor metrics：pairwise ADE、max point distance、ADE assignment、严格 epsilon coverage、cluster variance、cluster statistics 和论文对比指标；assignment/coverage 支持分批计算，避免 navtrain 全量矩阵长期驻留内存。
+3. 新增 Coverage-guided Base Expansion：以官方 20 anchors 为 root，结合 P95 max error、cluster variance、sample support、uncovered count 选择 split cluster，使用 local K-Means(K=2) 替换父节点，每轮执行全局 re-assignment；支持 coverage target、收益饱和、无候选和 max-base safety cap 停止条件。
+4. Base tree 使用稳定 node_id/parent_id 记录 split 血缘，所有 child 永久继承原始 root_id，便于后续 same-root residual learning 和论文可视化。
+5. 新增 root-conditioned tangent-normal residual codebook：GT residual 按 nearest Base 和原始 root 聚合，第一版使用轻量 base-local frame，不实现完整道路 Frenet 投影；每个 root 显式保留 zero residual，并输出 M=1/2/4/8/16 distortion curve。
+6. 新增 data-support composition：只生成同 root 且满足 min support/min ratio 的 Base-Residual pair；zero residual 始终保留；最终按 trajectory ADE 去重，并优先保留 support 更高和原始 Base 候选。
+7. 同时导出 Final NPY、Base-only NPY、完整 NPZ metadata、JSON report 和 Base Expansion 曲线图。JSON 对比初始 20、Expanded Base、Base+Residual 的 Coverage@0.5/1.0/1.5/2.0m、mean/P95 nearest ADE 和 P95 max error。
+8. DiffusionDrive 删除 decoder 中无效的固定 20-mode constructor 参数；TrajectoryHead 校验 anchor shape/finite 值，并从 `plan_anchor.shape[0]` 自动推导 K；相关 shape 注释更新为 K。
+9. checkpoint 加载时不再恢复 state_dict 内的 plan_anchor。当前配置选择的离线 anchor 文件始终为权威来源，既避免旧 20-anchor checkpoint 覆盖新 bank，也避免 variable-K checkpoint shape mismatch。
+10. 保持 temporal compatibility、top-K ranking、tiny auxiliary、GT-protected gradient projection 和 test-time rescoring 算法不变；原有动态 top-K 保护继续适配可变 K。
+11. 新增轻量测试，覆盖距离/assignment/coverage、双峰 split、紧密单峰不 split、连续 split root inheritance、tangent-normal round trip、zero residual 保留 Base，以及 K=20/32/64 的 anchor 加载、refinement shape、stubbed forward_train/forward_test。
+
+预期影响：
+Anchor Bank 的表示容量由 navtrain 数据覆盖需求驱动，不再受固定 20 模态限制；Base Expansion 用于改善 coarse trajectory coverage，root-conditioned residual 用于在不跨意图错误组合的前提下补充局部行为模式。模型计算量仍随最终 K 近似线性增长，因此默认 max_base_anchors=64 仅作为首轮工程 safety cap，最终 K 应根据 coverage 收益、显存和速度共同确定。
+
+测试/验证结果：
+按实验约定，本地不运行 pytest、manual runner、syntax smoke 或训练 forward。已完成代码级静态审计与 hardcode 全局搜索；轻量测试已补充，等待服务器执行 navtrain extraction、offline builder、unit tests、K=20/32/64 forward smoke 和 full validation。
+
+与论文撰写的关系：
+该版本对应 “Coverage-guided Base Expansion + Root-conditioned Intent Residual Quantization”。论文消融应依次报告 Original K=20、Expanded Base、Base+Residual 三组离线 coverage/ADE 与训练 PDM，分离 coarse coverage 增益和 residual composition 的额外贡献；split history、root inheritance、distortion curve、support compatibility 和 dedup 统计均已保存在 report/metadata 中。

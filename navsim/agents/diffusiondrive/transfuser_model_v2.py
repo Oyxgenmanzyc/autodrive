@@ -204,13 +204,11 @@ class DiffMotionPlanningRefinementModule(nn.Module):
         self,
         embed_dims=256,
         ego_fut_ts=8,
-        ego_fut_mode=20,
         if_zeroinit_reg=True,
     ):
         super(DiffMotionPlanningRefinementModule, self).__init__()
         self.embed_dims = embed_dims
         self.ego_fut_ts = ego_fut_ts
-        self.ego_fut_mode = ego_fut_mode
         self.plan_cls_branch = nn.Sequential(
             *linear_relu_ln(embed_dims, 1, 2),
             nn.Linear(embed_dims, 1),
@@ -328,7 +326,6 @@ class CustomTransformerDecoderLayer(nn.Module):
         self.task_decoder = DiffMotionPlanningRefinementModule(
             embed_dims=config.tf_d_model,
             ego_fut_ts=num_poses,
-            ego_fut_mode=20,
         )
 
     def forward(self, 
@@ -357,7 +354,7 @@ class CustomTransformerDecoderLayer(nn.Module):
         traj_feature = self.time_modulation(traj_feature, time_embed,global_cond=None,global_img=global_img)
         
         # 4.9 predict the offset & heading
-        poses_reg, poses_cls = self.task_decoder(traj_feature) #bs,20,8,3; bs,20
+        poses_reg, poses_cls = self.task_decoder(traj_feature) # bs,K,8,3; bs,K
         poses_reg[...,:2] = poses_reg[...,:2] + noisy_traj_points
         poses_reg[..., StateSE2Index.HEADING] = poses_reg[..., StateSE2Index.HEADING].tanh() * np.pi
 
@@ -415,7 +412,6 @@ class TrajectoryHead(nn.Module):
         self._d_model = d_model
         self._d_ffn = d_ffn
         self.diff_loss_weight = 2.0
-        self.ego_fut_mode = 20
         self.temporal_noise_strength = 0.2
         self.temporal_noise_min_scale = 0.88
         self.temporal_noise_max_scale = 1.35
@@ -456,11 +452,19 @@ class TrajectoryHead(nn.Module):
 
 
         plan_anchor = np.load(plan_anchor_path)
+        expected_shape = (num_poses, 2)
+        if plan_anchor.ndim != 3 or plan_anchor.shape[1:] != expected_shape:
+            raise ValueError(
+                f"plan_anchor must have shape [K, {num_poses}, 2], got {plan_anchor.shape}"
+            )
+        if plan_anchor.shape[0] < 1 or not np.isfinite(plan_anchor).all():
+            raise ValueError("plan_anchor must contain at least one finite trajectory")
+        self.ego_fut_mode = int(plan_anchor.shape[0])
 
         self.plan_anchor = nn.Parameter(
             torch.tensor(plan_anchor, dtype=torch.float32),
             requires_grad=False,
-        ) # 20,8,2
+        ) # K,8,2
         self.plan_anchor_encoder = nn.Sequential(
             *linear_relu_ln(d_model, 1, 1,512),
             nn.Linear(d_model, d_model),

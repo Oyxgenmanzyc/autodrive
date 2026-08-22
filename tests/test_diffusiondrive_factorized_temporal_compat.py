@@ -1,6 +1,7 @@
 import sys
 import types
 
+import numpy as np
 import torch
 
 
@@ -17,10 +18,55 @@ class _DummyModule(torch.nn.Module):
         super().__init__()
 
 
+class _DummyScheduler:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def add_noise(self, original_samples, noise, timesteps):
+        return original_samples
+
+    def set_timesteps(self, *args, **kwargs):
+        pass
+
+    def step(self, model_output, timestep, sample):
+        return types.SimpleNamespace(prev_sample=model_output)
+
+
+class _ZeroTime(torch.nn.Module):
+    def __init__(self, dimensions):
+        super().__init__()
+        self.dimensions = dimensions
+
+    def forward(self, timesteps):
+        return torch.zeros(len(timesteps), self.dimensions, device=timesteps.device)
+
+
+class _ZeroLoss(torch.nn.Module):
+    def forward(self, poses_reg, poses_cls, targets, plan_anchor, temporal_context=None):
+        return poses_reg.sum() * 0.0 + poses_cls.sum() * 0.0
+
+
+class _ShapeRecordingDecoder(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.noisy_shape = None
+
+    def forward(self, traj_feature, noisy_traj_points, *args, **kwargs):
+        self.noisy_shape = tuple(noisy_traj_points.shape)
+        heading = torch.zeros(*noisy_traj_points.shape[:-1], 1, device=noisy_traj_points.device)
+        poses_reg = torch.cat([noisy_traj_points, heading], dim=-1)
+        poses_cls = torch.arange(
+            noisy_traj_points.shape[1],
+            device=noisy_traj_points.device,
+            dtype=noisy_traj_points.dtype,
+        ).unsqueeze(0).repeat(noisy_traj_points.shape[0], 1)
+        return [poses_reg], [poses_cls]
+
+
 def _load_trajectory_head():
     diffusers_module = _stub_module("diffusers")
     diffusers_module.__path__ = []
-    _stub_module("diffusers.schedulers", DDIMScheduler=object)
+    _stub_module("diffusers.schedulers", DDIMScheduler=_DummyScheduler)
     _stub_module("navsim.agents.diffusiondrive.transfuser_config", TransfuserConfig=object)
     _stub_module("navsim.agents.diffusiondrive.transfuser_backbone", TransfuserBackbone=object)
     _stub_module("navsim.agents.diffusiondrive.transfuser_features", BoundingBox2DIndex=object)
@@ -34,7 +80,7 @@ def _load_trajectory_head():
         "navsim.agents.diffusiondrive.modules.blocks",
         linear_relu_ln=lambda *args, **kwargs: [],
         bias_init_with_prob=lambda *args, **kwargs: 0.0,
-        gen_sineembed_for_position=lambda *args, **kwargs: None,
+        gen_sineembed_for_position=lambda positions, **kwargs: positions,
         GridSampleCrossBEVAttention=_DummyModule,
     )
     _stub_module("navsim.agents.diffusiondrive.modules.multimodal_loss", LossComputer=_DummyModule)
@@ -100,6 +146,62 @@ def test_temporal_noise_scale_returns_none_without_previous():
     plan_anchor = torch.zeros(1, 20, 8, 2)
 
     assert head._temporal_noise_scale(plan_anchor, None) is None
+
+
+def test_refinement_module_preserves_variable_mode_dimension():
+    _load_trajectory_head()
+    from navsim.agents.diffusiondrive.transfuser_model_v2 import DiffMotionPlanningRefinementModule
+
+    module = DiffMotionPlanningRefinementModule(embed_dims=16, ego_fut_ts=8)
+    for mode_count in (20, 32, 64):
+        poses_reg, poses_cls = module(torch.randn(2, mode_count, 16))
+        assert poses_reg.shape == (2, mode_count, 8, 3)
+        assert poses_cls.shape == (2, mode_count)
+
+
+def test_variable_anchor_bank_loads_and_smokes_train_and_test(tmp_path):
+    TrajectoryHead = _load_trajectory_head()
+
+    class _Config:
+        tf_d_model = 16
+        tf_num_head = 4
+        tf_dropout = 0.0
+        tf_d_ffn = 32
+
+    for mode_count in (20, 32, 64):
+        anchor_path = tmp_path / f"anchors_{mode_count}.npy"
+        np.save(anchor_path, np.zeros((mode_count, 8, 2), dtype=np.float32))
+        head = TrajectoryHead(
+            num_poses=8,
+            d_ffn=32,
+            d_model=16,
+            plan_anchor_path=str(anchor_path),
+            config=_Config(),
+        )
+        head.time_mlp = _ZeroTime(16)
+        head.loss_computer = _ZeroLoss()
+        head.diff_decoder = _ShapeRecordingDecoder()
+        ego_query = torch.zeros(2, 1, 16)
+        ignored = torch.zeros(2, 1, 16)
+
+        head.train()
+        train_output = head.forward_train(
+            ego_query,
+            ignored,
+            ignored,
+            (1, 1),
+            ignored,
+            targets={"trajectory": torch.zeros(2, 8, 3)},
+        )
+        assert head.ego_fut_mode == mode_count
+        assert head.diff_decoder.noisy_shape == (2, mode_count, 8, 2)
+        assert train_output["trajectory"].shape == (2, 8, 3)
+        assert torch.isfinite(train_output["trajectory_loss"])
+
+        head.eval()
+        test_output = head.forward_test(ego_query, ignored, ignored, (1, 1), ignored, None)
+        assert head.diff_decoder.noisy_shape == (2, mode_count, 8, 2)
+        assert test_output["trajectory"].shape == (2, 8, 3)
 
 
 def test_temporal_noise_scale_keeps_anchor_noise_shape():

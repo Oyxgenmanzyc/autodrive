@@ -286,9 +286,9 @@ class LossComputer(nn.Module):
 
     def forward(self, poses_reg, poses_cls, targets, plan_anchor, temporal_context: Optional[Dict[str, Tensor]]=None):
         """
-        pred_traj: (bs, 20, 8, 3)
-        pred_cls: (bs, 20)
-        plan_anchor: (bs,20, 8, 2)
+        pred_traj: (bs, K, 8, 3)
+        pred_cls: (bs, K)
+        plan_anchor: (bs, K, 8, 2)
         targets['trajectory']: (bs, 8, 3)
         """
         bs, num_mode, ts, d = poses_reg.shape
