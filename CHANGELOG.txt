@@ -517,3 +517,39 @@ CHANGELOG.txt
 
 与论文撰写的关系：
 该版本可表述为 “GT-Protected Temporal Fine Adjustment”。方法属于面向主目标优先级的非对称梯度协调：历史连接不是与 imitation objective 平权竞争的第二目标，而是在不牺牲原始监督一阶下降方向的约束下，对 trajectory head 进行有限幅度的时序细化。
+修改主题：3.1.03 Connection-Aligned Gated History Adapter
+修改日期：2026-08-23
+
+修改目的：
+基于纯 3.1.01 GT-Protected Temporal Optimization，引入真正参与扩散轨迹生成的历史特征适配器。此前历史连接信息主要作用于训练辅助损失和测试阶段 mode rescoring，没有进入 diffusion decoder 的候选轨迹生成过程；3.1.03 通过显式连接对齐、历史可靠性门控和有界残差，在不改变固定 20 anchor、多模态监督与 3.1.01 梯度保护逻辑的前提下，让 decoder 能学习利用近端历史。
+
+涉及文件：
+navsim/agents/diffusiondrive/transfuser_config.py
+navsim/agents/diffusiondrive/transfuser_model_v2.py
+navsim/agents/diffusiondrive/transfuser_agent.py
+navsim/planning/script/run_pdm_score.py
+tests/test_diffusiondrive_factorized_temporal_compat.py
+CHANGELOG.txt
+
+核心改动：
+1. 基于 3.1.01 创建 3.1.03，不合入 3.1.02 Adaptive Anchor Bank；继续使用固定 20 个 plan anchor，不新增、替换或传播 anchor，不修改 decoder mode 数量。
+2. 新增 ConnectionAlignedHistoryAdapter，并只放在第二层/最终 diffusion decoder layer，避免历史残差在多层中累计，也避免第一层出现未使用 adapter 参数。
+3. 历史输入严格保持连接语义：H0=executed_delta 对齐 S0=q0-origin，H1=p1-p0 对齐 S1=q1-q0，H2=p2-p1 对齐 S2=q2-q1；不做同时间段 p0/q0 重叠匹配，也不使用 p3-p7。
+4. 使用 PairMLP 处理三个已知的一一对应关系，而不是让普通 cross-attention 自由寻找对应。pair feature 包含当前段、历史段、差值、逐元素乘积、段长度、长度差、slot ID 和 executed/predicted source type。
+5. 门控拆成 reliability 与 relevance：reliability 结合当前场景聚合特征、历史 token 和 pair feature 判断历史是否可信；relevance 结合当前 mode query 与 pair feature 判断该历史对当前 mode 是否有用；最终 gate=validity*reliability*relevance。
+6. 硬 validity 屏蔽缺失、NaN/Inf 或单个 0.5s segment 位移超过 15m 的历史段；跨 log/scene 仍沿用 run_pdm_score 的 reset_temporal_context() 隔离缓存。
+7. 训练时仅对 H1/H2 预测历史 slot 使用 0.10 dropout，真实 executed_delta slot 永不 dropout，用于让 gate 学会在预测历史缺失时回退当前场景判断。
+8. 历史 update projection 使用全零初始化，因此训练开始时 adapter 输出严格为零，初始行为等价 3.1.01。
+9. 历史残差逐 mode 做范数约束：||history_update|| 最大为 ||mode_query|| 的 10%，防止历史特征即使门控误判也产生无界特征扰动；无有效历史时 gate 为零并精确回退原 decoder 特征。
+10. 不新增 loss、不修改 GT best mode、one-hot classification、best-mode regression、3.14 ranking/tiny auxiliary 和 3.1.01 GT-protected gradient projection；adapter 通过现有 primary supervision 与受保护 temporal supervision 学习。
+11. 保留 3.1.01 的 test-time top-5 temporal rescoring，3.1.03 只新增“历史参与候选生成”这一实验变量，不重新启用 temporal noise modulation。
+12. 新增诊断字段 history_adapter_active、history_adapter_gate_mean、history_adapter_reliability_mean、history_adapter_relevance_mean、history_adapter_update_norm_ratio；训练写入 Lightning 日志，验证写入 PDM CSV。
+
+预期影响：
+3.1.03 用结构层面的历史特征融合补足此前 temporal 方法只影响 loss/重排、却不影响去噪生成的缺口。固定连接对齐减少自由 attention 学偏的空间；双门控抑制错误历史；零初始化与 10% 有界残差使模型从 3.1.01 行为出发渐进学习。该设计不能预先保证 PDM 提升，但能把“历史是否有生成价值”变成可直接验证、可通过日志诊断的单一架构变量。
+
+测试/验证结果：
+按实验约定，本地不运行 pytest、manual runner、syntax smoke 或完整验证。轻量测试已补充连接段构造、零初始化等价回退、10% update norm 上限及预测历史 dropout 不影响 executed slot 的覆盖；等待服务器 smoke/full training 和本地 PDM validation。
+
+与论文撰写的关系：
+3.1.03 可表述为 Connection-Aligned Gated History Adapter。核心贡献不是增加历史损失或替换 anchor，而是把真实执行运动与近端预测历史编码为三个具有明确时间连接关系的稀疏几何 token，通过 source-aware 双门控和有界残差注入 diffusion trajectory decoder，从网络架构层面学习“何时、对哪个 mode、以多大幅度使用历史”。

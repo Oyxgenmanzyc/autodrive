@@ -135,6 +135,11 @@ def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[D
                 "temporal_rescore_cls_margin": 0.0,
                 "temporal_rescore_selected_mode": 0.0,
                 "temporal_rescore_base_mode": 0.0,
+                "history_adapter_active": 0.0,
+                "history_adapter_gate_mean": 0.0,
+                "history_adapter_reliability_mean": 0.0,
+                "history_adapter_relevance_mean": 0.0,
+                "history_adapter_update_norm_ratio": 0.0,
             }
             try:
                 metric_cache_path = metric_cache_loader.metric_cache_paths[token]

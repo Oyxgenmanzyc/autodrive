@@ -79,6 +79,11 @@ class TransfuserConfig:
     tf_num_head: int = 8
     tf_dropout: float = 0.0
 
+    # Connection-aligned history adapter (3.1.03)
+    history_adapter_max_update_ratio: float = 0.10
+    history_adapter_prediction_dropout: float = 0.10
+    history_adapter_max_delta: float = 15.0
+
     # detection
     num_bounding_boxes: int = 30
 

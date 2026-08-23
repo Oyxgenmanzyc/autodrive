@@ -73,7 +73,20 @@ def _make_head():
     head.temporal_rescore_topk = 5
     head.temporal_rescore_alpha = 0.05
     head.temporal_rescore_cost_clamp = 2.0
+    head.history_adapter_max_delta = 15.0
     return head
+
+
+def _make_history_adapter(max_update_ratio=0.10, prediction_dropout=0.0):
+    _load_trajectory_head()
+    from navsim.agents.diffusiondrive.transfuser_model_v2 import ConnectionAlignedHistoryAdapter
+
+    return ConnectionAlignedHistoryAdapter(
+        d_model=16,
+        max_update_ratio=max_update_ratio,
+        prediction_dropout=prediction_dropout,
+        geometry_scale=15.0,
+    )
 
 
 def _make_loss_computer():
@@ -93,6 +106,90 @@ def _straight_x(scale=1.0, steps=8):
 
 def _straight_y(scale=1.0, steps=8):
     return torch.stack([torch.zeros(steps), torch.arange(1, steps + 1).float() * scale], dim=-1)
+
+
+def test_history_adapter_inputs_follow_connection_alignment():
+    head = _make_head()
+    previous = torch.tensor([[[0.5, 0.0], [1.5, 0.2], [2.8, 0.5]]])
+    executed_delta = torch.tensor([[0.4, -0.1]])
+
+    history_deltas, validity = head._history_adapter_inputs(
+        previous,
+        executed_delta,
+        batch_size=1,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    expected = torch.tensor([[[0.4, -0.1], [1.0, 0.2], [1.3, 0.3]]])
+    assert torch.allclose(history_deltas, expected)
+    assert torch.equal(validity, torch.ones_like(validity))
+
+
+def test_zero_initialized_history_adapter_preserves_original_query():
+    adapter = _make_history_adapter()
+    mode_query = torch.randn(2, 20, 16)
+    trajectory_points = torch.randn(2, 20, 8, 2)
+    history_deltas = torch.randn(2, 3, 2)
+    history_validity = torch.ones(2, 3)
+
+    output, diagnostics = adapter(
+        mode_query,
+        trajectory_points,
+        history_deltas,
+        history_validity,
+    )
+
+    assert torch.equal(output, mode_query)
+    assert diagnostics["history_adapter_update_norm_ratio"].item() == 0.0
+
+
+def test_history_adapter_update_is_bounded_by_query_norm():
+    adapter = _make_history_adapter(max_update_ratio=0.10)
+    torch.nn.init.normal_(adapter.update_projection.weight, std=1.0)
+    torch.nn.init.normal_(adapter.update_projection.bias, std=1.0)
+    mode_query = torch.randn(2, 20, 16)
+    trajectory_points = torch.randn(2, 20, 8, 2)
+    history_deltas = torch.randn(2, 3, 2)
+    history_validity = torch.ones(2, 3)
+
+    output, diagnostics = adapter(
+        mode_query,
+        trajectory_points,
+        history_deltas,
+        history_validity,
+    )
+    update_ratio = torch.linalg.norm(output - mode_query, dim=-1) / torch.linalg.norm(
+        mode_query,
+        dim=-1,
+    ).clamp_min(1e-6)
+
+    assert update_ratio.max() <= 0.10001
+    assert diagnostics["history_adapter_update_norm_ratio"] <= 0.10001
+
+
+def test_prediction_dropout_keeps_executed_motion_slot():
+    adapter = _make_history_adapter(prediction_dropout=1.0)
+    adapter.train()
+    torch.nn.init.normal_(adapter.update_projection.weight, std=0.1)
+    mode_query = torch.randn(1, 20, 16)
+    trajectory_points = torch.randn(1, 20, 8, 2)
+    history_deltas = torch.randn(1, 3, 2)
+
+    output_with_dropout, _ = adapter(
+        mode_query,
+        trajectory_points,
+        history_deltas,
+        torch.ones(1, 3),
+    )
+    output_executed_only, _ = adapter(
+        mode_query,
+        trajectory_points,
+        history_deltas,
+        torch.tensor([[1.0, 0.0, 0.0]]),
+    )
+
+    assert torch.allclose(output_with_dropout, output_executed_only)
 
 
 def test_temporal_noise_scale_returns_none_without_previous():

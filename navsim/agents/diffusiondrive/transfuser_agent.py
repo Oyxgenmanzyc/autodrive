@@ -64,6 +64,11 @@ class TransfuserAgent(AbstractAgent):
         self._last_temporal_rescore_cls_margin = 0.0
         self._last_temporal_rescore_selected_mode = 0.0
         self._last_temporal_rescore_base_mode = 0.0
+        self._last_history_adapter_active = 0.0
+        self._last_history_adapter_gate_mean = 0.0
+        self._last_history_adapter_reliability_mean = 0.0
+        self._last_history_adapter_relevance_mean = 0.0
+        self._last_history_adapter_update_norm_ratio = 0.0
         self.init_from_pretrained()
 
     def init_from_pretrained(self):
@@ -149,6 +154,11 @@ class TransfuserAgent(AbstractAgent):
         self._last_temporal_rescore_cls_margin = 0.0
         self._last_temporal_rescore_selected_mode = 0.0
         self._last_temporal_rescore_base_mode = 0.0
+        self._last_history_adapter_active = 0.0
+        self._last_history_adapter_gate_mean = 0.0
+        self._last_history_adapter_reliability_mean = 0.0
+        self._last_history_adapter_relevance_mean = 0.0
+        self._last_history_adapter_update_norm_ratio = 0.0
 
     def _build_temporal_reference(self, agent_input: AgentInput) -> Optional[np.ndarray]:
         if self._previous_trajectory is None or len(agent_input.ego_statuses) < 2:
@@ -189,6 +199,11 @@ class TransfuserAgent(AbstractAgent):
             "temporal_rescore_cls_margin": self._last_temporal_rescore_cls_margin,
             "temporal_rescore_selected_mode": self._last_temporal_rescore_selected_mode,
             "temporal_rescore_base_mode": self._last_temporal_rescore_base_mode,
+            "history_adapter_active": self._last_history_adapter_active,
+            "history_adapter_gate_mean": self._last_history_adapter_gate_mean,
+            "history_adapter_reliability_mean": self._last_history_adapter_reliability_mean,
+            "history_adapter_relevance_mean": self._last_history_adapter_relevance_mean,
+            "history_adapter_update_norm_ratio": self._last_history_adapter_update_norm_ratio,
         }
 
     @staticmethod
@@ -235,6 +250,11 @@ class TransfuserAgent(AbstractAgent):
             self._last_temporal_rescore_cls_margin = self._prediction_scalar(predictions, "temporal_rescore_cls_margin")
             self._last_temporal_rescore_selected_mode = self._prediction_scalar(predictions, "temporal_rescore_selected_mode")
             self._last_temporal_rescore_base_mode = self._prediction_scalar(predictions, "temporal_rescore_base_mode")
+            self._last_history_adapter_active = self._prediction_scalar(predictions, "history_adapter_active")
+            self._last_history_adapter_gate_mean = self._prediction_scalar(predictions, "history_adapter_gate_mean")
+            self._last_history_adapter_reliability_mean = self._prediction_scalar(predictions, "history_adapter_reliability_mean")
+            self._last_history_adapter_relevance_mean = self._prediction_scalar(predictions, "history_adapter_relevance_mean")
+            self._last_history_adapter_update_norm_ratio = self._prediction_scalar(predictions, "history_adapter_update_norm_ratio")
             poses = predictions["trajectory"].squeeze(0).numpy()
 
         self._previous_trajectory = poses.copy()

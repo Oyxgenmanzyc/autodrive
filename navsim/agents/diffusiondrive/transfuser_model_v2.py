@@ -287,6 +287,168 @@ class ModulationLayer(nn.Module):
         traj_feature = traj_feature * (1 + scale) + shift
         return traj_feature
 
+class ConnectionAlignedHistoryAdapter(nn.Module):
+    """Injects three explicitly aligned history segments into mode queries."""
+
+    def __init__(
+        self,
+        d_model: int,
+        max_update_ratio: float,
+        prediction_dropout: float,
+        geometry_scale: float,
+    ):
+        super().__init__()
+        self.max_update_ratio = max_update_ratio
+        self.prediction_dropout = prediction_dropout
+        self.geometry_scale = geometry_scale
+
+        self.history_encoder = nn.Sequential(
+            nn.Linear(5, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+        )
+        self.pair_encoder = nn.Sequential(
+            nn.Linear(15, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+        )
+        self.reliability_gate = nn.Sequential(
+            nn.Linear(3 * d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, 1),
+        )
+        self.relevance_gate = nn.Sequential(
+            nn.Linear(2 * d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, 1),
+        )
+        self.update_projection = nn.Linear(d_model, d_model)
+        nn.init.zeros_(self.update_projection.weight)
+        nn.init.zeros_(self.update_projection.bias)
+
+    @staticmethod
+    def _segment_deltas(points):
+        origin = torch.zeros_like(points[..., :1, :])
+        return points[..., :3, :] - torch.cat([origin, points[..., :2, :]], dim=-2)
+
+    @staticmethod
+    def _zero_diagnostics(reference):
+        zero = reference.new_zeros(())
+        return {
+            "history_adapter_active": zero,
+            "history_adapter_gate_mean": zero,
+            "history_adapter_reliability_mean": zero,
+            "history_adapter_relevance_mean": zero,
+            "history_adapter_update_norm_ratio": zero,
+        }
+
+    def forward(self, mode_query, trajectory_points, history_deltas, history_validity):
+        if trajectory_points.shape[-2] < 3 or history_deltas is None or history_validity is None:
+            return mode_query, self._zero_diagnostics(mode_query)
+
+        history_deltas = history_deltas.to(device=mode_query.device, dtype=mode_query.dtype)
+        history_validity = history_validity.to(device=mode_query.device, dtype=mode_query.dtype)
+        if history_deltas.shape[-2:] != (3, 2) or history_validity.shape[-1] != 3:
+            return mode_query, self._zero_diagnostics(mode_query)
+
+        if self.training and self.prediction_dropout > 0:
+            keep_prediction = (
+                torch.rand_like(history_validity[..., 1:]) >= self.prediction_dropout
+            ).to(history_validity.dtype)
+            history_validity = torch.cat(
+                [history_validity[..., :1], history_validity[..., 1:] * keep_prediction],
+                dim=-1,
+            )
+
+        batch_size, num_modes = mode_query.shape[:2]
+        validity = history_validity[:, None, :, None]
+        current_delta = self._segment_deltas(trajectory_points[..., :2])
+        history_delta = history_deltas[:, None].expand(-1, num_modes, -1, -1)
+        current_length = torch.linalg.norm(current_delta, dim=-1, keepdim=True)
+        history_length = torch.linalg.norm(history_delta, dim=-1, keepdim=True)
+        current_delta_scaled = current_delta / self.geometry_scale
+        history_delta_scaled = history_delta / self.geometry_scale
+        current_length_scaled = current_length / self.geometry_scale
+        history_length_scaled = history_length / self.geometry_scale
+
+        slot_one_hot = F.one_hot(
+            torch.arange(3, device=mode_query.device),
+            num_classes=3,
+        ).to(mode_query.dtype)
+        slot_one_hot = slot_one_hot.view(1, 1, 3, 3).expand(batch_size, num_modes, -1, -1)
+        source_type = torch.tensor(
+            [1.0, 0.0, 0.0],
+            device=mode_query.device,
+            dtype=mode_query.dtype,
+        ).view(1, 1, 3, 1).expand(batch_size, num_modes, -1, -1)
+
+        pair_input = torch.cat(
+            [
+                current_delta_scaled,
+                history_delta_scaled,
+                current_delta_scaled - history_delta_scaled,
+                current_delta_scaled * history_delta_scaled,
+                current_length_scaled,
+                history_length_scaled,
+                current_length_scaled - history_length_scaled,
+                slot_one_hot,
+                source_type,
+            ],
+            dim=-1,
+        )
+        pair_feature = self.pair_encoder(pair_input)
+
+        slot_scalar = torch.arange(3, device=mode_query.device, dtype=mode_query.dtype) / 2.0
+        slot_scalar = slot_scalar.view(1, 3, 1).expand(batch_size, -1, -1)
+        history_source = torch.tensor(
+            [1.0, 0.0, 0.0],
+            device=mode_query.device,
+            dtype=mode_query.dtype,
+        ).view(1, 3, 1).expand(batch_size, -1, -1)
+        history_raw = torch.cat(
+            [
+                history_deltas / self.geometry_scale,
+                torch.linalg.norm(history_deltas, dim=-1, keepdim=True) / self.geometry_scale,
+                history_source,
+                slot_scalar,
+            ],
+            dim=-1,
+        )
+        history_feature = self.history_encoder(history_raw)[:, None].expand(-1, num_modes, -1, -1)
+        global_scene = mode_query.mean(dim=1, keepdim=True)[:, :, None].expand(-1, num_modes, 3, -1)
+        expanded_query = mode_query[:, :, None].expand(-1, -1, 3, -1)
+
+        reliability = torch.sigmoid(
+            self.reliability_gate(torch.cat([global_scene, history_feature, pair_feature], dim=-1))
+        )
+        relevance = torch.sigmoid(
+            self.relevance_gate(torch.cat([expanded_query, pair_feature], dim=-1))
+        )
+        gate = validity * reliability * relevance
+
+        pair_update = self.update_projection(pair_feature)
+        history_update = (gate * pair_update).sum(dim=2) / 3.0
+        query_norm = torch.linalg.norm(mode_query, dim=-1, keepdim=True).clamp_min(1e-6)
+        update_norm = torch.linalg.norm(history_update, dim=-1, keepdim=True)
+        max_update_norm = self.max_update_ratio * query_norm
+        update_scale = torch.clamp(max_update_norm / update_norm.clamp_min(1e-6), max=1.0)
+        bounded_update = history_update * update_scale
+
+        valid_count = validity.sum().clamp_min(1.0) * float(num_modes)
+        diagnostics = {
+            "history_adapter_active": history_validity.bool().any(dim=-1).to(mode_query.dtype).mean().detach(),
+            "history_adapter_gate_mean": (gate.sum() / valid_count).detach(),
+            "history_adapter_reliability_mean": ((validity * reliability).sum() / valid_count).detach(),
+            "history_adapter_relevance_mean": ((validity * relevance).sum() / valid_count).detach(),
+            "history_adapter_update_norm_ratio": (
+                torch.linalg.norm(bounded_update, dim=-1) / query_norm.squeeze(-1)
+            ).mean().detach(),
+        }
+        return mode_query + bounded_update, diagnostics
+
+
 class CustomTransformerDecoderLayer(nn.Module):
     def __init__(self, 
                  num_poses,
@@ -324,6 +486,12 @@ class CustomTransformerDecoderLayer(nn.Module):
         self.norm1 = nn.LayerNorm(config.tf_d_model)
         self.norm2 = nn.LayerNorm(config.tf_d_model)
         self.norm3 = nn.LayerNorm(config.tf_d_model)
+        self.history_adapter = ConnectionAlignedHistoryAdapter(
+            d_model=config.tf_d_model,
+            max_update_ratio=config.history_adapter_max_update_ratio,
+            prediction_dropout=config.history_adapter_prediction_dropout,
+            geometry_scale=config.history_adapter_max_delta,
+        )
         self.time_modulation = ModulationLayer(config.tf_d_model,256)
         self.task_decoder = DiffMotionPlanningRefinementModule(
             embed_dims=config.tf_d_model,
@@ -340,7 +508,9 @@ class CustomTransformerDecoderLayer(nn.Module):
                 ego_query, 
                 time_embed, 
                 status_encoding,
-                global_img=None):
+                global_img=None,
+                history_deltas=None,
+                history_validity=None):
         traj_feature = self.cross_bev_attention(traj_feature,noisy_traj_points,bev_feature,bev_spatial_shape)
         traj_feature = traj_feature + self.dropout(self.cross_agent_attention(traj_feature, agents_query,agents_query)[0])
         traj_feature = self.norm1(traj_feature)
@@ -350,6 +520,15 @@ class CustomTransformerDecoderLayer(nn.Module):
         # 4.5 cross attention with  ego query
         traj_feature = traj_feature + self.dropout1(self.cross_ego_attention(traj_feature, ego_query,ego_query)[0])
         traj_feature = self.norm2(traj_feature)
+
+        history_diagnostics = {}
+        if self.history_adapter is not None and history_deltas is not None:
+            traj_feature, history_diagnostics = self.history_adapter(
+                traj_feature,
+                noisy_traj_points,
+                history_deltas,
+                history_validity,
+            )
         
         # 4.6 feedforward network
         traj_feature = self.norm3(self.ffn(traj_feature))
@@ -361,7 +540,7 @@ class CustomTransformerDecoderLayer(nn.Module):
         poses_reg[...,:2] = poses_reg[...,:2] + noisy_traj_points
         poses_reg[..., StateSE2Index.HEADING] = poses_reg[..., StateSE2Index.HEADING].tanh() * np.pi
 
-        return poses_reg, poses_cls
+        return poses_reg, poses_cls, history_diagnostics
 def _get_clones(module, N):
     # FIXME: copy.deepcopy() is not defined on nn.module
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
@@ -378,6 +557,8 @@ class CustomTransformerDecoder(nn.Module):
         torch._C._log_api_usage_once(f"torch.nn.modules.{self.__class__.__name__}")
         self.layers = _get_clones(decoder_layer, num_layers)
         self.num_layers = num_layers
+        for layer in self.layers[:-1]:
+            layer.history_adapter = None
     
     def forward(self, 
                 traj_feature, 
@@ -388,16 +569,34 @@ class CustomTransformerDecoder(nn.Module):
                 ego_query, 
                 time_embed, 
                 status_encoding,
-                global_img=None):
+                global_img=None,
+                history_deltas=None,
+                history_validity=None):
         poses_reg_list = []
         poses_cls_list = []
+        history_diagnostics = {}
         traj_points = noisy_traj_points
-        for mod in self.layers:
-            poses_reg, poses_cls = mod(traj_feature, traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)
+        for layer_index, mod in enumerate(self.layers):
+            use_history = layer_index == self.num_layers - 1
+            poses_reg, poses_cls, layer_history_diagnostics = mod(
+                traj_feature,
+                traj_points,
+                bev_feature,
+                bev_spatial_shape,
+                agents_query,
+                ego_query,
+                time_embed,
+                status_encoding,
+                global_img,
+                history_deltas if use_history else None,
+                history_validity if use_history else None,
+            )
             poses_reg_list.append(poses_reg)
             poses_cls_list.append(poses_cls)
+            if use_history:
+                history_diagnostics = layer_history_diagnostics
             traj_points = poses_reg[...,:2].clone().detach()
-        return poses_reg_list, poses_cls_list
+        return poses_reg_list, poses_cls_list, history_diagnostics
 
 class TrajectoryHead(nn.Module):
     """Trajectory prediction head."""
@@ -447,6 +646,7 @@ class TrajectoryHead(nn.Module):
         self.temporal_rescore_topk = 5
         self.temporal_rescore_alpha = 0.05
         self.temporal_rescore_cost_clamp = 2.0
+        self.history_adapter_max_delta = config.history_adapter_max_delta
 
         self.diffusion_scheduler = DDIMScheduler(
             num_train_timesteps=1000,
@@ -503,6 +703,71 @@ class TrajectoryHead(nn.Module):
         origin = torch.zeros_like(points[..., :1, :])
         previous_points = torch.cat([origin, points[..., :-1, :]], dim=-2)
         return points - previous_points
+
+    @staticmethod
+    def _expand_history_batch(value, batch_size):
+        if value.shape[0] == batch_size:
+            return value
+        if value.shape[0] == 1:
+            return value.expand(batch_size, *value.shape[1:])
+        return None
+
+    def _history_adapter_inputs(
+        self,
+        previous_trajectory,
+        previous_ego_delta,
+        batch_size,
+        device,
+        dtype,
+    ):
+        if previous_trajectory is None and previous_ego_delta is None:
+            return None, None
+
+        zero_segment = torch.zeros((batch_size, 1, 2), device=device, dtype=dtype)
+        executed_delta = zero_segment
+        executed_validity = torch.zeros((batch_size, 1), device=device, dtype=dtype)
+        if previous_ego_delta is not None:
+            ego_delta = previous_ego_delta.to(device=device, dtype=dtype)
+            if ego_delta.dim() == 1:
+                ego_delta = ego_delta.unsqueeze(0)
+            ego_delta = self._expand_history_batch(ego_delta, batch_size)
+            if ego_delta is not None and ego_delta.shape[-1] >= 2:
+                executed_delta = ego_delta[..., :2].unsqueeze(1)
+                executed_finite = torch.isfinite(executed_delta).all(dim=-1)
+                executed_length = torch.linalg.norm(
+                    torch.nan_to_num(executed_delta),
+                    dim=-1,
+                )
+                executed_validity = (
+                    executed_finite & (executed_length <= self.history_adapter_max_delta)
+                ).to(dtype)
+                executed_delta = torch.nan_to_num(executed_delta)
+                executed_delta = executed_delta * executed_validity.unsqueeze(-1)
+
+        predicted_delta = torch.zeros((batch_size, 2, 2), device=device, dtype=dtype)
+        predicted_validity = torch.zeros((batch_size, 2), device=device, dtype=dtype)
+        if previous_trajectory is not None:
+            previous_points = previous_trajectory.to(device=device, dtype=dtype)
+            if previous_points.dim() == 2:
+                previous_points = previous_points.unsqueeze(0)
+            previous_points = self._expand_history_batch(previous_points, batch_size)
+            if previous_points is not None and previous_points.shape[-2] >= 3 and previous_points.shape[-1] >= 2:
+                previous_xy = previous_points[..., :3, :2]
+                predicted_delta = previous_xy[..., 1:, :] - previous_xy[..., :-1, :]
+                predicted_finite = torch.isfinite(predicted_delta).all(dim=-1)
+                predicted_length = torch.linalg.norm(
+                    torch.nan_to_num(predicted_delta),
+                    dim=-1,
+                )
+                predicted_validity = (
+                    predicted_finite & (predicted_length <= self.history_adapter_max_delta)
+                ).to(dtype)
+                predicted_delta = torch.nan_to_num(predicted_delta)
+                predicted_delta = predicted_delta * predicted_validity.unsqueeze(-1)
+
+        history_deltas = torch.cat([executed_delta, predicted_delta], dim=1)
+        history_validity = torch.cat([executed_validity, predicted_validity], dim=1)
+        return history_deltas.detach(), history_validity.detach()
 
     def _angle_error(self, anchor_angle, previous_angle):
         return torch.atan2(
@@ -929,8 +1194,28 @@ class TrajectoryHead(nn.Module):
         time_embed = time_embed.view(bs,1,-1)
 
 
+        history_deltas, history_validity = self._history_adapter_inputs(
+            previous_trajectory,
+            previous_ego_delta,
+            bs,
+            device,
+            traj_feature.dtype,
+        )
+
         # 4. begin the stacked decoder
-        poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)
+        poses_reg_list, poses_cls_list, temporal_metrics = self.diff_decoder(
+            traj_feature,
+            noisy_traj_points,
+            bev_feature,
+            bev_spatial_shape,
+            agents_query,
+            ego_query,
+            time_embed,
+            status_encoding,
+            global_img,
+            history_deltas,
+            history_validity,
+        )
         temporal_context = self._energy_loss_context(
             poses_reg_list[-1][..., :2],
             previous_trajectory,
@@ -980,6 +1265,7 @@ class TrajectoryHead(nn.Module):
         best_reg = torch.gather(poses_reg_list[-1], 1, mode_idx).squeeze(1)
         trajectory_loss_dict["trajectory_original_loss"] = ret_original_traj_loss.detach()
         trajectory_loss_dict["trajectory_connection_loss"] = ret_connection_traj_loss.detach()
+        trajectory_loss_dict.update(temporal_metrics)
         output = {
             "trajectory": best_reg,
             "trajectory_loss": ret_traj_loss,
@@ -998,6 +1284,14 @@ class TrajectoryHead(nn.Module):
         step_ratio = 20 / step_num
         roll_timesteps = (np.arange(0, step_num) * step_ratio).round()[::-1].copy().astype(np.int64)
         roll_timesteps = torch.from_numpy(roll_timesteps).to(device)
+        history_deltas, history_validity = self._history_adapter_inputs(
+            previous_trajectory,
+            previous_ego_delta,
+            bs,
+            device,
+            ego_query.dtype,
+        )
+        history_adapter_diagnostics = {}
 
 
         # 1. add truncated noise to the plan anchor
@@ -1031,7 +1325,19 @@ class TrajectoryHead(nn.Module):
             time_embed = time_embed.view(bs,1,-1)
 
             # 4. begin the stacked decoder
-            poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)
+            poses_reg_list, poses_cls_list, history_adapter_diagnostics = self.diff_decoder(
+                traj_feature,
+                noisy_traj_points,
+                bev_feature,
+                bev_spatial_shape,
+                agents_query,
+                ego_query,
+                time_embed,
+                status_encoding,
+                global_img,
+                history_deltas,
+                history_validity,
+            )
             poses_reg = poses_reg_list[-1]
             poses_cls = poses_cls_list[-1]
             x_start = poses_reg[...,:2]
@@ -1051,4 +1357,5 @@ class TrajectoryHead(nn.Module):
         best_reg = torch.gather(poses_reg, 1, mode_idx).squeeze(1)
         output = {"trajectory": best_reg}
         output.update(temporal_diagnostics)
+        output.update(history_adapter_diagnostics)
         return output
