@@ -44,6 +44,23 @@ class AgentLightningModule(pl.LightningModule):
         """
         return self._step(batch, "train")
 
+    def on_train_epoch_end(self) -> None:
+        """Log exact global adaptive-Anchor utilization from one reduced ``[K]`` vector."""
+        metrics_fn = getattr(self.agent, "synchronized_training_utilization_metrics", None)
+        reset_fn = getattr(self.agent, "reset_training_utilization", None)
+        if metrics_fn is None or reset_fn is None:
+            return
+        metrics = metrics_fn()
+        if metrics:
+            self.log_dict(
+                {f"train/{key}": value for key, value in metrics.items()},
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                sync_dist=False,
+            )
+        reset_fn()
+
     def validation_step(self, batch: Tuple[Dict[str, Tensor], Dict[str, Tensor]], batch_idx: int):
         """
         Step called on validation samples

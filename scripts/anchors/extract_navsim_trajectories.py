@@ -14,6 +14,12 @@ from omegaconf import OmegaConf
 from pyquaternion import Quaternion
 from tqdm import tqdm
 
+from navsim.agents.diffusiondrive.anchors.trajectory_distance import (
+    NAVSIM_ONE_HOT_COMMANDS,
+    TrajectoryCommand,
+    navsim_command_from_one_hot,
+)
+
 
 def _local_future_trajectory(frames: list[dict[str, Any]], current_idx: int, num_poses: int) -> np.ndarray:
     current = frames[current_idx]
@@ -29,11 +35,11 @@ def _local_future_trajectory(frames: list[dict[str, Any]], current_idx: int, num
     return (delta @ global_to_ego.T).astype(np.float32)
 
 
-def _iter_navtrain_trajectories(
+def _iter_navtrain_samples(
     data_path: Path,
     filter_config: Any,
     num_poses: int,
-) -> Iterable[np.ndarray]:
+) -> Iterable[tuple[np.ndarray, TrajectoryCommand]]:
     selected_logs = set(filter_config.get("log_names") or [])
     selected_tokens = set(filter_config.get("tokens") or [])
     history_frames = int(filter_config.get("num_history_frames", 4))
@@ -60,7 +66,10 @@ def _iter_navtrain_trajectories(
                 continue
             if selected_tokens and current["token"] not in selected_tokens:
                 continue
-            yield _local_future_trajectory(scene_frames, current_idx, num_poses)
+            command = navsim_command_from_one_hot(current["driving_command"])
+            if command is None:
+                continue
+            yield _local_future_trajectory(scene_frames, current_idx, num_poses), command
             emitted += 1
             if max_scenes is not None and emitted >= int(max_scenes):
                 return
@@ -90,22 +99,34 @@ def main() -> None:
     if not args.data_path.is_dir():
         raise FileNotFoundError(f"NAVSIM log directory does not exist: {args.data_path}")
     filter_config = OmegaConf.load(args.navtrain_filter_config)
-    trajectories = list(_iter_navtrain_trajectories(args.data_path, filter_config, args.num_poses))
-    if not trajectories:
+    samples = list(_iter_navtrain_samples(args.data_path, filter_config, args.num_poses))
+    if not samples:
         raise RuntimeError("No navtrain trajectories were extracted; check paths and split filters")
+    trajectories, commands = zip(*samples)
     array = np.stack(trajectories).astype(np.float32)
+    command_array = np.asarray([command.value for command in commands], dtype="<U8")
+    command_path = args.output.with_name(f"{args.output.stem}_commands.npy")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     np.save(args.output, array)
+    np.save(command_path, command_array)
     metadata = {
         "split": "navtrain",
         "data_path": str(args.data_path),
         "filter_config": str(args.navtrain_filter_config),
         "num_trajectories": int(len(array)),
         "shape": list(array.shape),
+        "commands_path": str(command_path),
+        "command_counts": {
+            command.value: int(np.sum(command_array == command.value))
+            for command in NAVSIM_ONE_HOT_COMMANDS
+            if command is not None
+        },
+        "unknown_command_filtered": True,
     }
     with args.output.with_suffix(".json").open("w", encoding="utf-8") as file:
         json.dump(metadata, file, ensure_ascii=False, indent=2)
     print(f"Saved {len(array)} navtrain trajectories to {args.output}")
+    print(f"Saved semantic commands to {command_path}")
 
 
 if __name__ == "__main__":

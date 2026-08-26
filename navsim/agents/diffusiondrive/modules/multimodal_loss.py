@@ -5,6 +5,12 @@ import functools
 from typing import Callable, Optional
 from torch import Tensor
 from navsim.agents.diffusiondrive.transfuser_config import TransfuserConfig
+from navsim.agents.diffusiondrive.anchors.trajectory_distance import (
+    TrajectoryCommand,
+    torch_command_ids_from_one_hot,
+    torch_trajectory_distance,
+    torch_valid_command_mask,
+)
 # from mmcv.ops import sigmoid_focal_loss as _sigmoid_focal_loss
 # from mmdet.models.losses import FocalLoss
 
@@ -114,45 +120,243 @@ def py_sigmoid_focal_loss(pred,
     return loss
 
 
+def command_mode_mask(
+    driving_command: Tensor,
+    anchor_command_ids: Tensor,
+    *,
+    allow_unknown_all_modes: bool = False,
+) -> tuple[Tensor, Tensor]:
+    """Return semantic command ids and the eligible ``[B, K]`` mode mask."""
+    valid_commands = torch_valid_command_mask(driving_command)
+    if torch.any(~valid_commands) and not allow_unknown_all_modes:
+        raise ValueError("unknown driving_command has no command-conditioned Anchor group")
+    if allow_unknown_all_modes:
+        command_ids = (driving_command[:, :3] != 0).to(dtype=torch.int64).argmax(dim=1)
+    else:
+        command_ids = torch_command_ids_from_one_hot(driving_command)
+    anchor_command_ids = anchor_command_ids.to(
+        device=driving_command.device, dtype=torch.int64
+    )
+    if anchor_command_ids.ndim != 1:
+        raise ValueError("anchor_command_ids must have shape [K]")
+    if torch.any((anchor_command_ids < 0) | (anchor_command_ids > 2)):
+        raise ValueError("anchor_command_ids must contain only ids 0--2")
+    mask = command_ids[:, None] == anchor_command_ids[None]
+    if allow_unknown_all_modes:
+        mask = mask | (~valid_commands)[:, None]
+    if torch.any(valid_commands & ~mask.any(dim=1)):
+        raise ValueError("every batch command must have at least one eligible mode")
+    return command_ids, mask
+
+
+def command_masked_argmax(
+    poses_cls: Tensor,
+    driving_command: Tensor,
+    anchor_command_ids: Tensor,
+) -> Tensor:
+    """Apply command eligibility before the unchanged maximum-logit selector."""
+    if poses_cls.ndim != 2:
+        raise ValueError("poses_cls must have shape [B, K]")
+    _, mask = command_mode_mask(
+        driving_command,
+        anchor_command_ids,
+        allow_unknown_all_modes=True,
+    )
+    if mask.shape != poses_cls.shape:
+        raise ValueError("command mask and poses_cls must have identical shape")
+    return poses_cls.masked_fill(~mask, -torch.inf).argmax(dim=-1)
+
+
+def k_invariant_focal_loss(
+    poses_cls: Tensor,
+    winner_indices: Tensor,
+    command_mask: Tensor,
+    *,
+    gamma: float = 2.0,
+    alpha: float = 0.25,
+) -> Tensor:
+    """Return positive focal loss plus per-sample mean valid-negative focal loss."""
+    if poses_cls.ndim != 2 or command_mask.shape != poses_cls.shape:
+        raise ValueError("poses_cls and command_mask must have shape [B, K]")
+    if winner_indices.shape != (poses_cls.shape[0],):
+        raise ValueError("winner_indices must have shape [B]")
+    if torch.any((winner_indices < 0) | (winner_indices >= poses_cls.shape[1])):
+        raise ValueError("winner_indices contain an out-of-range mode")
+    if torch.any(~command_mask.gather(1, winner_indices[:, None]).squeeze(1)):
+        raise ValueError("winner_indices must select command-valid modes")
+
+    targets = torch.zeros_like(poses_cls)
+    targets.scatter_(1, winner_indices[:, None], 1)
+    loss_element = py_sigmoid_focal_loss(
+        poses_cls,
+        targets,
+        weight=None,
+        gamma=gamma,
+        alpha=alpha,
+        reduction="none",
+        avg_factor=None,
+    )
+    positive_loss = loss_element.gather(1, winner_indices[:, None]).squeeze(1)
+    negative_mask = command_mask & ~targets.bool()
+    negative_count = negative_mask.sum(dim=1)
+    negative_loss = (loss_element * negative_mask).sum(dim=1)
+    negative_mean = torch.where(
+        negative_count > 0,
+        negative_loss / negative_count.clamp_min(1),
+        torch.zeros_like(negative_loss),
+    )
+    return positive_loss.mean() + negative_mean.mean()
+
+
+def current_prediction_responsibility(
+    poses_reg: Tensor,
+    target_trajectory: Tensor,
+    driving_command: Tensor,
+    anchor_command_ids: Tensor,
+    delta_scales: Tensor,
+    fde_scales: Tensor,
+) -> Tensor:
+    """Choose the detached current prediction with minimum command-local ``D_traj``."""
+    command_ids, mask = command_mode_mask(driving_command, anchor_command_ids)
+    with torch.no_grad():
+        distances = torch_trajectory_distance(
+            poses_reg.detach()[..., :2],
+            target_trajectory[..., :2],
+            command_ids,
+            delta_scales,
+            fde_scales,
+        )
+        distances = distances.masked_fill(~mask, torch.inf)
+        return distances.argmin(dim=-1)
+
+
 class LossComputer(nn.Module):
-    def __init__(self,config: TransfuserConfig):
-        self._config = config
+    def __init__(
+        self,
+        config: TransfuserConfig,
+        anchor_command_ids: Tensor,
+        delta_scales: Tensor,
+        fde_scales: Tensor,
+    ):
         super(LossComputer, self).__init__()
+        self._config = config
+        self.register_buffer("anchor_command_ids", anchor_command_ids.to(dtype=torch.int64))
+        self.register_buffer("delta_scales", delta_scales.to(dtype=torch.float32))
+        self.register_buffer("fde_scales", fde_scales.to(dtype=torch.float32))
+        self.register_buffer(
+            "winner_counts",
+            torch.zeros(len(anchor_command_ids), dtype=torch.int64),
+            persistent=False,
+        )
+        anchor_ids_cpu = anchor_command_ids.detach().to(device="cpu", dtype=torch.int64)
+        self._command_anchor_indices = tuple(
+            tuple(torch.flatnonzero(anchor_ids_cpu == command_id).tolist())
+            for command_id in range(len(TrajectoryCommand))
+        )
         # self.focal_loss = FocalLoss(use_sigmoid=True, gamma=2.0, alpha=0.25, reduction='mean', loss_weight=1.0, activated=False)
         self.cls_loss_weight = config.trajectory_cls_weight
         self.reg_loss_weight = config.trajectory_reg_weight
-    def forward(self, poses_reg, poses_cls, targets, plan_anchor):
+    @torch.no_grad()
+    def update_training_utilization(self, winner_indices: Tensor) -> None:
+        """Accumulate command-local winner counts for training utilization logs."""
+        self.winner_counts.add_(
+            torch.bincount(winner_indices, minlength=len(self.anchor_command_ids)).to(
+                device=self.winner_counts.device
+            )
+        )
+
+    def training_utilization_metrics(
+        self, winner_counts: Optional[Tensor] = None
+    ) -> dict[str, Tensor]:
+        """Compute command-local utilization metrics from one global ``[K]`` histogram."""
+        metrics: dict[str, Tensor] = {}
+        if winner_counts is None:
+            winner_counts = self.winner_counts
+        if winner_counts.shape != self.winner_counts.shape:
+            raise ValueError("winner_counts must have shape [K]")
+        counts = winner_counts.to(device=self.winner_counts.device, dtype=torch.float32)
+        for command_id, command in enumerate(TrajectoryCommand):
+            anchor_indices = self._command_anchor_indices[command_id]
+            if not anchor_indices:
+                continue
+            index_tensor = torch.tensor(
+                anchor_indices, dtype=torch.int64, device=counts.device
+            )
+            command_counts = counts[index_tensor]
+            frequencies = command_counts / command_counts.sum().clamp_min(1.0)
+            active_mode_rate = (frequencies > 0.001).to(dtype=torch.float32).mean()
+            positive_frequencies = frequencies[frequencies > 0]
+            winner_entropy = -(
+                positive_frequencies * positive_frequencies.log()
+            ).sum()
+            prefix = f"trajectory_utilization/{command.value}"
+            metrics[f"{prefix}/active_mode_rate"] = active_mode_rate
+            metrics[f"{prefix}/winner_entropy"] = winner_entropy
+            for local_index, anchor_index in enumerate(anchor_indices):
+                metrics[f"{prefix}/winner_mode_{anchor_index}_frequency"] = frequencies[
+                    local_index
+                ]
+        return metrics
+
+    @torch.no_grad()
+    def synchronized_training_utilization_metrics(self) -> dict[str, Tensor]:
+        """All-reduce the complete ``[K]`` histogram once, then compute global metrics."""
+        global_counts = self.winner_counts.clone()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(global_counts, op=torch.distributed.ReduceOp.SUM)
+        return self.training_utilization_metrics(global_counts)
+
+    @torch.no_grad()
+    def reset_training_utilization(self) -> None:
+        """Clear the local histogram after the epoch-level metrics are emitted."""
+        self.winner_counts.zero_()
+
+    def forward(
+        self,
+        poses_reg,
+        poses_cls,
+        targets,
+        driving_command,
+        *,
+        track_utilization: bool = False,
+    ):
         """
         pred_traj: (bs, K, 8, 3)
         pred_cls: (bs, K)
-        plan_anchor: (bs, K, 8, 2)
+        driving_command: (bs, 4)
         targets['trajectory']: (bs, 8, 3)
         """
-        bs, num_mode, ts, d = poses_reg.shape
-        target_traj = targets["trajectory"]
-        dist = torch.linalg.norm(target_traj.unsqueeze(1)[...,:2] - plan_anchor, dim=-1)
-        dist = dist.mean(dim=-1)
-        mode_idx = torch.argmin(dist, dim=-1)
+        valid_samples = torch_valid_command_mask(driving_command)
+        if not torch.any(valid_samples):
+            return (poses_reg.sum() + poses_cls.sum()) * 0.0
+
+        poses_reg = poses_reg[valid_samples]
+        poses_cls = poses_cls[valid_samples]
+        target_traj = targets["trajectory"][valid_samples]
+        driving_command = driving_command[valid_samples]
+        _, _, ts, d = poses_reg.shape
+        _, valid_mode_mask = command_mode_mask(
+            driving_command, self.anchor_command_ids
+        )
+        mode_idx = current_prediction_responsibility(
+            poses_reg,
+            target_traj,
+            driving_command,
+            self.anchor_command_ids,
+            self.delta_scales,
+            self.fde_scales,
+        )
         cls_target = mode_idx
+        if track_utilization:
+            self.update_training_utilization(cls_target)
         mode_idx = mode_idx[...,None,None,None].repeat(1,1,ts,d)
         best_reg = torch.gather(poses_reg, 1, mode_idx).squeeze(1)
-        # import ipdb; ipdb.set_trace()
-        # Calculate cls loss using focal loss
-        target_classes_onehot = torch.zeros([bs, num_mode],
-                                            dtype=poses_cls.dtype,
-                                            layout=poses_cls.layout,
-                                            device=poses_cls.device)
-        target_classes_onehot.scatter_(1, cls_target.unsqueeze(1), 1)
-
-        # Use py_sigmoid_focal_loss function for focal loss calculation
-        loss_cls = self.cls_loss_weight * py_sigmoid_focal_loss(
+        loss_cls = self.cls_loss_weight * k_invariant_focal_loss(
             poses_cls,
-            target_classes_onehot,
-            weight=None,
+            cls_target,
+            valid_mode_mask,
             gamma=2.0,
             alpha=0.25,
-            reduction='mean',
-            avg_factor=None
         )
 
         # Calculate regression loss

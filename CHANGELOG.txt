@@ -31,3 +31,195 @@ tests/test_diffusiondrive_variable_anchor.py
 
 与论文撰写的关系：
 该版本作为“原版 DiffusionDrive + Adaptive Multimodal Anchor”的独立消融实验，与 3.1.01 时序优化实验分离，可用于直接比较固定 20-anchor 与 adaptive variable-K anchor 的覆盖率、训练稳定性及 NAVSIM 指标。
+
+
+修改主题：3.1.02 统一轨迹距离与 Calibration Bank（阶段 1-2）
+修改日期：2026-08-26
+
+修改目的：
+为后续 command-conditioned split、K-Medoids、dedup 和动态 responsibility 建立唯一的轨迹距离定义，并使用约 60 个离线 Calibration Medoid 标定各 command 的 Delta/FDE P95 固定尺度。
+
+涉及文件：
+navsim/agents/diffusiondrive/anchors/trajectory_distance.py
+navsim/agents/diffusiondrive/anchors/calibration.py
+scripts/anchors/extract_navsim_trajectories.py
+scripts/anchors/calibrate_trajectory_distance.py
+tests/test_trajectory_distance.py
+tests/test_anchor_calibration.py
+docs/adaptive_anchor_bank.md
+docs/calibration_bank_modification_review.md
+requirements.txt
+
+核心改动：
+1. 统一 D_traj 为 command-conditioned Raw Delta Distance 与 0.2 权重 Raw FDE 的独立 P95 归一化组合。
+2. NAVSIM command 显式映射为 left/straight/right，unknown 在 Calibration 数据中滤除。
+3. 按 command 样本比例精确分配 60 个 Calibration Anchor，每组至少 10 个，整数分配采用 largest remainder。
+4. 每个 command 最多固定种子抽样 10,000 条，使用 Raw Delta Distance + FasterPAM K-Medoids 选取真实 GT medoid。
+5. 全量 GT 根据 Raw Delta Distance 找最近 medoid，Delta 与 FDE 对同一个 medoid 计算并分别取 P95。
+6. JSON 保存六个固定 normalization scale；NPZ 保存 medoid、command、source index 与 support 审计数据。
+7. 新增相应单元测试，但不接入后续 split、dedup 或训练 responsibility。
+
+预期影响：
+后续所有 Anchor 模块可共享同一 D_traj，消除距离尺度随 batch、epoch 或 Anchor Split 漂移的问题。Calibration 仅离线运行，不增加训练和推理开销。
+
+测试/验证结果：
+按本地实验工作流未运行测试；待代码审核通过后由服务器执行相关单元测试与标定脚本。
+
+与论文撰写的关系：
+对应“Command-conditioned Unified Trajectory Geometry”的基础实现，使后续 P95 Split、K-Medoids、Dedup 与 prediction-based responsibility 能使用同一个可解释且固定尺度的轨迹距离。
+
+
+修改主题：3.1.02 Command-conditioned Base Bank 与递归 K-Medoids Split（阶段 3-5）
+修改日期：2026-08-26
+
+修改目的：
+落实实施计划第十一至十七节，使正式 Base Anchor 携带 command metadata，并统一使用固定尺度 D_traj 完成 assignment、P95 trigger 和 K-Medoids split。
+
+涉及文件：
+navsim/agents/diffusiondrive/anchors/command_anchor_bank.py
+navsim/agents/diffusiondrive/anchors/kmedoids_splitter.py
+navsim/agents/diffusiondrive/anchors/io.py
+navsim/agents/diffusiondrive/anchors/__init__.py
+scripts/anchors/build_anchor_bank.py
+tests/test_command_anchor_bank.py
+docs/adaptive_anchor_bank.md
+docs/command_anchor_split_modification_review.md
+
+核心改动：
+1. 保持 flat [K, 8, 2] tensor，并增加 command_ids、support、parent_ids、root_ids、node_ids。
+2. GT assignment 先按 Left/Straight/Right mask，再在同 command 内以 D_traj 求最近 Anchor。
+3. Split 唯一主判据改为 P95(D_traj) > tau_split；旧 variance、max waypoint error、Coverage@1m 降为 diagnostics。
+4. 使用 worst-first priority queue 递归处理 P95 最大的 cluster，tau_split（论文符号 τ_D）默认固定为 1.0。
+5. 使用 K-Medoids(k=2, distance=D_traj) 产生真实 GT medoid；大 parent 固定种子最多抽样 4096 条，随后完整回分配。
+6. 两个 child 均需达到该 command 全量样本的 3%；否则 Reject 并保留 parent。Reject membership 不变时阻止重试，global assignment 改变 membership 后允许重新评估。
+7. 使用 max_total_anchors=72 作为工程 safety cap；正常目标约 60，不强制精确数量。
+8. 不再给旧全局 20 Anchor 猜测 command；直接按 GT command 分组重新生成初始 20 Base Anchor，并从真实 GT 来源继承 metadata。Calibration Bank 仍只提供固定尺度。
+
+预期影响：
+正式 Base Expansion 的“哪里需要 split”和“如何 split”开始共用同一 D_traj，并消除跨 command Anchor 竞争。Calibration scale 保持离线固定，不增加训练期动态状态。
+
+测试/验证结果：
+新增初始 command 来源、blocked membership 重评、command mask、worst-first、真实 medoid、采样上限、完整 support、3% Reject 和 72 cap 单元测试；按本地实验工作流未运行，待服务器验证。
+
+与论文撰写的关系：
+对应 Command-conditioned Base Anchor Expansion，使离散 trajectory prototype 的语义空间、覆盖误差和 split 优化目标保持一致。
+
+
+修改主题：3.1.02 Command-local Dedup 与 Current Prediction Responsibility（阶段 6-7）
+修改日期：2026-08-26
+
+修改目的：
+落实实施计划第十八至十九节，在递归 Split 后用正式 D_traj 完成同 command Anchor 去重，并将训练正样本分配从静态 Anchor 最近邻改为当前预测轨迹的 command-local D_traj 最近邻。
+
+涉及文件：
+navsim/agents/diffusiondrive/anchors/anchor_dedup.py
+navsim/agents/diffusiondrive/anchors/trajectory_distance.py
+navsim/agents/diffusiondrive/anchors/io.py
+navsim/agents/diffusiondrive/anchors/__init__.py
+scripts/anchors/build_anchor_bank.py
+navsim/agents/diffusiondrive/modules/multimodal_loss.py
+navsim/agents/diffusiondrive/transfuser_model_v2.py
+navsim/agents/diffusiondrive/transfuser_config.py
+navsim/agents/diffusiondrive/transfuser_agent.py
+tests/test_anchor_dedup.py
+tests/test_dynamic_responsibility.py
+tests/test_trajectory_distance.py
+tests/test_diffusiondrive_variable_anchor.py
+docs/adaptive_anchor_bank.md
+docs/dedup_responsibility_modification_review.md
+
+核心改动：
+1. Dedup 仅在相同 command 内判定 D_traj < tau_dedup，默认阈值 0.15，并开放 0.10/0.15/0.20/0.25 消融。
+2. 重复 Anchor 优先保留 support 更大者；support 相同时保留 local mean D_traj 更低者；再次相同时按原索引稳定决胜。
+3. Dedup 后在最终 Bank 上对全量 GT 执行一次 command-conditioned reassignment，并更新 support、local mean D_traj、assignment 和最近距离。
+4. 模型训练 artifact 改为完整 NPZ，统一携带 anchors、command_ids、delta_scales 和 fde_scales；普通 NPY 仅用于可视化。
+5. 训练 winner 改为当前 poses_reg 与 GT 的 command-local D_traj argmin，不再使用静态 plan_anchor 与 GT 选正样本。
+6. winner argmin 使用 poses_reg.detach() 和 no_grad，不允许离散分配路径参与反向传播。
+7. winner 确定后的 regression 继续使用原版 L1，不修改回归目标。
+8. checkpoint 加载过滤当前 Bank 的 Anchor、command metadata 与固定尺度，避免旧 checkpoint 覆盖实验 artifact。
+9. 第二十一节 K-invariant classification reduction 和第二十二节完整训练/推理 command mask、selector 尚未实现。
+10. 训练数据入口未保证过滤 unknown；LossComputer 增加 sample-level valid mask，使 unknown 不参与 trajectory classification、responsibility 或 regression。全 unknown batch 返回可反传零损失，且不将 unknown 映射为 Straight。
+
+预期影响：
+Anchor Bank 在 Split 后消除同 command 冗余原型，同时保留跨 command 语义隔离；训练正样本随 decoder 当前预测质量动态分配，且离线构建与训练使用同一个固定尺度 D_traj。当前阶段尚不适合启动完整实验，需等待后续 classification 和 inference 逻辑接入。
+
+测试/验证结果：
+新增 Dedup 保留优先级、跨 command 隔离、全量 reassignment、Current Prediction winner、command mask、unknown 样本过滤、全 unknown batch 可反传零损失、argmin 无梯度、原版 L1 和 Torch/NumPy D_traj 一致性测试；按本地实验工作流未运行，待服务器验证。
+
+与论文撰写的关系：
+对应“Command-local Anchor Deduplication”与“Prediction-based Training Responsibility”，使 Anchor 原型压缩和训练 winner 分配共享统一的 command-conditioned trajectory geometry。
+
+
+修改主题：3.1.02 K-invariant Training、Command Mask 与 Anchor Utilization 日志（最终阶段）
+修改日期：2026-08-26
+
+修改目的：
+完成实施计划第十九至二十五节，使 Current Prediction Responsibility、原版 Regression、K-invariant Classification、训练/推理 Command Mask、离线 Coverage/Diversity 和训练 Utilization 形成完整闭环，并遵守第二十八至三十一节的模块边界与第一版控制变量。
+
+涉及文件：
+navsim/agents/diffusiondrive/anchors/anchor_metrics.py
+navsim/agents/diffusiondrive/anchors/command_anchor_bank.py
+navsim/agents/diffusiondrive/anchors/__init__.py
+navsim/agents/diffusiondrive/modules/multimodal_loss.py
+navsim/agents/diffusiondrive/transfuser_model_v2.py
+navsim/planning/training/agent_lightning_module.py
+scripts/anchors/build_anchor_bank.py
+tests/test_anchor_metrics.py
+tests/test_dynamic_responsibility.py
+tests/test_diffusiondrive_variable_anchor.py
+docs/adaptive_anchor_bank.md
+docs/final_anchor_training_logging_review.md
+
+核心改动：
+1. Current Prediction Responsibility 继续使用 command-local D_traj 与 no_grad argmin，静态 Anchor 不参与 positive mode 分配。
+2. winner 后继续使用原版 L1 regression，不增加新回归项。
+3. Classification 保留原 focal loss 的 logits、target、alpha 和 gamma，reduction 改为 positive mean + per-sample valid-negative mean，消除 K 对 loss scale 的直接影响。
+4. 训练保持 [B,K,...]，invalid command modes 不参与 classification、responsibility 或 regression。
+5. 推理在原 argmax 前将 invalid command logits 置为 -inf；selector 本身不重写。unknown 推理回退为全部 modes，不映射成 Straight。
+6. Builder 报告 total K、各 command K、逐 Anchor support、完整 Split Accept/Reject、Mean/P50/P95 D_traj、ADE/FDE、P95 max point error 与 Coverage@0.5/1.0/1.5m。
+7. 新增同 command Diversity：Mean/Median nearest-neighbor D_traj、pairwise 分布、四档近重复比例及直方图 PNG。
+8. 最终 decoder 按 command 累积 winner counts；epoch end 一次性 all-reduce 完整 [K] vector，再从全局计数计算 winner frequency、>0.1% active mode rate 和 winner entropy。运行期计数不写入 checkpoint，记录后清零。
+9. 保持统一距离、Calibration、Split、Dedup、Metrics、IO 和训练 loss 的模块职责，不把逻辑堆入 agent。
+10. 未实现新 regression/heading/curvature loss、风险或进度 selector、时序模块、在线增长、可学习阈值/归一化或动态 P95。
+
+预期影响：
+不同 command 的 mode 数量不再改变分类 loss 的基本尺度，训练和推理均消除跨 command mode 竞争；离线 Bank 的 coverage/effective diversity 与训练期间真实 mode 利用率可被直接审计。
+
+测试/验证结果：
+新增 K-invariant focal、单 valid mode 零 negative、invalid logits 零梯度、command-masked selector、unknown 回退、DDP 全局 training utilization、Coverage/Diversity 和 variable-K 接口测试；按本地实验工作流未运行，待服务器验证。
+
+与论文撰写的关系：
+完成“Adaptive Multimodal Anchor”的训练闭环与可观测性设计，可分别报告 nominal K、effective diversity、command-local coverage 和实际 winner utilization，同时保持原 DiffusionDrive regression 与 selector 作为控制变量。
+
+
+修改主题：3.1.02_2 最终审核修正
+修改日期：2026-08-26
+
+修改目的：
+修正多卡 Training Utilization 的统计口径，保证 frequency、active mode rate 与 entropy 来自全局 winner histogram，并补齐单 valid mode 的 focal loss 边界验证。
+
+涉及文件：
+navsim/agents/diffusiondrive/modules/multimodal_loss.py
+navsim/agents/diffusiondrive/transfuser_agent.py
+navsim/agents/diffusiondrive/transfuser_model_v2.py
+navsim/planning/training/agent_lightning_module.py
+tests/test_dynamic_responsibility.py
+tests/test_diffusiondrive_variable_anchor.py
+docs/adaptive_anchor_bank.md
+docs/final_anchor_training_logging_review.md
+
+核心改动：
+1. 每个 rank 在 epoch 内只累计一个 [K] winner_counts buffer。
+2. epoch end 对整个 [K] vector 执行一次 all_reduce(SUM)，不再同步或平均各 rank 独立计算的 entropy/active rate。
+3. winner frequency、0.1% active mode rate 和 entropy 全部由 global counts 计算，因此统计严格对应全局训练样本。
+4. utilization 作为 epoch-level 指标写出，随后清零本地 counts；buffer 不进入 checkpoint。
+5. 增加单 valid mode、零 negative 的 K-invariant focal 测试，确认 loss 有限且梯度有限。
+
+预期影响：
+多卡训练下的 Anchor 实际利用率不再受 rank 分片分布影响，可可靠判断 nominal K 与真正工作的 mode 数量；同步开销仅为每 epoch 一个约 60 维整型向量。
+
+测试/验证结果：
+已补充一次性 [K] all-reduce 行为与单 valid mode 边界测试；按本地实验工作流未运行，待服务器 smoke test。
+
+与论文撰写的关系：
+使论文中的 winner histogram、active mode rate 和 winner entropy 具有严格的全局统计含义，避免将各 rank 非线性指标均值误报为全数据指标。

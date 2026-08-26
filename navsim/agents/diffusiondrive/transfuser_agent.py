@@ -56,7 +56,17 @@ class TransfuserAgent(AbstractAgent):
     @staticmethod
     def _without_checkpoint_anchor(state_dict: Dict[str, Any]) -> Dict[str, Any]:
         """Keep the anchor bank selected by config instead of restoring a checkpoint asset."""
-        return {key: value for key, value in state_dict.items() if not key.endswith("plan_anchor")}
+        artifact_suffixes = (
+            "plan_anchor",
+            "anchor_command_ids",
+            "delta_scales",
+            "fde_scales",
+        )
+        return {
+            key: value
+            for key, value in state_dict.items()
+            if not key.endswith(artifact_suffixes)
+        }
 
     def init_from_pretrained(self):
         # import ipdb; ipdb.set_trace()
@@ -75,7 +85,13 @@ class TransfuserAgent(AbstractAgent):
             # Load state dict and get info about missing and unexpected keys
             missing_keys, unexpected_keys = self.load_state_dict(state_dict, strict=False)
             
-            unexpected_missing = [key for key in missing_keys if not key.endswith("plan_anchor")]
+            unexpected_missing = [
+                key
+                for key in missing_keys
+                if not key.endswith(
+                    ("plan_anchor", "anchor_command_ids", "delta_scales", "fde_scales")
+                )
+            ]
             if unexpected_missing:
                 print(f"Missing keys when loading pretrained weights: {unexpected_missing}")
             if unexpected_keys:
@@ -122,6 +138,14 @@ class TransfuserAgent(AbstractAgent):
     ) -> torch.Tensor:
         """Inherited, see superclass."""
         return transfuser_loss(targets, predictions, self._config)
+
+    def synchronized_training_utilization_metrics(self) -> Dict[str, torch.Tensor]:
+        """Expose globally reduced adaptive-Anchor utilization at epoch end."""
+        return self._transfuser_model._trajectory_head.synchronized_training_utilization_metrics()
+
+    def reset_training_utilization(self) -> None:
+        """Clear adaptive-Anchor winner counts after epoch logging."""
+        self._transfuser_model._trajectory_head.reset_training_utilization()
 
     def get_optimizers(self) -> Union[Optimizer, Dict[str, Union[Optimizer, LRScheduler]]]:
         """Inherited, see superclass."""

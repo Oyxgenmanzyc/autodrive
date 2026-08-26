@@ -43,8 +43,16 @@ class _ZeroTime(torch.nn.Module):
 
 
 class _ZeroLoss(torch.nn.Module):
-    def forward(self, poses_reg, poses_cls, targets, plan_anchor):
+    def forward(
+        self, poses_reg, poses_cls, targets, driving_command, *, track_utilization=False
+    ):
         return poses_reg.sum() * 0.0 + poses_cls.sum() * 0.0
+
+    def synchronized_training_utilization_metrics(self):
+        return {}
+
+    def reset_training_utilization(self):
+        pass
 
 
 class _ShapeRecordingDecoder(torch.nn.Module):
@@ -85,7 +93,13 @@ def _load_model_types():
         gen_sineembed_for_position=lambda positions, **kwargs: positions,
         GridSampleCrossBEVAttention=_DummyModule,
     )
-    _stub_module("navsim.agents.diffusiondrive.modules.multimodal_loss", LossComputer=_DummyModule)
+    _stub_module(
+        "navsim.agents.diffusiondrive.modules.multimodal_loss",
+        LossComputer=_DummyModule,
+        command_masked_argmax=lambda logits, driving_command, anchor_command_ids: logits.argmax(
+            dim=-1
+        ),
+    )
 
     from navsim.agents.diffusiondrive.transfuser_model_v2 import (
         DiffMotionPlanningRefinementModule,
@@ -118,8 +132,14 @@ def test_variable_anchor_bank_smokes_train_and_test(tmp_path):
     _, trajectory_head = _load_model_types()
 
     for mode_count in (20, 32, 64):
-        anchor_path = tmp_path / f"anchors_{mode_count}.npy"
-        np.save(anchor_path, np.zeros((mode_count, 8, 2), dtype=np.float32))
+        anchor_path = tmp_path / f"anchors_{mode_count}.npz"
+        np.savez_compressed(
+            anchor_path,
+            anchors=np.zeros((mode_count, 8, 2), dtype=np.float32),
+            command_ids=np.arange(mode_count, dtype=np.int64) % 3,
+            delta_scales=np.ones(3, dtype=np.float32),
+            fde_scales=np.ones(3, dtype=np.float32),
+        )
         head = trajectory_head(
             num_poses=8,
             d_ffn=32,
@@ -132,6 +152,9 @@ def test_variable_anchor_bank_smokes_train_and_test(tmp_path):
         head.diff_decoder = _ShapeRecordingDecoder()
         ego_query = torch.zeros(2, 1, 16)
         ignored = torch.zeros(2, 1, 16)
+        driving_command = torch.tensor(
+            [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
+        )
 
         head.train()
         train_output = head.forward_train(
@@ -140,6 +163,7 @@ def test_variable_anchor_bank_smokes_train_and_test(tmp_path):
             ignored,
             (1, 1),
             ignored,
+            driving_command,
             targets={"trajectory": torch.zeros(2, 8, 3)},
         )
         assert head.ego_fut_mode == mode_count
@@ -148,7 +172,9 @@ def test_variable_anchor_bank_smokes_train_and_test(tmp_path):
         assert torch.isfinite(train_output["trajectory_loss"])
 
         head.eval()
-        test_output = head.forward_test(ego_query, ignored, ignored, (1, 1), ignored, None)
+        test_output = head.forward_test(
+            ego_query, ignored, ignored, (1, 1), ignored, driving_command, None
+        )
         assert head.diff_decoder.noisy_shape == (2, mode_count, 8, 2)
         assert test_output["trajectory"].shape == (2, 8, 3)
 
@@ -163,10 +189,31 @@ def test_variable_anchor_bank_smokes_train_and_test(tmp_path):
 )
 def test_invalid_anchor_bank_is_rejected(tmp_path, anchors):
     _, trajectory_head = _load_model_types()
-    anchor_path = tmp_path / "invalid.npy"
-    np.save(anchor_path, anchors)
+    anchor_path = tmp_path / "invalid.npz"
+    np.savez_compressed(
+        anchor_path,
+        anchors=anchors,
+        command_ids=np.zeros(len(anchors), dtype=np.int64),
+        delta_scales=np.ones(3, dtype=np.float32),
+        fde_scales=np.ones(3, dtype=np.float32),
+    )
 
     with pytest.raises(ValueError):
+        trajectory_head(
+            num_poses=8,
+            d_ffn=32,
+            d_model=16,
+            plan_anchor_path=str(anchor_path),
+            config=_config(),
+        )
+
+
+def test_plain_npy_without_command_metadata_is_rejected(tmp_path):
+    _, trajectory_head = _load_model_types()
+    anchor_path = tmp_path / "anchors.npy"
+    np.save(anchor_path, np.zeros((20, 8, 2), dtype=np.float32))
+
+    with pytest.raises(ValueError, match="command-conditioned NPZ"):
         trajectory_head(
             num_poses=8,
             d_ffn=32,

@@ -11,7 +11,10 @@ from diffusers.schedulers import DDIMScheduler
 from navsim.agents.diffusiondrive.modules.conditional_unet1d import ConditionalUnet1D,SinusoidalPosEmb
 import torch.nn.functional as F
 from navsim.agents.diffusiondrive.modules.blocks import linear_relu_ln,bias_init_with_prob, gen_sineembed_for_position, GridSampleCrossBEVAttention
-from navsim.agents.diffusiondrive.modules.multimodal_loss import LossComputer
+from navsim.agents.diffusiondrive.modules.multimodal_loss import (
+    LossComputer,
+    command_masked_argmax,
+)
 from torch.nn import TransformerDecoder,TransformerDecoderLayer
 from typing import Any, List, Dict, Optional, Union
 class V2TransfuserModel(nn.Module):
@@ -129,7 +132,16 @@ class V2TransfuserModel(nn.Module):
 
         output: Dict[str, torch.Tensor] = {"bev_semantic_map": bev_semantic_map}
 
-        trajectory = self._trajectory_head(trajectory_query,agents_query, cross_bev_feature,bev_spatial_shape,status_encoding[:, None],targets=targets,global_img=None)
+        trajectory = self._trajectory_head(
+            trajectory_query,
+            agents_query,
+            cross_bev_feature,
+            bev_spatial_shape,
+            status_encoding[:, None],
+            targets=targets,
+            global_img=None,
+            driving_command=status_feature[:, :4],
+        )
         output.update(trajectory)
 
         agents = self._agent_head(agents_query)
@@ -400,7 +412,23 @@ class TrajectoryHead(nn.Module):
         )
 
 
-        plan_anchor = np.load(plan_anchor_path)
+        anchor_artifact = np.load(plan_anchor_path)
+        if not isinstance(anchor_artifact, np.lib.npyio.NpzFile):
+            raise ValueError(
+                "plan_anchor_path must point to the command-conditioned NPZ artifact"
+            )
+        required_keys = {"anchors", "command_ids", "delta_scales", "fde_scales"}
+        missing_keys = required_keys.difference(anchor_artifact.files)
+        if missing_keys:
+            anchor_artifact.close()
+            raise ValueError(
+                "plan anchor artifact is missing: " + ", ".join(sorted(missing_keys))
+            )
+        plan_anchor = np.asarray(anchor_artifact["anchors"], dtype=np.float32)
+        anchor_command_ids = np.asarray(anchor_artifact["command_ids"], dtype=np.int64)
+        delta_scales = np.asarray(anchor_artifact["delta_scales"], dtype=np.float32)
+        fde_scales = np.asarray(anchor_artifact["fde_scales"], dtype=np.float32)
+        anchor_artifact.close()
         expected_shape = (num_poses, 2)
         if plan_anchor.ndim != 3 or plan_anchor.shape[1:] != expected_shape:
             raise ValueError(
@@ -408,12 +436,30 @@ class TrajectoryHead(nn.Module):
             )
         if plan_anchor.shape[0] < 1 or not np.isfinite(plan_anchor).all():
             raise ValueError("plan_anchor must contain at least one finite trajectory")
+        if anchor_command_ids.shape != (len(plan_anchor),) or np.any(
+            (anchor_command_ids < 0) | (anchor_command_ids > 2)
+        ):
+            raise ValueError("command_ids must have shape [K] and contain only ids 0--2")
+        if delta_scales.shape != (3,) or fde_scales.shape != (3,):
+            raise ValueError("delta_scales and fde_scales must have shape [3]")
+        if (
+            not np.isfinite(delta_scales).all()
+            or not np.isfinite(fde_scales).all()
+            or np.any(delta_scales <= 0)
+            or np.any(fde_scales <= 0)
+        ):
+            raise ValueError("trajectory distance scales must be finite and positive")
         self.ego_fut_mode = int(plan_anchor.shape[0])
 
         self.plan_anchor = nn.Parameter(
             torch.tensor(plan_anchor, dtype=torch.float32),
             requires_grad=False,
         ) # K,8,2
+        self.register_buffer(
+            "anchor_command_ids", torch.tensor(anchor_command_ids, dtype=torch.int64)
+        )
+        self.register_buffer("delta_scales", torch.tensor(delta_scales, dtype=torch.float32))
+        self.register_buffer("fde_scales", torch.tensor(fde_scales, dtype=torch.float32))
         self.plan_anchor_encoder = nn.Sequential(
             *linear_relu_ln(d_model, 1, 1,512),
             nn.Linear(d_model, d_model),
@@ -433,7 +479,12 @@ class TrajectoryHead(nn.Module):
         )
         self.diff_decoder = CustomTransformerDecoder(diff_decoder_layer, 2)
 
-        self.loss_computer = LossComputer(config)
+        self.loss_computer = LossComputer(
+            config,
+            self.anchor_command_ids,
+            self.delta_scales,
+            self.fde_scales,
+        )
     def norm_odo(self, odo_info_fut):
         odo_info_fut_x = odo_info_fut[..., 0:1]
         odo_info_fut_y = odo_info_fut[..., 1:2]
@@ -452,15 +503,15 @@ class TrajectoryHead(nn.Module):
         odo_info_fut_y = (odo_info_fut_y + 1)/2 * 46 - 20
         odo_info_fut_head = (odo_info_fut_head + 1)/2 * 3.9 - 2
         return torch.cat([odo_info_fut_x, odo_info_fut_y, odo_info_fut_head], dim=-1)
-    def forward(self, ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None) -> Dict[str, torch.Tensor]:
+    def forward(self, ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None,driving_command=None) -> Dict[str, torch.Tensor]:
         """Torch module forward pass."""
         if self.training:
-            return self.forward_train(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,targets,global_img)
+            return self.forward_train(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,driving_command,targets,global_img)
         else:
-            return self.forward_test(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,global_img)
+            return self.forward_test(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,driving_command,global_img)
 
 
-    def forward_train(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None) -> Dict[str, torch.Tensor]:
+    def forward_train(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding,driving_command,targets=None,global_img=None) -> Dict[str, torch.Tensor]:
         bs = ego_query.shape[0]
         device = ego_query.device
         # 1. add truncated noise to the plan anchor
@@ -496,16 +547,36 @@ class TrajectoryHead(nn.Module):
         trajectory_loss_dict = {}
         ret_traj_loss = 0
         for idx, (poses_reg, poses_cls) in enumerate(zip(poses_reg_list, poses_cls_list)):
-            trajectory_loss = self.loss_computer(poses_reg, poses_cls, targets, plan_anchor)
+            trajectory_loss = self.loss_computer(
+                poses_reg,
+                poses_cls,
+                targets,
+                driving_command,
+                track_utilization=idx == len(poses_reg_list) - 1,
+            )
             trajectory_loss_dict[f"trajectory_loss_{idx}"] = trajectory_loss
             ret_traj_loss += trajectory_loss
 
-        mode_idx = poses_cls_list[-1].argmax(dim=-1)
+        mode_idx = command_masked_argmax(
+            poses_cls_list[-1], driving_command, self.anchor_command_ids
+        )
         mode_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
         best_reg = torch.gather(poses_reg_list[-1], 1, mode_idx).squeeze(1)
-        return {"trajectory": best_reg,"trajectory_loss":ret_traj_loss,"trajectory_loss_dict":trajectory_loss_dict}
+        return {
+            "trajectory": best_reg,
+            "trajectory_loss": ret_traj_loss,
+            "trajectory_loss_dict": trajectory_loss_dict,
+        }
 
-    def forward_test(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding,global_img) -> Dict[str, torch.Tensor]:
+    def synchronized_training_utilization_metrics(self) -> Dict[str, torch.Tensor]:
+        """Return exact epoch metrics after one global winner-count reduction."""
+        return self.loss_computer.synchronized_training_utilization_metrics()
+
+    def reset_training_utilization(self) -> None:
+        """Start a fresh winner histogram for the next training epoch."""
+        self.loss_computer.reset_training_utilization()
+
+    def forward_test(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding,driving_command,global_img) -> Dict[str, torch.Tensor]:
         step_num = 2
         bs = ego_query.shape[0]
         device = ego_query.device
@@ -556,7 +627,9 @@ class TrajectoryHead(nn.Module):
                 timestep=k,
                 sample=img
             ).prev_sample
-        mode_idx = poses_cls.argmax(dim=-1)
+        mode_idx = command_masked_argmax(
+            poses_cls, driving_command, self.anchor_command_ids
+        )
         mode_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
         best_reg = torch.gather(poses_reg, 1, mode_idx).squeeze(1)
         return {"trajectory": best_reg}
