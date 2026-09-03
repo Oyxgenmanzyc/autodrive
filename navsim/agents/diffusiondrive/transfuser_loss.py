@@ -31,9 +31,11 @@ def transfuser_loss(
         diffusion_loss = predictions['diffusion_loss']
     else:
         diffusion_loss = 0
+    future_speed_loss = predictions.get('future_speed_loss', 0)
     loss = (
         config.trajectory_weight * trajectory_loss
         + config.diff_loss_weight * diffusion_loss
+        + config.future_speed_loss_weight * future_speed_loss
         + config.agent_class_weight * agent_class_loss
         + config.agent_box_weight * agent_box_loss
         + config.bev_semantic_weight * bev_semantic_loss
@@ -42,6 +44,7 @@ def transfuser_loss(
         'loss': loss,
         'trajectory_loss': config.trajectory_weight*trajectory_loss,
         'diffusion_loss': config.diff_loss_weight*diffusion_loss,
+        'future_speed_loss': config.future_speed_loss_weight*future_speed_loss,
         'agent_class_loss': config.agent_class_weight*agent_class_loss,
         'agent_box_loss': config.agent_box_weight*agent_box_loss,
         'bev_semantic_loss': config.bev_semantic_weight*bev_semantic_loss

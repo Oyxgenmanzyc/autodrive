@@ -61,7 +61,8 @@ class _ShapeRecordingDecoder(torch.nn.Module):
             device=noisy_traj_points.device,
             dtype=noisy_traj_points.dtype,
         ).unsqueeze(0).repeat(noisy_traj_points.shape[0], 1)
-        return [poses_reg], [poses_cls]
+        speed_logits = torch.zeros(noisy_traj_points.shape[0], 4, device=noisy_traj_points.device)
+        return [poses_reg], [poses_cls], [speed_logits]
 
 
 def _load_model_types():
@@ -101,6 +102,9 @@ def _config():
         tf_num_head=4,
         tf_dropout=0.0,
         tf_d_ffn=32,
+        future_speed_num_classes=4,
+        future_speed_thresholds=(0.5, 2.0, 5.0),
+        trajectory_sampling=types.SimpleNamespace(interval_length=0.5),
     )
 
 
@@ -146,6 +150,7 @@ def test_variable_anchor_bank_smokes_train_and_test(tmp_path):
         assert head.diff_decoder.noisy_shape == (2, mode_count, 8, 2)
         assert train_output["trajectory"].shape == (2, 8, 3)
         assert torch.isfinite(train_output["trajectory_loss"])
+        assert torch.isfinite(train_output["future_speed_loss"])
 
         head.eval()
         test_output = head.forward_test(ego_query, ignored, ignored, (1, 1), ignored, None)

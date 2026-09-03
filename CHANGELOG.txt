@@ -31,3 +31,39 @@ tests/test_diffusiondrive_variable_anchor.py
 
 与论文撰写的关系：
 该版本作为“原版 DiffusionDrive + Adaptive Multimodal Anchor”的独立消融实验，与 3.1.01 时序优化实验分离，可用于直接比较固定 20-anchor 与 adaptive variable-K anchor 的覆盖率、训练稳定性及 NAVSIM 指标。
+修改主题：3.1.04 DiffE2E-style Hybrid Future-Speed Semantic Query
+修改日期：2026-09-03
+
+修改目的：
+基于 3.1.02 原版 DiffusionDrive + Adaptive Multimodal Anchor，迁移 DiffE2E 中最可能帮助多模态 Anchor 表征的“trajectory token + supervised query 共享 Transformer latent space”模块。仅增加一个 Future-Speed Semantic Query，用显式未来运动语义辅助 trajectory mode specialization；不整体替换 DiffusionDrive decoder，不混入 3.1.01/3.1.03 的时序训练或历史适配变量。
+
+代码来源与迁移边界：
+1. 结构来源为 bdjukic/DiffE2E commit 4985f8b 的 hybrid_decoder.py 与 train_decoder.py：复用 learnable supervision_query、TransformerEncoder、linear supervision head 和 CrossEntropy collaborative loss 组织方式。
+2. 上游仓库是简化 skeleton，不能直接替换现有 DiffusionDrive；本版本仅做接口适配，不迁移其感知网络、线性 diffusion schedule 或不完整的采样流程。
+3. 为兼容 3.1.02 的 variable-K adaptive anchor，使用 trajectory/semantic token-type encoding 代替上游依赖固定 token 数的 positional table，不引入与 K 绑定的可学习参数。
+
+涉及文件：
+navsim/agents/diffusiondrive/modules/semantic_auxiliary.py
+navsim/agents/diffusiondrive/transfuser_model_v2.py
+navsim/agents/diffusiondrive/transfuser_config.py
+navsim/agents/diffusiondrive/transfuser_loss.py
+tests/test_diffusiondrive_hybrid_speed_semantic.py
+tests/test_diffusiondrive_variable_anchor.py
+CHANGELOG.txt
+
+核心改动：
+1. 在每个 CustomTransformerDecoderLayer 完成 Cross-BEV、Cross-Agent、Cross-Ego 后，插入一层 DiffE2E-style HybridSpeedSemanticDecoder；此时 K 个 trajectory mode 已完成几何感知，semantic token 不进入 GridSampleCrossBEVAttention，因此不破坏 mode 与 trajectory reference points 的一一对应。
+2. 每层使用 1 个 learnable Future-Speed Query，与 K 个 trajectory tokens 拼接后进入 PyTorch TransformerEncoder，再拆回 K 个 trajectory tokens 和 1 个 semantic token；semantic token 经 linear head 输出 4 类 future-speed logits。
+3. 从 targets["trajectory"] 相邻未来点的平均位移和 0.5s 采样间隔构造 future mean-speed label，默认阈值为 0.5/2.0/5.0 m/s，对应四个有序速度区间；无需新增人工标注。
+4. 两层 decoder 的 future-speed CrossEntropy 取均值并以 future_speed_loss_weight=1.0 加入总损失，确保所有 semantic heads 均有梯度，同时避免 loss 随 decoder 层数线性放大。
+5. 保持 adaptive anchor bank、variable-K、anchor split/dedup、原始 GT-to-anchor responsibility、trajectory classification/regression、DDIM 两步去噪和最终 argmax selector 不变。
+6. 旧 checkpoint 继续通过 strict=False 加载；新增 semantic 模块从随机初始化开始训练，plan_anchor 仍沿用 3.1.02 的 checkpoint 过滤逻辑。
+
+预期影响：
+Future-Speed Query 为共享 trajectory latent 提供不依赖 command 泄漏的动力学语义监督，使不同 anchor mode 在学习轨迹几何的同时区分停止/低速/中速/高速行为，预期缓解新增 anchor 同质化和 mode collapse。该机制增加约 K+1 token 的单层 self-attention，计算增量相对现有 BEV/agent attention 较小。由于上游非官方代码并非完整论文复现，性能提升仍需 NAVSIM 训练与 PDMS 实验确认。
+
+测试/验证结果：
+按本仓库实验约定，本地未运行 pytest、manual runner、syntax smoke 或完整训练。已新增轻量单元测试，覆盖四类 future-speed target、非法配置、20/67 variable-K shape 保持，以及 semantic CrossEntropy 梯度回传 trajectory tokens；并更新既有 variable-anchor smoke stub 以覆盖 future_speed_loss。等待服务器执行 pytest、4 卡 fast-dev-run、完整训练和 Navtest PDMS 验证。
+
+与论文撰写的关系：
+3.1.04 可表述为 “Hybrid Future-Speed Semantic Query for Adaptive Multimodal Anchors”。该版本将 DiffE2E 的 hybrid diffusion-supervision latent space 缩减为单一、可归因的模块迁移实验：Anchor 仍负责几何多模态，Diffusion residual 仍负责 mode 内精修，Future-Speed Query 只通过共享注意力和辅助分类监督促进动力学语义分化。建议论文消融同时报告 PDMS、GT-to-anchor coverage error、anchor utilization entropy 与 duplicate ratio，以判断收益是否确实来自 mode specialization。

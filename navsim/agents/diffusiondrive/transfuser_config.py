@@ -83,6 +83,9 @@ class TransfuserConfig:
     trajectory_cls_weight: float = 10.0
     trajectory_reg_weight: float = 8.0
     diff_loss_weight: float = 20.0
+    future_speed_loss_weight: float = 1.0
+    future_speed_thresholds: Tuple[float, float, float] = (0.5, 2.0, 5.0)
+    future_speed_num_classes: int = 4
     agent_class_weight: float = 10.0
     agent_box_weight: float = 1.0
     bev_semantic_weight: float = 14.0

@@ -12,6 +12,10 @@ from navsim.agents.diffusiondrive.modules.conditional_unet1d import ConditionalU
 import torch.nn.functional as F
 from navsim.agents.diffusiondrive.modules.blocks import linear_relu_ln,bias_init_with_prob, gen_sineembed_for_position, GridSampleCrossBEVAttention
 from navsim.agents.diffusiondrive.modules.multimodal_loss import LossComputer
+from navsim.agents.diffusiondrive.modules.semantic_auxiliary import (
+    HybridSpeedSemanticDecoder,
+    future_speed_targets,
+)
 from torch.nn import TransformerDecoder,TransformerDecoderLayer
 from typing import Any, List, Dict, Optional, Union
 class V2TransfuserModel(nn.Module):
@@ -294,6 +298,13 @@ class CustomTransformerDecoderLayer(nn.Module):
             dropout=config.tf_dropout,
             batch_first=True,
         )
+        self.hybrid_speed_decoder = HybridSpeedSemanticDecoder(
+            feature_dim=config.tf_d_model,
+            num_heads=config.tf_num_head,
+            dim_feedforward=config.tf_d_ffn,
+            dropout=config.tf_dropout,
+            num_speed_classes=config.future_speed_num_classes,
+        )
         self.ffn = nn.Sequential(
             nn.Linear(config.tf_d_model, config.tf_d_ffn),
             nn.ReLU(),
@@ -327,6 +338,9 @@ class CustomTransformerDecoderLayer(nn.Module):
         # 4.5 cross attention with  ego query
         traj_feature = traj_feature + self.dropout1(self.cross_ego_attention(traj_feature, ego_query,ego_query)[0])
         traj_feature = self.norm2(traj_feature)
+
+        # DiffE2E-style shared latent space for trajectory modes and speed supervision.
+        traj_feature, speed_logits = self.hybrid_speed_decoder(traj_feature)
         
         # 4.6 feedforward network
         traj_feature = self.norm3(self.ffn(traj_feature))
@@ -338,7 +352,7 @@ class CustomTransformerDecoderLayer(nn.Module):
         poses_reg[...,:2] = poses_reg[...,:2] + noisy_traj_points
         poses_reg[..., StateSE2Index.HEADING] = poses_reg[..., StateSE2Index.HEADING].tanh() * np.pi
 
-        return poses_reg, poses_cls
+        return poses_reg, poses_cls, speed_logits
 def _get_clones(module, N):
     # FIXME: copy.deepcopy() is not defined on nn.module
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
@@ -368,13 +382,15 @@ class CustomTransformerDecoder(nn.Module):
                 global_img=None):
         poses_reg_list = []
         poses_cls_list = []
+        speed_logits_list = []
         traj_points = noisy_traj_points
         for mod in self.layers:
-            poses_reg, poses_cls = mod(traj_feature, traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)
+            poses_reg, poses_cls, speed_logits = mod(traj_feature, traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)
             poses_reg_list.append(poses_reg)
             poses_cls_list.append(poses_cls)
+            speed_logits_list.append(speed_logits)
             traj_points = poses_reg[...,:2].clone().detach()
-        return poses_reg_list, poses_cls_list
+        return poses_reg_list, poses_cls_list, speed_logits_list
 
 class TrajectoryHead(nn.Module):
     """Trajectory prediction head."""
@@ -391,6 +407,7 @@ class TrajectoryHead(nn.Module):
         self._num_poses = num_poses
         self._d_model = d_model
         self._d_ffn = d_ffn
+        self._config = config
         self.diff_loss_weight = 2.0
 
         self.diffusion_scheduler = DDIMScheduler(
@@ -491,7 +508,7 @@ class TrajectoryHead(nn.Module):
 
 
         # 4. begin the stacked decoder
-        poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)
+        poses_reg_list, poses_cls_list, speed_logits_list = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)
 
         trajectory_loss_dict = {}
         ret_traj_loss = 0
@@ -500,10 +517,24 @@ class TrajectoryHead(nn.Module):
             trajectory_loss_dict[f"trajectory_loss_{idx}"] = trajectory_loss
             ret_traj_loss += trajectory_loss
 
+        speed_target = future_speed_targets(
+            targets["trajectory"],
+            interval_length=self._config.trajectory_sampling.interval_length,
+            thresholds=self._config.future_speed_thresholds,
+        )
+        future_speed_loss = torch.stack(
+            [F.cross_entropy(speed_logits, speed_target) for speed_logits in speed_logits_list]
+        ).mean()
+
         mode_idx = poses_cls_list[-1].argmax(dim=-1)
         mode_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
         best_reg = torch.gather(poses_reg_list[-1], 1, mode_idx).squeeze(1)
-        return {"trajectory": best_reg,"trajectory_loss":ret_traj_loss,"trajectory_loss_dict":trajectory_loss_dict}
+        return {
+            "trajectory": best_reg,
+            "trajectory_loss": ret_traj_loss,
+            "trajectory_loss_dict": trajectory_loss_dict,
+            "future_speed_loss": future_speed_loss,
+        }
 
     def forward_test(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding,global_img) -> Dict[str, torch.Tensor]:
         step_num = 2
@@ -546,7 +577,7 @@ class TrajectoryHead(nn.Module):
             time_embed = time_embed.view(bs,1,-1)
 
             # 4. begin the stacked decoder
-            poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)
+            poses_reg_list, poses_cls_list, _ = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)
             poses_reg = poses_reg_list[-1]
             poses_cls = poses_cls_list[-1]
             x_start = poses_reg[...,:2]
