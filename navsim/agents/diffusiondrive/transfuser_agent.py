@@ -190,4 +190,9 @@ class TransfuserAgent(AbstractAgent):
 
     def get_training_callbacks(self) -> List[pl.Callback]:
         """Inherited, see superclass."""
-        return [TransfuserCallback(self._config)]
+        callbacks = [TransfuserCallback(self._config)]
+        if getattr(self._config, "anchor_diagnostics", False):
+            from navsim.agents.diffusiondrive.anchor_diagnostics_callback import AnchorDiagnosticsCallback
+
+            callbacks.append(AnchorDiagnosticsCallback())
+        return callbacks

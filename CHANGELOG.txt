@@ -1,3 +1,38 @@
+修改主题：新 3.1.02：保留原算法，迁回 3.1.02_2 的只读诊断能力
+修改日期：2026-09-05
+
+修改目的：
+以 0c18ceb（原版 DiffusionDrive + Adaptive Multimodal Anchor）为基底，按用户要求结束当前 3.1.02_2 消融排查，仅迁回不会参与预测、匹配或反向传播的统计与离线分析功能。
+
+涉及文件：
+navsim/agents/diffusiondrive/anchor_diagnostics_callback.py
+navsim/agents/diffusiondrive/anchors/diagnostics.py
+navsim/agents/diffusiondrive/transfuser_config.py
+navsim/agents/diffusiondrive/transfuser_agent.py
+scripts/anchors/diagnose_anchor_bank.py
+scripts/anchors/merge_anchor_diagnostics.py
+tests/test_anchor_diagnostics.py
+tests/test_anchor_diagnostics_callback.py
+docs/anchor_diagnostics_3_1_02.md
+
+核心改动：
+1. 从 3.1.02_2 的 utilization/diversity 诊断思想中提取只读能力，适配原版全局 ADE 静态匹配、普通 NPY bank；不直接合并其模型或损失实现。
+2. 可选 anchor_diagnostics=false（默认）：启用后用 detached forward hook 记录每个 decoder 层的静态 winner / logit top1 计数、频率、活跃率、熵、分类/回归损失、非有限 batch 数和实际 optimizer group LR。
+3. 统计不注册模型参数或 buffer、不写入 checkpoint、不额外调用模型 forward、不抽随机数；每个 rank 独立写 JSON，训练中不引入 collective。全局统计在训练外先求和计数再计算熵。
+4. 增加原版 NPY anchor 的离线支持度、最近邻 ADE、近重复比例、覆盖率报告及总览/逐条/支持度可视化；只读原 bank，不更改生成或去重结果。
+5. 原版 base + residual 构建、静态 ADE winner、focal mean + L1、全部 loss weights、DDIM 推理、optimizer/scheduler、训练缓存构造均保留。没有迁入 command mask、D_traj、动态 WTA、K-invariant focal 或 1.5% child ratio。
+
+预期影响：
+默认关闭训练诊断时保持原训练/推理数值路径；启用时仅增加观测和 I/O 开销。此版本不宣称获得新的 PDM 分数，既有约 88.44 的成绩属于原 checkpoint 与原评测配置。
+
+测试/验证结果：
+按实验工作流未在本地运行测试、语法检查或训练；待服务器执行新增单元测试和 4 卡跨两轮 smoke test。新增测试覆盖 loss/gradient/RNG/checkpoint 状态不变、分层计数、不统计验证、NaN 只记录不修复、禁止 collective、离线合并完整性、覆盖与重复度边界。
+
+与论文撰写的关系：
+本版为原 3.1.02 的观测增强版，不作为额外算法增益。3.1.02_2 的消融结果保留为独立实验，不将诊断模块归因为 PDM 改善。
+
+------------------------------------------------------------
+
 修改主题：3.1.02 原版 DiffusionDrive + Adaptive Multimodal Anchor
 修改日期：2026-08-22
 

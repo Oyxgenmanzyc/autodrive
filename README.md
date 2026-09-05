@@ -18,6 +18,10 @@ Accepted to CVPR 2025 as Highlight!
 
 </div>
 
+## 新 3.1.02：原算法 + Anchor 诊断
+
+本分支基于原 3.1.02 (`0c18ceb`)，保留原版 adaptive NPY anchor、静态 ADE 匹配、loss 和推理逻辑，迁回 3.1.02_2 的只读统计与离线可视化能力。训练诊断默认关闭；使用方法、迁移边界及服务器测试命令见 [新 3.1.02 说明](docs/anchor_diagnostics_3_1_02.md)。
+
 ## News
 * **` Apr. 4th, 2025`:** DiffusionDrive is awarded as CVPR 2025 Highlight!
 * **` Feb. 27th, 2025`:** DiffusionDrive is accepted to CVPR 2025!
