@@ -114,18 +114,21 @@ def test_refinement_module_preserves_variable_mode_dimension():
         assert poses_cls.shape == (2, mode_count)
 
 
-def test_variable_anchor_bank_smokes_train_and_test(tmp_path):
+@pytest.mark.parametrize("spr_enabled", [False, True])
+def test_variable_anchor_bank_smokes_train_and_test(tmp_path, spr_enabled):
     _, trajectory_head = _load_model_types()
 
     for mode_count in (20, 32, 64):
         anchor_path = tmp_path / f"anchors_{mode_count}.npy"
         np.save(anchor_path, np.zeros((mode_count, 8, 2), dtype=np.float32))
+        config = _config()
+        config.spr_enabled = spr_enabled
         head = trajectory_head(
             num_poses=8,
             d_ffn=32,
             d_model=16,
             plan_anchor_path=str(anchor_path),
-            config=_config(),
+            config=config,
         )
         head.time_mlp = _ZeroTime(16)
         head.loss_computer = _ZeroLoss()
@@ -146,11 +149,32 @@ def test_variable_anchor_bank_smokes_train_and_test(tmp_path):
         assert head.diff_decoder.noisy_shape == (2, mode_count, 8, 2)
         assert train_output["trajectory"].shape == (2, 8, 3)
         assert torch.isfinite(train_output["trajectory_loss"])
+        if spr_enabled:
+            expected_spr_loss = 2.0 * head.spr_head.get_reconstruction_loss(
+                train_output, {"trajectory": torch.zeros(2, 8, 3)}
+            )
+            torch.testing.assert_close(train_output["trajectory_loss"], expected_spr_loss)
+            torch.testing.assert_close(
+                train_output["trajectory_loss"], train_output["trajectory_loss_dict"]["spr_loss"]
+            )  # Stubbed proposal loss is zero; reconstruction must be counted once.
+            train_output["trajectory_loss"].backward()
+            assert head.spr_head.trajectory_recon[-1].weight.grad is not None
+            assert train_output["proposal_trajectory"].shape == (2, mode_count, 8, 3)
+            assert train_output["trajectory"] is train_output["spr_trajectory"]
+        else:
+            assert head.spr_head is None
+            assert "spr_trajectory" not in train_output
 
         head.eval()
         test_output = head.forward_test(ego_query, ignored, ignored, (1, 1), ignored, None)
         assert head.diff_decoder.noisy_shape == (2, mode_count, 8, 2)
         assert test_output["trajectory"].shape == (2, 8, 3)
+        if spr_enabled:
+            assert test_output["trajectory"] is test_output["spr_trajectory"]
+            head.spr_output = "selector"
+            selected = head.forward_test(ego_query, ignored, ignored, (1, 1), ignored, None)
+            assert selected["trajectory"] is selected["selector_trajectory"]
+            torch.testing.assert_close(selected["trajectory"], selected["proposal_trajectory"][:, -1])
 
 
 @pytest.mark.parametrize(

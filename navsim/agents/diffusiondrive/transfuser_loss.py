@@ -49,6 +49,15 @@ def transfuser_loss(
     if "trajectory_loss_dict" in predictions:
         trajectory_loss_dict = predictions["trajectory_loss_dict"]
         loss_dict.update(trajectory_loss_dict)
+    if "spr_trajectory" in predictions:
+        # Detached diagnostics only; none of these ADE values enters loss.
+        with torch.no_grad():
+            target_xy = targets["trajectory"][..., :2].float()
+            for name in ("spr", "selector"):
+                error = predictions[f"{name}_trajectory"][..., :2].detach().float() - target_xy
+                loss_dict[f"{name}_ade"] = error.norm(dim=-1).mean()
+            proposal_error = predictions["proposal_trajectory"][..., :2].detach().float() - target_xy[:, None]
+            loss_dict["proposal_oracle_ade"] = proposal_error.norm(dim=-1).mean(dim=-1).min(dim=-1).values.mean()
     # import ipdb; ipdb.set_trace()
     return loss_dict
 

@@ -13,6 +13,7 @@ from navsim.agents.diffusiondrive.transfuser_model_v2 import V2TransfuserModel a
 
 from navsim.agents.diffusiondrive.transfuser_callback import TransfuserCallback 
 from navsim.agents.diffusiondrive.transfuser_loss import transfuser_loss
+from navsim.agents.diffusiondrive.modules.scene_proposal_reconstruction import validate_spr_checkpoint
 from navsim.agents.diffusiondrive.transfuser_features import TransfuserFeatureBuilder, TransfuserTargetBuilder
 from navsim.common.dataclasses import SensorConfig
 from navsim.planning.training.abstract_feature_target_builder import AbstractFeatureBuilder, AbstractTargetBuilder
@@ -70,6 +71,7 @@ class TransfuserAgent(AbstractAgent):
             
             # Remove 'agent.' prefix from keys if present
             state_dict = {k.replace('agent.', ''): v for k, v in state_dict.items()}
+            validate_spr_checkpoint(self._transfuser_model._trajectory_head, state_dict)
             state_dict = self._without_checkpoint_anchor(state_dict)
             
             # Load state dict and get info about missing and unexpected keys
@@ -95,6 +97,7 @@ class TransfuserAgent(AbstractAgent):
                 "state_dict"
             ]
         state_dict = {k.replace("agent.", ""): v for k, v in state_dict.items()}
+        validate_spr_checkpoint(self._transfuser_model._trajectory_head, state_dict, require_spr=True)
         self.load_state_dict(self._without_checkpoint_anchor(state_dict), strict=False)
 
 

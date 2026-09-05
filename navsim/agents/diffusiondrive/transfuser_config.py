@@ -20,6 +20,12 @@ class TransfuserConfig:
     # Optional observation only; does not change losses, anchors, or inference.
     anchor_diagnostics: bool = False
 
+    # 3.1.05: opt in through diffusiondrive_spr_agent.yaml.
+    spr_enabled: bool = False
+    spr_loss_weight: float = 2.0  # Inside trajectory_loss, before trajectory_weight.
+    spr_detach_proposals: bool = True
+    spr_output: str = "reconstruction"  # "selector" gives a same-checkpoint ablation.
+
     latent: bool = False
     latent_rad_thresh: float = 4 * np.pi / 9
 

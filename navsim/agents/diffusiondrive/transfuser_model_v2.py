@@ -12,6 +12,7 @@ from navsim.agents.diffusiondrive.modules.conditional_unet1d import ConditionalU
 import torch.nn.functional as F
 from navsim.agents.diffusiondrive.modules.blocks import linear_relu_ln,bias_init_with_prob, gen_sineembed_for_position, GridSampleCrossBEVAttention
 from navsim.agents.diffusiondrive.modules.multimodal_loss import LossComputer
+from navsim.agents.diffusiondrive.modules.scene_proposal_reconstruction import SceneProposalReconstruction
 from torch.nn import TransformerDecoder,TransformerDecoderLayer
 from typing import Any, List, Dict, Optional, Union
 class V2TransfuserModel(nn.Module):
@@ -434,6 +435,29 @@ class TrajectoryHead(nn.Module):
         self.diff_decoder = CustomTransformerDecoder(diff_decoder_layer, 2)
 
         self.loss_computer = LossComputer(config)
+        self.spr_head = None
+        self.spr_output = getattr(config, "spr_output", "reconstruction")
+        self.spr_loss_weight = float(getattr(config, "spr_loss_weight", 2.0))
+        if self.spr_output not in ("reconstruction", "selector"):
+            raise ValueError("spr_output must be reconstruction or selector")
+        if not np.isfinite(self.spr_loss_weight) or self.spr_loss_weight <= 0:
+            raise ValueError("spr_loss_weight must be finite and positive")
+        if getattr(config, "spr_enabled", False):
+            self.spr_head = SceneProposalReconstruction(config, self.ego_fut_mode, num_poses)
+
+    def _reconstruct_proposals(self, proposals, logits, selected, ego_query, agents_query):
+        if self.spr_head is None:
+            return {"trajectory": selected}
+        reconstructed = self.spr_head(proposals, ego_query, agents_query)
+        return {
+            "trajectory": reconstructed["trajectory"] if self.spr_output == "reconstruction" else selected,
+            "spr_trajectory": reconstructed["trajectory"],
+            "diff_trajectory": reconstructed["diff_trajectory"],
+            "selector_trajectory": selected,
+            "proposal_trajectory": proposals,
+            "proposal_logits": logits,
+        }
+
     def norm_odo(self, odo_info_fut):
         odo_info_fut_x = odo_info_fut[..., 0:1]
         odo_info_fut_y = odo_info_fut[..., 1:2]
@@ -503,7 +527,15 @@ class TrajectoryHead(nn.Module):
         mode_idx = poses_cls_list[-1].argmax(dim=-1)
         mode_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
         best_reg = torch.gather(poses_reg_list[-1], 1, mode_idx).squeeze(1)
-        return {"trajectory": best_reg,"trajectory_loss":ret_traj_loss,"trajectory_loss_dict":trajectory_loss_dict}
+        result = self._reconstruct_proposals(
+            poses_reg_list[-1], poses_cls_list[-1], best_reg, ego_query, agents_query
+        )
+        if self.spr_head is not None:
+            spr_loss = self.spr_loss_weight * self.spr_head.get_reconstruction_loss(result, targets)
+            ret_traj_loss = ret_traj_loss + spr_loss
+            trajectory_loss_dict["spr_loss"] = spr_loss
+        result.update(trajectory_loss=ret_traj_loss, trajectory_loss_dict=trajectory_loss_dict)
+        return result
 
     def forward_test(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding,global_img) -> Dict[str, torch.Tensor]:
         step_num = 2
@@ -559,4 +591,4 @@ class TrajectoryHead(nn.Module):
         mode_idx = poses_cls.argmax(dim=-1)
         mode_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
         best_reg = torch.gather(poses_reg, 1, mode_idx).squeeze(1)
-        return {"trajectory": best_reg}
+        return self._reconstruct_proposals(poses_reg, poses_cls, best_reg, ego_query, agents_query)

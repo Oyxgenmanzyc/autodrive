@@ -1,0 +1,10 @@
+defaults:
+  - diffusiondrive_agent
+  - _self_
+
+config:
+  spr_enabled: true
+  spr_loss_weight: 2.0
+  spr_detach_proposals: true
+  spr_output: reconstruction
+  anchor_diagnostics: true

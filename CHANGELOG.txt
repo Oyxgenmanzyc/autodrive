@@ -1,3 +1,62 @@
+修改主题：3.1.05 Scene-conditioned Proposal Reconstruction（SPR，场景条件候选重构）
+修改日期：2026-09-05
+
+修改目的：
+在 3.1.02 diagnostics 基线上迁移 MeanFuser 候选重构模块，结合全部 refinement
+proposals 与场景 query 生成最终轨迹，检验能否改善硬分类选择导致的误差及 PDM。
+
+基线与来源：
+基线 change/20260905-adaptive-anchor-diagnostics-3.1.02，
+ddaafbc35785b5f4e2d2b03d5b56393b6c3e6096。
+新分支 change/20260905-scene-proposal-reconstruction-3.1.05。
+上游 https://github.com/wjl2244/MeanFuser，
+8de8ba6244834645192e318dcc437d124cfd6872。
+
+涉及文件：
+navsim/agents/diffusiondrive/modules/scene_proposal_reconstruction.py
+navsim/agents/diffusiondrive/modules/proposal_trajectory_utils.py
+navsim/agents/diffusiondrive/transfuser_model_v2.py、transfuser_config.py
+navsim/agents/diffusiondrive/transfuser_agent.py、transfuser_loss.py
+navsim/planning/script/config/common/agent/diffusiondrive_spr_agent.yaml
+scripts/training/run_diffusiondrive_spr_training.sh
+scripts/evaluation/run_diffusiondrive_spr.sh
+tests/test_scene_proposal_reconstruction.py、test_diffusiondrive_variable_anchor.py
+third_party/meanfuser/LICENSE、NOTICE.md
+docs/experiment_3_1_05_spr.md
+
+核心改动：
+1. 复用上游三层 TransformerDecoder、MLP、初始化及 normalized delta/sin/cos L1，
+   保留 embedded_vocab + norm(cross_attn_output) 顺序和原始归一化统计。
+2. K 来自现有 bank；将 [B,K,8,3] 转换为上游表示，memory 为 ego + agent query；
+   坐标转换、累计与损失使用 FP32。
+3. 保留 DDIM、anchor 构建、候选分类及 best-mode 回归；训练复用最后一层候选，
+   推理复用最后一次采样候选，每次只重构一次，不增加 DDIM rollout。
+4. 默认 detach 候选坐标，保留上游无梯度采样边界；仍更新共享场景编码器。
+5. spr_loss_weight=2.0 在 trajectory_loss 内部，外层默认乘 12，
+   因此新增损失实际总权重为 24，只计入一次；该设置未经调参验证。
+6. 基础 agent 默认关闭 SPR；新 diffusiondrive_spr_agent 启用，
+   spr_output=selector 支持同一 checkpoint 输出消融。
+7. 添加 detached 的 spr_ade、selector_ade、proposal_oracle_ade；
+   原 anchor diagnostics callback 不变。
+8. 旧 checkpoint 可训练热启动，但 SPR 评测要求完整新头参数。
+   已含 SPR 的 checkpoint 要求 bank 数值和顺序与训练一致。
+
+预期影响：
+可能改善最终轨迹误差，但 ADE 降低不保证 PDM 上升；训练与推理候选分布差异
+仍存在。当前没有 PDM 增益结论，也不以 MeanFuser 整体分数替代本实验结果。
+
+测试/验证结果：
+完成源码与接线审阅，添加纯 Torch、轻量集成和 CUDA AMP 测试。
+遵循 autodrive-experiment-workflow，本地未运行 pytest、smoke、语法检查或 PDM；
+not run locally; pending server smoke test。
+服务器运行及基线/同权重 selector 消融方法见 docs/experiment_3_1_05_spr.md。
+
+与论文撰写的关系：
+SPR 是本地功能命名，核心迁移自 MeanFuser ARM，许可证及来源随代码保留。
+须引用原工作、说明适配边界，不能把改名当作原创；贡献需由真实 PDM 消融支撑。
+
+----------------------------------------------------------------------
+
 修改主题：新 3.1.02：保留原算法，迁回 3.1.02_2 的只读诊断能力
 修改日期：2026-09-05
 
