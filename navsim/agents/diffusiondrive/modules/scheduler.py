@@ -11,7 +11,9 @@ class WarmupCosLR(_LRScheduler):
         self.lr = lr
         self.epochs = epochs
         self.warmup_epochs = warmup_epochs
-        super(WarmupCosLR, self).__init__(optimizer, last_epoch, verbose)
+        # PyTorch 2.7 removed verbose from LRScheduler.__init__.
+        # The keyword form of last_epoch works on both the old and new APIs.
+        super(WarmupCosLR, self).__init__(optimizer, last_epoch=last_epoch)
 
     def state_dict(self):
         """Returns the state of the scheduler as a :class:`dict`.

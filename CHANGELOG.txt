@@ -1,3 +1,20 @@
+补充修复：navhigh / 新版 PyTorch 训练兼容性
+修复日期：2026-09-05
+
+1. WarmupCosLR 不再向父类传入已从新版 PyTorch 移除的 verbose 参数，
+   last_epoch 改用新旧版本均支持的关键字形式。
+2. 修正 3.1.05 启动脚本的 Hydra 参数：动态添加的 bkb_path 和
+   plan_anchor_path 使用 + 前缀。
+3. checkpoint 通过 OmegaConf 环境变量插值传入，兼容文件名中的等号。
+4. 添加 WarmupCosLR 初始化和首个 warmup step 回归测试。
+5. 不涉及特征、标签或 PDM metric，已有 training cache 和 metric cache 继续复用。
+
+测试/验证结果：
+按实验工作流未在本地运行；待 navhigh 服务器执行
+python -m pytest tests/test_warmup_cos_scheduler.py。
+
+----------------------------------------------------------------------
+
 修改主题：3.1.05 Scene-conditioned Proposal Reconstruction（SPR，场景条件候选重构）
 修改日期：2026-09-05
 
