@@ -1,3 +1,14 @@
+# 新 3.1.05：PDM Candidate Scoring（PCS）
+
+本分支以原 3.1.02 K67 为基础，冻结候选生成器，迁移 DiffusionDriveV2 的单阶段 PDM 子指标评分器。
+原 SPR 分支保留。本版本尚待服务器训练与验证，不代表已有 PDM 提升。
+
+- [实验设计、来源与取舍](docs/experiment_3_1_05_pcs.md)
+- [navhigh / 物理 0–3 卡 / 每卡 BS32 服务器指令](docs/server_3_1_05_pcs.md)
+- 统一入口：`bash scripts/pcs/run_3_1_05.sh help`
+
+---
+
 <div align="center">
 <img src="assets/logo.png" width="80">
 <h1>DiffusionDrive</h1>

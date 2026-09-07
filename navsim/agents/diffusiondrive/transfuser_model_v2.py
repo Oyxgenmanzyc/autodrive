@@ -92,7 +92,7 @@ class V2TransfuserModel(nn.Module):
         )
 
 
-    def forward(self, features: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]=None) -> Dict[str, torch.Tensor]:
+    def forward(self, features: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]=None, return_candidates: bool=False) -> Dict[str, torch.Tensor]:
         """Torch module forward pass."""
 
         camera_feature: torch.Tensor = features["camera_feature"]
@@ -131,6 +131,16 @@ class V2TransfuserModel(nn.Module):
 
         trajectory = self._trajectory_head(trajectory_query,agents_query, cross_bev_feature,bev_spatial_shape,status_encoding[:, None],targets=targets,global_img=None)
         output.update(trajectory)
+        if return_candidates:
+            if self.training:
+                raise ValueError("PCS requires final inference candidates from an eval-mode generator")
+            output["pcs_context"] = {
+                "proposals": trajectory["proposal_trajectory"],
+                "base_logits": trajectory["proposal_logits"],
+                "bev": cross_bev_feature,
+                "agents": agents_query,
+                "ego": trajectory_query,
+            }
 
         agents = self._agent_head(agents_query)
         output.update(agents)
@@ -559,4 +569,8 @@ class TrajectoryHead(nn.Module):
         mode_idx = poses_cls.argmax(dim=-1)
         mode_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
         best_reg = torch.gather(poses_reg, 1, mode_idx).squeeze(1)
-        return {"trajectory": best_reg}
+        return {
+            "trajectory": best_reg,
+            "proposal_trajectory": poses_reg,
+            "proposal_logits": poses_cls,
+        }
