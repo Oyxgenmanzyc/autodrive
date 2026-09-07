@@ -1,3 +1,47 @@
+修改主题：新 3.1.05：冻结 K67 生成器的 PDM Candidate Scoring（PCS）
+修改日期：2026-09-07
+
+修改目的：
+结束 SPR 重构路线；以原 3.1.02 的 K67 checkpoint 为固定生成器，单独检验 PDM 监督能否改善候选选择。
+新分支 change/20260907-pdm-candidate-scoring-3.1.05，不覆盖旧 SPR 分支。
+
+涉及文件：
+navsim/agents/diffusiondrive/pcs/（V2 评分组件、MIT 许可、标签评分、缓存与训练）
+navsim/agents/diffusiondrive/transfuser_model_v2.py
+navsim/agents/diffusiondrive/modules/scheduler.py
+navsim/planning/script/run_pcs.py
+scripts/pcs/run_3_1_05.sh
+tests/test_pcs.py
+docs/experiment_3_1_05_pcs.md
+docs/server_3_1_05_pcs.md
+README.md
+
+核心改动：
+- 从 DiffusionDriveV2 1cd12a1 迁移单层轨迹条件 BEV/车辆/自车交互与五项 PDM 评分头，保留许可及来源。
+- 采用缓存的最终推理候选训练；冻结生成器参数与运行模式，保留原 67 条轨迹、原分类头及两步去噪。
+- 保留 NC=0.5 的原始标签；不引入 EP-only 排序、RL、词表、候选扩增、重构、精筛或旧多重门控。
+- 借鉴 3.20.10 的梯度隔离和同次推理对照设计，未迁入风险代理标签和 shield。
+- 采用 V2 的逐参考 progress 归一化；每个 cache shard 首个场景自动与官方逐条评分核对。
+- 新增候选上限诊断、四卡分片缓存、仅评分器训练、同候选 PCS/原 selector 配对验证。
+- 缓存/权重严格检查基础 checkpoint、anchor、seed 与实现哈希；训练拒绝 navtest 标签及未完成 cache。
+- 每 token 固定扩散噪声；训练验证按场景索引去除 DDP padding 后汇总。
+- 同时修复旧 WarmupCosLR 的 verbose 位置参数兼容问题。
+
+预期影响：
+直接监督选择器判断候选的 PDM 子指标；是否达到 88.6 必须经过候选诊断、独立验证和正式实测。
+新增 navtrain metric cache（若已有则复用）与候选特征/标签 cache；原训练特征及 navtest metric cache 可复用。
+
+测试/验证结果：
+新增 K67、梯度隔离、候选重排、权重往返、PDM 归一化边界、数据划分与缓存冲突测试。
+not run locally; pending server smoke test。依项目工作流，本地不运行单元测试、语法检查、smoke 或完整训练。
+未获得本版本新的 PDM 指标；服务器须依文档完成 test/pilot/smoke/eval-smoke。
+
+与论文撰写的关系：
+评分网络源自 DiffusionDriveV2，需引用上游。PCS 是实验命名，不把改名或常规移植描述为原创模块。
+通过固定生成器和同次配对验证，隔离候选选择收益与生成质量变化。
+
+------------------------------------------------------------
+
 修改主题：新 3.1.02：保留原算法，迁回 3.1.02_2 的只读诊断能力
 修改日期：2026-09-05
 
