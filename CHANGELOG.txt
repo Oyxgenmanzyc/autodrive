@@ -1,3 +1,39 @@
+修改主题：3.1.05_2：GTRS 增强的保守优势门控选择器（CAGS）
+修改日期：2026-09-08
+
+修改目的：
+保留当前 3.1.05 PCS 最佳实现和 checkpoint，在独立分支解决 PCS 近乎全量换选、
+负收益选择大多被 base 全项支配以及 DAC/NC 新增零分的问题。
+
+核心改动：
+- 新增 base-relative `predicted_delta`、`predicted_win_probability` 和
+  `predicted_catastrophic_risk` 联合训练头；证据不足时直接保留 base。
+- 增加优势回归、胜负分类、灾难风险分类和保守离线策略 KL 目标；不使用 navtest 奖励或在线 RL。
+- 使用 DiffusionDriveV2 GTRS 的 16384 轨迹及 navtrain PDM 标签，只在训练中按场景
+  确定性抽取 32 条危险/边界/正优势样本；推理候选仍为原 K67。
+- GTRS 预处理为小型 mmap 索引/标签 cache，训练每轮不读取 29GB pkl，也不重跑 PDM。
+- 从原 3.1.05 epoch5 PCS 严格继承 encoder、decoder 和五项 metric heads，新增决策头独立初始化。
+- 旧 K67 cache 哈希涉及的实现文件保持不变，直接复用 205GB 候选 cache、已有 metric cache 和生成器。
+- 验证输出逐场景优势、胜率、风险、提议换选和实际换选；支持不重训覆盖门控阈值。
+
+涉及文件：
+navsim/agents/diffusiondrive/pcs/conservative.py
+navsim/agents/diffusiondrive/pcs/conservative_training.py
+navsim/agents/diffusiondrive/pcs/gtrs.py
+navsim/planning/script/run_pcs_conservative.py
+scripts/pcs/run_3_1_05_2.sh
+tests/test_pcs_conservative.py
+docs/experiment_3_1_05_2_conservative_advantage.md
+docs/server_3_1_05_2.md
+README.md
+
+验证状态：
+新增门控、联合损失、GTRS 确定性抽样/降采样/数据拼接和旧 PCS 权重继承测试。
+依项目工作流未在本地运行；等待 navhigh 执行 test、pilot 和 smoke。
+本分支尚无新 PDM 实测，不承诺达到 88.6。
+
+------------------------------------------------------------
+
 修改主题：新 3.1.05：冻结 K67 生成器的 PDM Candidate Scoring（PCS）
 修改日期：2026-09-07
 

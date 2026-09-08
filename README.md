@@ -1,4 +1,13 @@
-# 新 3.1.05：PDM Candidate Scoring（PCS）
+# 新 3.1.05_2：保守优势门控选择器（CAGS）
+
+本分支保留原 3.1.05 PCS 和完整 K67 候选缓存，以 GTRS 危险/边界样本训练
+base-relative 优势、胜率和灾难风险，并在证据不足时回退原 selector 的 base。
+
+- [3.1.05_2 实验设计、来源与边界](docs/experiment_3_1_05_2_conservative_advantage.md)
+- [navhigh / 物理 0–3 卡 / 每卡 BS32 服务器指令](docs/server_3_1_05_2.md)
+- 统一入口：`bash scripts/pcs/run_3_1_05_2.sh help`
+
+## 原 3.1.05：PDM Candidate Scoring（PCS）
 
 本分支以原 3.1.02 K67 为基础，冻结候选生成器，迁移 DiffusionDriveV2 的单阶段 PDM 子指标评分器。
 原 SPR 分支保留。本版本尚待服务器训练与验证，不代表已有 PDM 提升。
