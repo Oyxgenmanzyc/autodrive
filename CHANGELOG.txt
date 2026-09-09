@@ -1,3 +1,36 @@
+修改主题：3.1.05_2：原 PCS hard negatives 的三因子风险否决器（TRV）
+修改日期：2026-09-09
+
+修改目的：
+保留原 PCS 89.0756 的候选排序收益，仅对原 PCS 实际选择的 candidate 与 base
+训练 NC、DAC、TTC 相对风险，减少高置信新增零分；无正收益则作废本实验。
+
+核心改动：
+- 冻结原 PCS epoch5 作为 proposer，不重新学习候选排序。
+- 从现有 K67 cache 生成可续存的小型 PCS/base 决策对 cache，不重跑生成器或 PDM。
+- 相对标签定义为 clamp(base 指标 - candidate 指标, 0, 1)，保留 NC 软退化。
+- 三个独立风险头使用 candidate/base/residual 特征及 PCS/原 selector 预测信息。
+- focal BCE 对相对退化、新增零分和 PCS 输给 base 的 hard negatives 提高权重。
+- 每个 epoch 在独立 val 上搜索三项 OR 否决阈值；搜索包含完全不否决的原 PCS。
+- 完整验证同次输出 TRV、原 PCS 和 base，直接统计否决收益及新增零分。
+
+涉及文件：
+navsim/agents/diffusiondrive/pcs/veto.py
+navsim/agents/diffusiondrive/pcs/veto_data.py
+navsim/agents/diffusiondrive/pcs/veto_training.py
+navsim/planning/script/run_pcs_veto.py
+scripts/pcs/run_3_1_05_2_veto.sh
+tests/test_pcs_veto.py
+docs/experiment_3_1_05_2_triple_risk_veto.md
+docs/server_3_1_05_2_triple_risk_veto.md
+README.md
+
+验证状态：
+新增相对风险标签、OR 否决、阈值校准、梯度隔离和损失反传测试。
+依项目工作流未在本地运行，等待 navhigh 执行 test、pair pilot 和 smoke。
+
+------------------------------------------------------------
+
 修改主题：新 3.1.05：冻结 K67 生成器的 PDM Candidate Scoring（PCS）
 修改日期：2026-09-07
 

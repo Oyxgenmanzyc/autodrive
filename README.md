@@ -1,4 +1,13 @@
-# 新 3.1.05：PDM Candidate Scoring（PCS）
+# 新 3.1.05_2：三因子风险否决器（TRV）
+
+本分支冻结原 3.1.05 PCS 作为候选 proposer，使用其真实 hard-negative 决策训练
+独立 NC、DAC、TTC 相对风险头；任一风险超过 val 校准阈值时回退 base。
+
+- [实验机制、边界与止损](docs/experiment_3_1_05_2_triple_risk_veto.md)
+- [navhigh / 物理 0–3 卡 / 每卡 BS32 指令](docs/server_3_1_05_2_triple_risk_veto.md)
+- 统一入口：`bash scripts/pcs/run_3_1_05_2_veto.sh help`
+
+## 原 3.1.05：PDM Candidate Scoring（PCS）
 
 本分支以原 3.1.02 K67 为基础，冻结候选生成器，迁移 DiffusionDriveV2 的单阶段 PDM 子指标评分器。
 原 SPR 分支保留。本版本尚待服务器训练与验证，不代表已有 PDM 提升。
