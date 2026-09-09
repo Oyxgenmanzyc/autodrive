@@ -76,6 +76,23 @@ class TripleRiskVetoNetworkTests(unittest.TestCase):
         for key in ("proposals", "bev", "agents", "ego"):
             self.assertIsNone(context[key].grad)
 
+    def test_cached_pcs_mode_is_authoritative_for_near_tie_reproducibility(self):
+        model = TripleRiskVeto(PDMCSHead())
+        context = {
+            "proposals": torch.randn(1, 3, 8, 3),
+            "base_logits": torch.tensor([[2.0, 0.0, 0.0]]),
+            "bev": torch.randn(1, 256, 8, 8),
+            "agents": torch.randn(1, 30, 256),
+            "ego": torch.randn(1, 1, 256),
+        }
+        online = model(context)
+        cached_mode = (online["pcs_mode"] + 1) % 3
+        output = model(
+            context, cached_mode, online["base_mode"], verify_modes=True,
+        )
+        self.assertTrue(bool(output["pcs_mode_mismatch"][0]))
+        self.assertEqual(int(output["pcs_mode"][0]), int(cached_mode[0]))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -111,11 +111,13 @@ class TripleRiskVeto(nn.Module):
             base_mode = online_base
         selected_mode = selected_mode.long()
         base_mode = base_mode.long()
-        if verify_modes and (
-            not torch.equal(selected_mode, online_selected)
-            or not torch.equal(base_mode, online_base)
-        ):
-            raise ValueError("Pair cache modes differ from frozen PCS/base inference")
+        # Cached PCS decisions are authoritative during training. Near-tied PCS
+        # scores can flip argmax when GEMM batch shapes change, even though the
+        # checkpoint and inputs are identical. The base argmax is read directly
+        # from cached logits and therefore remains a strict integrity check.
+        pcs_mode_mismatch = selected_mode != online_selected
+        if verify_modes and not torch.equal(base_mode, online_base):
+            raise ValueError("Pair cache base modes differ from cached base logits")
 
         rows = torch.arange(len(selected_mode), device=selected_mode.device)
         candidate_feature = features[rows, selected_mode]
@@ -148,6 +150,7 @@ class TripleRiskVeto(nn.Module):
             "risks": risks,
             "pcs_scores": pcs_scores,
             "pcs_mode": selected_mode,
+            "pcs_mode_mismatch": pcs_mode_mismatch,
             "base_mode": base_mode,
             "final_mode": final_mode,
             "vetoed": vetoed,

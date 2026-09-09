@@ -44,6 +44,10 @@ base 及两者残差的 512 维特征，同时读取两条轨迹的预测子指�
 分别增加权重，使低风险误报的代价高于不必要回退。optimizer 只包含三个风险头，
 原 PCS 权重不更新。
 
+训练使用 pair cache 中预先生成的 PCS mode。PCS 分数极接近时，不同 batch 形状的浮点
+矩阵运算可能使 `argmax` 翻转，因此在线重算 mode 仅记录为 mismatch rate，不覆盖训练决策；
+base mode 直接来自缓存的 `base_logits`，仍执行严格一致性校验。
+
 每个 epoch 在独立 val cache 上搜索三个风险阈值，以最终“接受 PCS 或回退 base”
 后的真实 val PDM 选择组合。搜索集合包含 `[1,1,1]` 的完全不否决配置，因此风险头
 无效时，val 策略可以退回原 PCS。checkpoint 按否决后的 `val/pdm` 选择，并保存

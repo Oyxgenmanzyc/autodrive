@@ -29,6 +29,11 @@ README.md
 新增相对风险标签、OR 否决、阈值校准、梯度隔离和损失反传测试。
 依项目工作流未在本地运行，等待 navhigh 执行 test、pair pilot 和 smoke。
 
+服务器修正（2026-09-09）：
+- 完整训练在 epoch 0 的 540/665 处发现极少量 PCS argmax 随 batch 形状翻转。
+- 训练改为以预生成决策对的 PCS mode 为准，只对 base mode 保留严格一致性校验。
+- 新增 train/val PCS mode mismatch rate，区分数值近似翻转与缓存身份错误。
+
 ------------------------------------------------------------
 
 修改主题：新 3.1.05：冻结 K67 生成器的 PDM Candidate Scoring（PCS）

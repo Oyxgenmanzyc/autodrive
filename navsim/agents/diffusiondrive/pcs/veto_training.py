@@ -25,6 +25,12 @@ class TripleRiskVetoModule(pl.LightningModule):
             batch["context"], batch["pcs_mode"], batch["base_mode"], verify_modes=True,
         )
         losses = self.model.loss(output, batch["labels"], batch["scores"])
+        self.log(
+            "train/pcs_mode_mismatch_rate",
+            output["pcs_mode_mismatch"].float().mean(),
+            on_step=False, on_epoch=True, batch_size=len(batch["scores"]),
+            sync_dist=True,
+        )
         for name, value in losses.items():
             self.log(
                 f"train/{name}", value, on_step=name == "loss", on_epoch=True,
@@ -54,6 +60,12 @@ class TripleRiskVetoModule(pl.LightningModule):
             targets.double(),
         ], dim=-1)
         self.validation_rows.extend(packed.cpu().tolist())
+        self.log(
+            "val/pcs_mode_mismatch_rate",
+            output["pcs_mode_mismatch"].float().mean(),
+            on_step=False, on_epoch=True, batch_size=len(batch["scores"]),
+            sync_dist=True,
+        )
 
     def on_validation_epoch_end(self):
         rows = self.validation_rows
