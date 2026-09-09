@@ -27,7 +27,16 @@ README.md
 
 验证状态：
 新增相对风险标签、OR 否决、阈值校准、梯度隔离和损失反传测试。
-依项目工作流未在本地运行，等待 navhigh 执行 test、pair pilot 和 smoke。
+navhigh 初始 13 项测试、pair pilot、完整 pair cache、四卡训练、eval smoke 与
+12,146 场景完整 navtest 均已完成。
+
+正式结果：
+- checkpoint：epoch=02.ckpt；val 校准阈值为 NC/DAC/TTC 均 0.5。
+- TRV 89.181861，原 PCS 89.075571，同次 base 88.488936。
+- 相对 PCS +0.106290 点，相对 base +0.692925 点。
+- 11,857 次 PCS 换选中只否决 448 次，保留 11,409 次。
+- 新增零分由 231 降到 199，同时救回零分由 193 降到 177。
+- 结果满足预先规定的 PDM 正增益和新增零分下降条件，保留本实验。
 
 服务器修正（2026-09-09）：
 - 完整训练在 epoch 0 的 540/665 处发现极少量 PCS argmax 随 batch 形状翻转。

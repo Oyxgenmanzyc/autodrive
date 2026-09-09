@@ -3,6 +3,10 @@
 本分支冻结原 3.1.05 PCS 作为候选 proposer，使用其真实 hard-negative 决策训练
 独立 NC、DAC、TTC 相对风险头；任一风险超过 val 校准阈值时回退 base。
 
+完整 navtest（12,146 场景）达到 **89.181861 PDM**：相对同次原 PCS 的
+89.075571 提升 0.106290 点，相对 base 的 88.488936 提升 0.692925 点；
+仅否决 448 次 PCS 换选，新增零分由 231 降至 199。
+
 - [实验机制、边界与止损](docs/experiment_3_1_05_2_triple_risk_veto.md)
 - [navhigh / 物理 0–3 卡 / 每卡 BS32 指令](docs/server_3_1_05_2_triple_risk_veto.md)
 - 统一入口：`bash scripts/pcs/run_3_1_05_2_veto.sh help`
@@ -10,7 +14,7 @@
 ## 原 3.1.05：PDM Candidate Scoring（PCS）
 
 本分支以原 3.1.02 K67 为基础，冻结候选生成器，迁移 DiffusionDriveV2 的单阶段 PDM 子指标评分器。
-原 SPR 分支保留。本版本尚待服务器训练与验证，不代表已有 PDM 提升。
+原 SPR 分支保留；原 PCS 已完成服务器验证并达到 89.075571 PDM。
 
 - [实验设计、来源与取舍](docs/experiment_3_1_05_pcs.md)
 - [navhigh / 物理 0–3 卡 / 每卡 BS32 服务器指令](docs/server_3_1_05_pcs.md)
