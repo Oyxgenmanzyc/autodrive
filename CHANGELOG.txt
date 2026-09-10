@@ -1,3 +1,44 @@
+修改主题：3.1.05_3：生成器刹车时机监督，固定已验证的 PCS＋TRV
+修改日期：2026-09-10
+
+修改目的：
+纠正 timing-weighted-gain-selector 分支把 3.22 用在筛选端的方向偏差。
+本版以原 TRV 611e87b 为基础，将 3.22 的时机监督用于轨迹生成，
+检验候选质量改善是否能在固定筛选器下改善 TTC 和总 PDM。
+
+核心改动：
+- 迁移原 change/20260713-brake-timing-supervision-3.22 的 GT 软刹车时机损失。
+- 仅微调轨迹头，冻结感知/上下文、anchor、原分类头参数；PCS/TRV 不参加训练。
+- 监督 GT anchor 匹配模式的刹车软轮廓和累计启动轮廓，保留原来的风险场景激活条件。
+- control/timing 两组使用同一初始生成器、数据、种子、优化器、训练步数，权重分别为 0/0.1。
+- 独立小型 GT targets sidecar；复用原 image/LiDAR 特征，缺失时支持只补缺失特征文件。
+- 保留原模型和全部 PCS/TRV 实现文件，新增训练封装通过 decoder 输出 hook 连接梯度。
+- 对新旧生成器同场景同种子生成全部 K67 候选，固定同一 PCS/TRV 评估并保存全部候选标签。
+- 严格检查原生成器、anchor、PCS、TRV 的 checkpoint 来源，明确记录新生成器应用到旧筛选器的实验。
+- 对 DDP 中稀有激活场景按全局 active count 归一化；不按每张卡各自均值等权放大。
+
+涉及文件：
+navsim/agents/diffusiondrive/generator_timing/
+navsim/planning/script/run_generator_timing.py
+navsim/planning/script/prepare_generator_features.py
+navsim/planning/script/compare_generator_timing.py
+scripts/pcs/run_3_1_05_3_generator.sh
+tests/test_generator_timing.py
+docs/experiment_3_1_05_3_generator_timing.md
+docs/server_3_1_05_3_generator_timing.md
+README.md, .gitattributes
+
+预期影响与论文边界：
+把“生成时机监督是否有效”和“筛选器是否善于利用改善后的候选”分开检验。
+原 3.22 不保证所有模式都变好；通过全部候选 TTC 合格率、PDM 均值、oracle 和最终 PDM 验证。
+需与等时长 control 比较，不能只与未经额外训练的旧 checkpoint 比较后宣称 3.22 有效。
+
+测试/验证结果：
+未在本地运行测试、语法检查或 smoke；按项目工作流等待服务器 navhigh 测试。
+已补充梯度、GT 匹配、无激活、对照关闭、静止数值稳定、冻结范围等服务器测试。
+89.181861 为上一版 TRV 已有结果，本版尚无训练及 PDM 结果。
+
+------------------------------------------------------------
 修改主题：3.1.05_2：原 PCS hard negatives 的三因子风险否决器（TRV）
 修改日期：2026-09-09
 
