@@ -1,3 +1,22 @@
+修改主题：3.1.05_3 时序特征增强的加权相对增益选择器
+修改日期：2026-09-10
+修改目的：减少误否决的正常收益，保留对高代价NC/DAC/TTC退化的拦截。
+实验依据：12146场景，107次正确否决平均挽回0.36947，271次误否决平均放弃0.09824。
+更正：标准CSV多的一行是average汇总；此前逐场景改善数包含该行，并非场景数量异常。
+核心改动：gain/loss期望回归 + 相对风险加权；用navtrain校准log的正确救援/误拦
+预测效用分位数选择阈值，本轮另一组val log用于checkpoint选择，不用navtest调阈值。
+迁移3.22：0.5秒速度/加速度、软刹车、连续刹车、累计起点，组合candidate/base及差值。
+旧cache缺少原始车速，首段加速度屏蔽；不搬GT前车激活、生成器损失或历史LiDAR输入。
+旧TRV风险头/PCS冻结为对照；只训练新风险头及gain/loss头，时序输入权重零初始化。
+风险正例权重由train每类频率估计；输出为风险分数，不假定已经概率校准。
+增加无时序特征消融、逐epoch诊断、四路navtest对照、断点恢复与同次子指标统计。
+涉及文件：pcs/timing_gain.py、pcs/timing_gain_training.py、run_pcs_timing_gain.py、
+scripts/pcs/run_3_1_05_3.sh、analyze_veto_rescues.py、tests/test_pcs_timing_gain.py及文档。
+兼容：旧候选/决策对/metric缓存复用；旧provenance文件未改；py/yaml与脚本固定LF。
+测试/验证：未运行本地测试、语法检查或训练；已补服务端单元测试，待服务器test与smoke。
+尚无新PDM结果；校准无收益则显式回退旧TRV，不能将复现旧分数算作改进。
+论文关系：检验决策收益与灾难代价统一建模、候选刹车时序表示对风险判断的作用。
+
 修改主题：3.1.05_2：原 PCS hard negatives 的三因子风险否决器（TRV）
 修改日期：2026-09-09
 

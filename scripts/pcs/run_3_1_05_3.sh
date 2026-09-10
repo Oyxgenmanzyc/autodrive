@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# 3.1.05_3 timing-weighted gain: reuse K67 pairs, calibrate on navtrain val logs.
+set -euo pipefail
+source "${CONDA_SH:-/home/hndx/miniconda3/etc/profile.d/conda.sh}"
+conda activate navhigh
+
+CODE_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+DATA_ROOT=${DATA_ROOT:-/home/hndx/navsim_workspace/dataset}
+EXP_ROOT=${EXP_ROOT:-/home/hndx/navsim_workspace/exp}
+BASELINE_CKPT=${BASELINE_CKPT:-$EXP_ROOT/adaptive_multimodal_anchor_k67_3_1_02_4gpu_resume/2026.08.24.11.26.23/lightning_logs/version_0/checkpoints/epoch=99-step=266000.ckpt}
+BKB_PATH=${BKB_PATH:-$DATA_ROOT/pytorch_model.bin}
+ANCHOR_PATH=${ANCHOR_PATH:-$EXP_ROOT/anchors/adaptive_v1/adaptive_anchor_bank.npy}
+TEST_METRIC_CACHE=${TEST_METRIC_CACHE:-$EXP_ROOT/metric_cache}
+PCS_CACHE=${PCS_CACHE:-$EXP_ROOT/pcs_candidates_k67_3_1_05}
+PILOT_CACHE=${PILOT_CACHE:-$EXP_ROOT/pcs_candidates_pilot_k67_3_1_05}
+PCS_SCORER=${PCS_SCORER:-$EXP_ROOT/pdm_candidate_scoring_k67_3_1_05/train/2026.09.07.19.15.17.705777/checkpoints/epoch=05.ckpt}
+PAIR_CACHE=${PAIR_CACHE:-$EXP_ROOT/pcs_hard_negative_pairs_k67_3_1_05_2}
+PILOT_PAIR_CACHE=${PILOT_PAIR_CACHE:-$EXP_ROOT/pcs_hard_negative_pairs_pilot_k67_3_1_05_2}
+TWG_EXP=${TWG_EXP:-$EXP_ROOT/timing_weighted_gain_k67_3_1_05_3}
+REFERENCE_TRV=${REFERENCE_TRV:-$EXP_ROOT/triple_risk_veto_k67_3_1_05_2/train/2026.09.09.14.53.12.850967/checkpoints/epoch=02.ckpt}
+WORKERS=${WORKERS:-0}
+PRECISION=${PRECISION:-bf16-mixed}
+LOG_ROOT=${LOG_ROOT:-$EXP_ROOT/logs/3.1.05_3}
+TRAIN_GPUS=${TRAIN_GPUS:-GPU-cb61e34b-1bbd-919c-9df2-71ed67e97e04,GPU-2b61b5dd-693d-f98c-3f20-93e71630d30f,GPU-e9db5634-a044-a8fb-c294-6f372876e0e3,GPU-0ac26b0b-cec4-cb77-0cae-49c60e08a8cd}
+EVAL_GPU=${EVAL_GPU:-GPU-cb61e34b-1bbd-919c-9df2-71ed67e97e04}
+
+export NAVSIM_DEVKIT_ROOT="$CODE_ROOT"
+export OPENSCENE_DATA_ROOT="$DATA_ROOT"
+export NAVSIM_EXP_ROOT="$EXP_ROOT"
+export NUPLAN_MAPS_ROOT="$DATA_ROOT/maps"
+export NUPLAN_MAP_VERSION=nuplan-maps-v1.0
+export PYTHONPATH="$CODE_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONUNBUFFERED=1
+export CUDA_DEVICE_ORDER=PCI_BUS_ID HYDRA_FULL_ERROR=1
+export OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 NCCL_DEBUG=WARN
+cd "$CODE_ROOT"
+mkdir -p "$LOG_ROOT"
+MODE=${1:-help}
+
+run_logged() {
+    local name=$1
+    shift
+    "$@" 2>&1 | tee "$LOG_ROOT/${name}_$(date +%Y%m%d_%H%M%S)_$$.log"
+}
+
+require_file() {
+    test -f "$1" || { echo "Missing file: $1" >&2; exit 1; }
+}
+
+generator_args=(
+    --baseline "$BASELINE_CKPT" --backbone "$BKB_PATH" --anchor "$ANCHOR_PATH"
+    --data-root "$DATA_ROOT" --seed 0
+)
+
+case "$MODE" in
+    test)
+        run_logged twg_tests python -m unittest discover -s tests -p 'test_pcs*.py'
+        ;;
+    prepare-pairs-pilot)
+        require_file "$PCS_SCORER"
+        run_logged twg_prepare_pairs_pilot env CUDA_VISIBLE_DEVICES="$EVAL_GPU" \
+            python -m navsim.planning.script.run_pcs_timing_gain prepare-pairs \
+            --cache "$PILOT_CACHE" --pcs-scorer "$PCS_SCORER" \
+            --output "$PILOT_PAIR_CACHE" --workers "$WORKERS" --batch-size 32 --smoke
+        ;;
+    smoke)
+        require_file "$PCS_SCORER"
+        require_file "$REFERENCE_TRV"
+        run_logged twg_smoke env CUDA_VISIBLE_DEVICES="$EVAL_GPU" \
+            python -m navsim.planning.script.run_pcs_timing_gain train \
+            --cache "$PILOT_CACHE" --pair-cache "$PILOT_PAIR_CACHE" \
+            --pcs-scorer "$PCS_SCORER" --output "$TWG_EXP/smoke" \
+            --reference "$REFERENCE_TRV" --devices 1 --batch-size 2 --epochs 1 --workers "$WORKERS" \
+            --precision "$PRECISION" --lr 3e-4 --smoke
+        ;;
+    prepare-pairs)
+        require_file "$PCS_SCORER"
+        run_logged twg_prepare_pairs env CUDA_VISIBLE_DEVICES="$EVAL_GPU" \
+            python -m navsim.planning.script.run_pcs_timing_gain prepare-pairs \
+            --cache "$PCS_CACHE" --pcs-scorer "$PCS_SCORER" \
+            --output "$PAIR_CACHE" --workers "$WORKERS" --batch-size 32
+        ;;
+    train|train-no-timing)
+        require_file "$PCS_SCORER"
+        require_file "$REFERENCE_TRV"
+        extra=()
+        if [ "$MODE" = train-no-timing ]; then extra+=(--no-timing); fi
+        if [ -n "${RESUME_CKPT:-}" ]; then
+            require_file "$RESUME_CKPT"
+            extra+=(--resume "$RESUME_CKPT")
+        fi
+        run_logged twg_train env CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" \
+            python -m navsim.planning.script.run_pcs_timing_gain train \
+            --cache "$PCS_CACHE" --pair-cache "$PAIR_CACHE" \
+            --pcs-scorer "$PCS_SCORER" --output "$TWG_EXP/$MODE" \
+            --reference "$REFERENCE_TRV" --devices 4 --batch-size 32 --epochs "${EPOCHS:-10}" --workers "$WORKERS" \
+            --precision "$PRECISION" --lr 3e-4 "${extra[@]}"
+        ;;
+    eval|eval-smoke)
+        : "${TWG_CKPT:?Set TWG_CKPT to the best 3.1.05_3 checkpoint}"
+        extra=()
+        if [ "$MODE" = eval-smoke ]; then extra+=(--max-scenes 8); fi
+        run_logged "twg_$MODE" env CUDA_VISIBLE_DEVICES="$EVAL_GPU" \
+            python -m navsim.planning.script.run_pcs_timing_gain evaluate \
+            "${generator_args[@]}" --pcs-scorer "$PCS_SCORER" --veto "$TWG_CKPT" \
+            --metric-cache "$TEST_METRIC_CACHE" --output "$TWG_EXP/$MODE" \
+            --workers "$WORKERS" --score-workers 4 "${extra[@]}"
+        ;;
+    *)
+        echo "Usage: bash scripts/pcs/run_3_1_05_3.sh {test|prepare-pairs-pilot|smoke|prepare-pairs|train|train-no-timing|eval-smoke|eval}"
+        echo "Existing pair cache: test -> smoke -> train -> eval-smoke -> eval; no new cache needed"
+        echo "No feature, metric, K67 candidate, or GTRS cache is rebuilt."
+        ;;
+esac

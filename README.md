@@ -1,3 +1,16 @@
+# 3.1.05_3：时序特征增强的加权相对增益选择器
+
+在原PCS + TRV上比较预计收益、预计损失与加权NC/DAC/TTC风险，加入用户3.22的持续刹车与起点时序表示。
+旧89.18分是3.1.05_2的验证结果；本分支尚未完成服务器训练，不能沿用为新结果。
+
+- [实验设计、真实救援收益与迁移边界](docs/experiment_3_1_05_3_timing_gain.md)
+- [服务器test、smoke、四卡训练与验证](docs/server_3_1_05_3.md)
+- 入口：`bash scripts/pcs/run_3_1_05_3.sh test`
+- 复用K67候选、决策对及metric cache；物理0–3卡UUID，每卡BS32，navhigh。
+- `train-no-timing`用于时序特征消融；阈值仅在navtrain val指定log子集上选择。
+
+以下保留前一版本说明。
+
 # 新 3.1.05_2：三因子风险否决器（TRV）
 
 本分支冻结原 3.1.05 PCS 作为候选 proposer，使用其真实 hard-negative 决策训练
