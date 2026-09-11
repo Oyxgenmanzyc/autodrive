@@ -1,10 +1,17 @@
 """Server tests: timing gradients reach generation; frozen selectors stay fixed."""
 import unittest
 from types import SimpleNamespace
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import json
 import torch
 from torch import nn
 
-from navsim.agents.diffusiondrive.generator_timing.data import timing_config
+from navsim.agents.diffusiondrive.generator_timing.data import (
+    SCHEMA, TimingDataset, target_identity, timing_config,
+)
+from navsim.agents.diffusiondrive.pcs.common import CONTEXT_KEYS, implementation_hashes
+from navsim.agents.diffusiondrive.pcs.data import entry_path
 from navsim.agents.diffusiondrive.generator_timing.risk_brake_timing import (
     compute_brake_timing_loss, _trajectory_dynamics,
 )
@@ -104,6 +111,45 @@ class FrozenScopeTests(unittest.TestCase):
         self.assertTrue(module.generator._trajectory_head.training)
         module.eval()
         self.assertFalse(module.generator._trajectory_head.training)
+
+
+class FrozenContextDatasetTests(unittest.TestCase):
+    def test_training_reads_context_but_not_pdm_labels(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidate_root = root / "pcs"
+            candidate_root.mkdir()
+            records = [
+                {"token": "train-token", "log_name": "train-log", "split": "train"},
+                {"token": "val-token", "log_name": "val-log", "split": "val"},
+            ]
+            provenance = {"implementation_sha256": implementation_hashes()}
+            manifest = {"dataset": "navtrain", "provenance": provenance}
+            (candidate_root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (candidate_root / "records.json").write_text(json.dumps(records), encoding="utf-8")
+            for record in records:
+                path = entry_path(candidate_root, record)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                context = {
+                    "proposals": torch.zeros(2, 8, 3), "base_logits": torch.zeros(2),
+                    "bev": torch.zeros(256, 8, 8), "agents": torch.zeros(30, 256),
+                    "ego": torch.zeros(1, 256),
+                }
+                self.assertEqual(set(context), set(CONTEXT_KEYS))
+                torch.save({"token": record["token"], "provenance": provenance,
+                            "context": context, "labels": torch.full((2, 5), 7.)}, path)
+            targets = root / "targets.pt"
+            torch.save({
+                "identity": {"schema": SCHEMA, "implementation": target_identity(),
+                             "records": records, "data_root": "unused", "seed": 0},
+                "contexts": torch.zeros(2, 5), "trajectories": torch.zeros(2, 8, 3),
+                "summary": {"train": {"active_scenes": 0}, "val": {"active_scenes": 0}},
+            }, targets)
+            dataset = TimingDataset(targets, candidate_root, "train", smoke=True)
+            context, target = dataset[0]
+            self.assertEqual(set(context), set(CONTEXT_KEYS))
+            self.assertEqual(set(target), {"trajectory", "brake_timing_context"})
+            self.assertNotIn("labels", target)
 
 
 if __name__ == "__main__":

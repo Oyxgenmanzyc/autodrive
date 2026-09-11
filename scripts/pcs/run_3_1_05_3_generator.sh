@@ -6,7 +6,7 @@ conda activate navhigh
 CODE_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 DATA_ROOT=${DATA_ROOT:-/home/hndx/navsim_workspace/dataset}
 EXP_ROOT=${EXP_ROOT:-/home/hndx/navsim_workspace/exp}
-FEATURE_CACHE=${FEATURE_CACHE:-$EXP_ROOT/training_cache_3_1_02_k67}
+PCS_CACHE=${PCS_CACHE:-$EXP_ROOT/pcs_candidates_k67_3_1_05}
 RECORDS=${RECORDS:-$EXP_ROOT/pcs_candidates_k67_3_1_05/records.json}
 TIMING_TARGETS=${TIMING_TARGETS:-$EXP_ROOT/generator_brake_timing_3_1_05_3/targets/navtrain.pt}
 PILOT_TARGETS=${PILOT_TARGETS:-$EXP_ROOT/generator_brake_timing_3_1_05_3/targets/pilot.pt}
@@ -40,7 +40,8 @@ case "$MODE" in
             test -f "$file" || { echo "Missing: $file"; exit 1; }
             ls -lh "$file"
         done
-        test -d "$FEATURE_CACHE" || { echo "Missing raw feature cache: $FEATURE_CACHE. Restore it or run prepare-features; detached PCS caches cannot train the generator."; exit 1; }
+        test -d "$PCS_CACHE" || { echo "Missing frozen PCS context cache: $PCS_CACHE"; exit 1; }
+        test -f "$PCS_CACHE/manifest.json" || { echo "Missing: $PCS_CACHE/manifest.json"; exit 1; }
         nvidia-smi --query-gpu=index,pci.bus_id,uuid,name,memory.used,utilization.gpu --format=csv,noheader
         env CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" python -c 'import torch; assert torch.cuda.device_count() == 4; print([(i, torch.cuda.get_device_name(i)) for i in range(4)])'
         df -h "$EXP_ROOT"
@@ -48,16 +49,12 @@ case "$MODE" in
     test)
         run_logged tests python -m unittest discover -s tests -p 'test_generator_timing*.py'
         ;;
-    prepare-features)
-        run_logged features python -m navsim.planning.script.prepare_generator_features \
-            --records "$RECORDS" --feature-cache "$FEATURE_CACHE" --data-root "$DATA_ROOT"
-        ;;
     prepare-pilot|prepare)
         target=$TIMING_TARGETS
         extra=()
         if [ "$MODE" = prepare-pilot ]; then target=$PILOT_TARGETS; extra+=(--limit 128); fi
         run_logged "$MODE" python -m navsim.planning.script.run_generator_timing prepare \
-            --records "$RECORDS" --feature-cache "$FEATURE_CACHE" --data-root "$DATA_ROOT" \
+            --records "$RECORDS" --data-root "$DATA_ROOT" \
             --output "$target" "${extra[@]}"
         ;;
     smoke|smoke-ddp|train-control|train-timing)
@@ -73,7 +70,7 @@ case "$MODE" in
         if [ -n "${RESUME_CKPT:-}" ]; then extra+=(--resume "$RESUME_CKPT"); fi
         run_logged "$MODE" env CUDA_VISIBLE_DEVICES="$gpus" \
             python -m navsim.planning.script.run_generator_timing train "${common[@]}" \
-            --feature-cache "$FEATURE_CACHE" --targets "$target" --arm "$arm" \
+            --candidate-cache "$PCS_CACHE" --targets "$target" --arm "$arm" \
             --output "$output" --devices "$devices" --batch-size "$batch" --epochs "$epochs" \
             --workers "${WORKERS:-0}" --precision "${PRECISION:-16-mixed}" --lr "${LR:-2e-5}" \
             --timing-weight "${TIMING_WEIGHT:-0.1}" "${extra[@]}"
@@ -88,8 +85,8 @@ case "$MODE" in
             --output "$GEN_EXP/$MODE" --workers "${EVAL_WORKERS:-0}" --score-workers "${SCORE_WORKERS:-4}" "${extra[@]}"
         ;;
     *)
-        echo "Usage: $0 {check|test|prepare-features|prepare-pilot|smoke|smoke-ddp|prepare|train-control|train-timing|eval-smoke|eval}"
-        echo "Run prepare-features only if the original raw feature cache was removed."
+        echo "Usage: $0 {check|test|prepare-pilot|smoke|smoke-ddp|prepare|train-control|train-timing|eval-smoke|eval}"
+        echo "The existing PCS cache supplies frozen K67 perception contexts; no 94 GiB raw feature cache is required."
         echo "Compare control last.ckpt and timing last.ckpt after equal training, with the same fixed PCS/TRV."
         ;;
 esac

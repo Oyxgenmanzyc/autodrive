@@ -47,8 +47,12 @@ def train(args):
     fixed, selector_meta, identity = checked_selector(args, "cpu")
     del fixed
     generator, _ = build_generator(args.baseline, args.backbone, args.anchor, "cpu")
-    training = TimingDataset(args.targets, args.feature_cache, "train", args.smoke)
-    validation = TimingDataset(args.targets, args.feature_cache, "val", args.smoke)
+    training = TimingDataset(args.targets, args.candidate_cache, "train", args.smoke)
+    validation = TimingDataset(args.targets, args.candidate_cache, "val", args.smoke)
+    if training.candidate_manifest["provenance"] != identity:
+        raise ValueError("Frozen training contexts do not match the baseline/anchor/seed")
+    if validation.candidate_manifest != training.candidate_manifest:
+        raise ValueError("Train/val candidate cache manifests differ")
     weight = 0.0 if args.arm == "control" else args.timing_weight
     metadata = {
         "schema": "generator_brake_timing_fixed_selector_v1", "arm": args.arm,
@@ -58,7 +62,8 @@ def train(args):
         "timing_weight": weight, "epochs": args.epochs, "lr": args.lr,
         "seed": args.seed, "global_batch_size": args.batch_size * args.devices,
         "precision": args.precision, "smoke": args.smoke,
-        "scope": "trajectory_head_except_anchors_and_classifier; frozen_context_encoder",
+        "candidate_cache_provenance": training.candidate_manifest["provenance"],
+        "scope": "trajectory_head_except_anchors_and_classifier; frozen_cached_context_encoder",
     }
     if args.resume and load_torch(args.resume)["generator_timing_metadata"] != metadata:
         raise ValueError("Resume settings/source/selector/targets differ from the saved run")
@@ -221,7 +226,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     prepare = commands.add_parser("prepare")
-    for name in ("records", "feature-cache", "data-root", "output"):
+    for name in ("records", "data-root", "output"):
         prepare.add_argument("--" + name, required=True)
     prepare.add_argument("--limit", type=int, default=0)
     prepare.add_argument("--seed", type=int, default=0)
@@ -233,7 +238,7 @@ def main():
         sub.add_argument("--workers", type=int, default=0)
         if command == "train":
             sub.add_argument("--targets", required=True)
-            sub.add_argument("--feature-cache", required=True)
+            sub.add_argument("--candidate-cache", required=True)
             sub.add_argument("--arm", choices=("control", "timing"), required=True)
             sub.add_argument("--timing-weight", type=float, default=0.1)
             sub.add_argument("--epochs", type=int, default=10)

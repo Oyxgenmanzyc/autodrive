@@ -44,9 +44,9 @@ class GeneratorTimingModule(pl.LightningModule):
         return {"optimizer": optimizer, "lr_scheduler": torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, self.epochs)}
 
     def training_step(self, batch, batch_idx):
-        features, targets = batch
+        context, targets = batch
         self._poses = None
-        output = self.generator(features, targets=targets)
+        output = self._forward_head(context, targets)
         if self._poses is None:
             raise RuntimeError("Training did not produce differentiable decoder candidates")
         poses, self._poses = self._poses, None
@@ -76,14 +76,26 @@ class GeneratorTimingModule(pl.LightningModule):
     def on_validation_epoch_start(self):
         self._timing_sums = {}
 
+    def _forward_head(self, context, targets=None):
+        # The old PCS cache contains the frozen K67 perception/context tensors.
+        # status_encoding is retained in the legacy signature but is not read by
+        # either decoder layer; pass an explicit zero tensor rather than inventing data.
+        bev = context["bev"].float()
+        agents = context["agents"].float()
+        ego = context["ego"].float()
+        status = ego.new_zeros((len(ego), 1, ego.shape[-1]))
+        return self.generator._trajectory_head(
+            ego, agents, bev, bev.shape[-2:], status, targets=targets,
+        )
+
     def validation_step(self, batch, batch_idx):
-        features, targets = batch
+        context, targets = batch
         # Same validation noise each epoch/arm for the same DDP batch layout.
         devices = [self.device.index] if self.device.type == "cuda" else []
         with torch.random.fork_rng(devices=devices):
             torch.manual_seed(100000 + batch_idx + self.global_rank * 1000000)
-            output = self.generator(features, return_candidates=True)
-        proposals = output["pcs_context"]["proposals"]
+            output = self._forward_head(context)
+        proposals = output["proposal_trajectory"]
         distances = torch.linalg.vector_norm(proposals[..., :2] - targets["trajectory"][:, None, :, :2], dim=-1).mean(-1)
         oracle_ade = distances.min(-1).values.mean()
         self.log("val/oracle_ade", oracle_ade, sync_dist=True, batch_size=len(proposals))

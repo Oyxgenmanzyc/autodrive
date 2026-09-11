@@ -20,6 +20,8 @@
 
 输入还是原 camera、LiDAR、车辆状态；现有 K67 anchor 和两步 DDIM 推理保留。
 冻结感知编码器、场景上下文、原分类头参数，只微调轨迹头中的其余生成参数。
+训练直接读取现有 PCS cache 保存的旧 K67 `bev/agents/ego` 中间特征；这些特征来自固定基线，
+且在 PCS cache 中已有严格 checkpoint、anchor、源码和 seed 来源记录。生成器不读取其中的 PDM labels/scores。
 PCS epoch05 与 TRV epoch02 的参数、阈值完全固定，不进入训练模型和优化器。
 冻结感知模块同时保持 eval 模式，避免 BatchNorm 缓冲区和 dropout 导致上下文漂移。
 
@@ -60,18 +62,20 @@ PCS epoch05 与 TRV epoch02 的参数、阈值完全固定，不进入训练模�
 
 | 数据 | 本版用途 |
 |---|---|
-| `training_cache_3_1_02_k67/*/*/transfuser_feature.gz` | 复用原始 image/LiDAR/status 特征，生成器训练必需 |
-| 原 `transfuser_target.gz` | 不必复制；本版 sidecar 同时保存 GT trajectory 和 timing context |
+| 已删除的 `training_cache_3_1_02_k67` | 本版不需要恢复 |
+| 原 `transfuser_target.gz` | 不需要；本版 sidecar 同时保存 GT trajectory 和 timing context |
 | 新 `generator_brake_timing_3_1_05_3/targets/navtrain.pt` | 新建小型 GT 时机监督，约数十 MB，以实测为准 |
-| 旧 PCS cache | 只读取 `records.json` 固定场景划分，不读其候选/上下文张量训练新生成器 |
+| 旧 PCS cache | 读取 `records.json` 和冻结的 `bev/agents/ego`；不使用候选PDM标签监督生成器 |
 | 旧 decision-pair/GTRS cache | 本版不用 |
 | navtrain metric cache | 监督训练不需要 |
 | navtest `metric_cache` | 复用；评测时实时生成和打分新候选，不用重做场景 metric cache |
 
-如果原始特征已删除，`prepare-features` 可以只补缺失特征，读取原始 trainval sensor_blobs；
-这可能重新占用约原 94 GB 空间。不会删除或覆盖已有缓存，不创建一份重复的 205 GB PCS cache。
+原始94GB特征被删除不会阻断本实验。现有205GB PCS cache必须保留，因为其冻结场景上下文
+正好是只训练轨迹头所需的输入，并能保证control/timing两组使用完全相同的感知结果。
 准备 sidecar 后，其内部已保存 records；保留小型 `records.json` 方便重建。
-已有原始特征假定来自未修改的 K67 FeatureBuilder；本分支不修改它。
+
+旧缓存没有单独保存 `status_encoding`，但当前两层轨迹 decoder 的 legacy 参数虽保留在函数签名中，
+实现中并未读取它；训练器传入显式零张量。若以后 decoder 开始使用该参数，源码hash变化会拒绝旧cache。
 
 ## 评测如何定位瓶颈
 

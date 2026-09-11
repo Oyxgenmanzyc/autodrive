@@ -7,6 +7,7 @@
 - [实验设计、3.22 来源与缓存边界](docs/experiment_3_1_05_3_generator_timing.md)
 - [服务器完整步骤：navhigh／物理 0–3 卡／每卡 BS32](docs/server_3_1_05_3_generator_timing.md)
 - 入口：`bash scripts/pcs/run_3_1_05_3_generator.sh help`
+- 直接复用现有 PCS cache 内的冻结 K67 场景特征，无需恢复已删除的 94GB training cache。
 - 对照：同一 K67 checkpoint，等时长微调，时机损失权重分别为 0 和 0.1。
 - 状态：未在本地运行测试；等待服务器测试、smoke 和完整对照实验。
 

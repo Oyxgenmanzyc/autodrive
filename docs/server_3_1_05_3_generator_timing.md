@@ -16,15 +16,10 @@ echo "测试退出码：$?"
 ```
 
 脚本已按 UUID 锁定物理 0–3 卡；不依赖 CUDA 数字编号。使用 navhigh。
-若 `FEATURE_CACHE` 已不存在，但原始数据仍在，执行一次：
-
-```bash
-bash scripts/pcs/run_3_1_05_3_generator.sh prepare-features
-```
-
-若只是原缓存搬家，先 `export FEATURE_CACHE="实际缓存目录"`，不必重建。
+原94GB `training_cache_3_1_02_k67` 已删除也不需要恢复。本版直接读取仍保留的
+`$EXP_ROOT/pcs_candidates_k67_3_1_05` 中冻结 K67 场景特征；该目录是训练依赖，暂时不要删除。
 原记录默认读取 `$EXP_ROOT/pcs_candidates_k67_3_1_05/records.json`，也可通过 `RECORDS` 指定备份。
-时机 sidecar 不含图像；不能用它替代原始特征文件。
+时机 sidecar 只保存 GT trajectory 和时机 context，不重复保存205GB场景特征。
 
 ## 2. 小缓存及 smoke
 
@@ -86,8 +81,8 @@ RESUME_CKPT="具体中断运行的checkpoints/last.ckpt" \
 bash scripts/pcs/run_3_1_05_3_generator.sh train-timing
 ```
 
-已完成10轮就无需续训。与旧筛选器的几分钟训练不同，本版需要运行原始感知前向及生成头反向，
-实际时间以服务器进度为准；感知被冻结，但原始特征读取和前向仍有开销。
+已完成10轮就无需续训。本版直接读取已冻结的场景中间特征，只执行生成头前向和反向；
+实际时间以服务器进度为准。它训练的是轨迹生成参数，运行较快不能据此判断没有训练。
 
 ## 5. 两组各自验证
 

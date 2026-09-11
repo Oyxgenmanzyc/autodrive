@@ -1,6 +1,10 @@
 修改主题：3.1.05_3：生成器刹车时机监督，固定已验证的 PCS＋TRV
 修改日期：2026-09-10
 
+2026-09-11 数据依赖修正：服务器确认原94GB K67 training cache已按先前清理建议删除。
+训练输入改为现有 PCS cache 保存的冻结 K67 场景上下文，因此无需重建94GB缓存；
+原始错误依赖已移除，服务器须使用本次更新后的压缩包。
+
 修改目的：
 纠正 timing-weighted-gain-selector 分支把 3.22 用在筛选端的方向偏差。
 本版以原 TRV 611e87b 为基础，将 3.22 的时机监督用于轨迹生成，
@@ -11,7 +15,8 @@
 - 仅微调轨迹头，冻结感知/上下文、anchor、原分类头参数；PCS/TRV 不参加训练。
 - 监督 GT anchor 匹配模式的刹车软轮廓和累计启动轮廓，保留原来的风险场景激活条件。
 - control/timing 两组使用同一初始生成器、数据、种子、优化器、训练步数，权重分别为 0/0.1。
-- 独立小型 GT targets sidecar；复用原 image/LiDAR 特征，缺失时支持只补缺失特征文件。
+- 独立小型 GT targets sidecar；复用现有 205GB PCS cache 中冻结的 K67 BEV/agent/ego 场景特征。
+- 不依赖此前已删除的 94GB training cache；不重复计算感知特征，也不读取 PCS 的 PDM 标签训练生成器。
 - 保留原模型和全部 PCS/TRV 实现文件，新增训练封装通过 decoder 输出 hook 连接梯度。
 - 对新旧生成器同场景同种子生成全部 K67 候选，固定同一 PCS/TRV 评估并保存全部候选标签。
 - 严格检查原生成器、anchor、PCS、TRV 的 checkpoint 来源，明确记录新生成器应用到旧筛选器的实验。
@@ -20,7 +25,6 @@
 涉及文件：
 navsim/agents/diffusiondrive/generator_timing/
 navsim/planning/script/run_generator_timing.py
-navsim/planning/script/prepare_generator_features.py
 navsim/planning/script/compare_generator_timing.py
 scripts/pcs/run_3_1_05_3_generator.sh
 tests/test_generator_timing.py

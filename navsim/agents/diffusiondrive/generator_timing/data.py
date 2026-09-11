@@ -1,4 +1,4 @@
-"""Small GT target sidecar; existing image/LiDAR feature files are read-only."""
+"""Small GT target sidecar paired with frozen K67 contexts from PCS cache."""
 from pathlib import Path
 from types import SimpleNamespace
 import json
@@ -10,10 +10,12 @@ from hydra.utils import instantiate
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
-from navsim.agents.diffusiondrive.pcs.common import CONFIG_ROOT, load_torch, sha256, token_seed
+from navsim.agents.diffusiondrive.pcs.common import (
+    CONFIG_ROOT, CONTEXT_KEYS, implementation_hashes, load_torch, sha256, token_seed,
+)
+from navsim.agents.diffusiondrive.pcs.data import entry_path
 from navsim.common.dataclasses import Scene, SensorConfig
 from navsim.common.dataloader import SceneLoader
-from navsim.planning.training.dataset import load_feature_target_from_pickle
 from .risk_utils import build_gt_brake_timing_context
 from .risk_brake_timing import _brake_timing_observations
 
@@ -36,10 +38,6 @@ def target_identity():
     return {name: sha256(root / name) for name in ("data.py", "risk_utils.py", "risk_brake_timing.py")}
 
 
-def feature_path(root, record):
-    return Path(root) / record["log_name"] / record["token"] / "transfuser_feature.gz"
-
-
 def prepare_targets(args):
     records = json.loads(Path(args.records).read_text(encoding="utf-8"))
     logs = OmegaConf.load(CONFIG_ROOT / "training/default_train_val_test_log_split.yaml")
@@ -58,9 +56,6 @@ def prepare_targets(args):
         records = [r for split in ("train", "val") for r in [x for x in records if x["split"] == split][:args.limit]]
     if not records or {r["split"] for r in records} != {"train", "val"}:
         raise ValueError("Both train and val records are required")
-    missing = [str(feature_path(args.feature_cache, r)) for r in records if not feature_path(args.feature_cache, r).is_file()]
-    if missing:
-        raise FileNotFoundError(f"Missing {len(missing)} raw feature files; PCS candidates cannot replace them. First: {missing[0]}")
     identity = {
         "schema": SCHEMA, "implementation": target_identity(), "records": records,
         "data_root": str(Path(args.data_root).resolve()), "seed": args.seed,
@@ -115,7 +110,7 @@ def prepare_targets(args):
 
 
 class TimingDataset(Dataset):
-    def __init__(self, target_path, feature_root, split, smoke=False):
+    def __init__(self, target_path, candidate_root, split, smoke=False):
         payload = load_torch(target_path)
         self.identity = payload["identity"]
         if self.identity["schema"] != SCHEMA or self.identity["implementation"] != target_identity():
@@ -124,12 +119,31 @@ class TimingDataset(Dataset):
         self.indices = [i for i, r in enumerate(self.records) if r["split"] == split]
         self.contexts = payload["contexts"]
         self.trajectories = payload["trajectories"]
-        self.feature_root = feature_root
+        self.candidate_root = Path(candidate_root)
+        self.candidate_manifest = json.loads(
+            (self.candidate_root / "manifest.json").read_text(encoding="utf-8")
+        )
+        if self.candidate_manifest["dataset"] != "navtrain":
+            raise ValueError("Generator training requires the navtrain candidate cache")
+        if self.candidate_manifest["provenance"]["implementation_sha256"] != implementation_hashes():
+            raise ValueError("Current generator/PCS implementation differs from the frozen context cache")
+        cached_records = json.loads(
+            (self.candidate_root / "records.json").read_text(encoding="utf-8")
+        )
+        cached = {(r["split"], r["token"]): r for r in cached_records}
+        if len(cached) != len(cached_records):
+            raise ValueError("Duplicate records in candidate cache")
+        self.cache_records = {}
+        for i in self.indices:
+            key = (split, self.records[i]["token"])
+            if key not in cached or cached[key]["log_name"] != self.records[i]["log_name"]:
+                raise ValueError(f"Timing target is absent from candidate cache: {key}")
+            self.cache_records[i] = cached[key]
         if not smoke and len(self.indices) < 1000:
             raise ValueError("Pilot targets cannot be used for full training")
         for i in self.indices:
-            if not feature_path(feature_root, self.records[i]).is_file():
-                raise FileNotFoundError(feature_path(feature_root, self.records[i]))
+            if not entry_path(self.candidate_root, self.cache_records[i]).is_file():
+                raise FileNotFoundError(entry_path(self.candidate_root, self.cache_records[i]))
         if split == "train" and not smoke and payload["summary"]["train"]["active_scenes"] == 0:
             raise ValueError("No active timing supervision in the training split")
 
@@ -138,6 +152,13 @@ class TimingDataset(Dataset):
 
     def __getitem__(self, index):
         i = self.indices[index]
-        features = load_feature_target_from_pickle(feature_path(self.feature_root, self.records[i]))
+        entry = load_torch(entry_path(self.candidate_root, self.cache_records[i]))
+        if entry["token"] != self.records[i]["token"]:
+            raise ValueError("Candidate entry token mismatch")
+        if entry["provenance"] != self.candidate_manifest["provenance"]:
+            raise ValueError("Candidate entry provenance mismatch")
+        context = {key: entry["context"][key] for key in CONTEXT_KEYS}
+        if not all(torch.isfinite(value).all() for value in context.values()):
+            raise ValueError(f"Nonfinite cached context: {entry['token']}")
         # Future annotations are only in targets, never features.
-        return features, {"trajectory": self.trajectories[i], "brake_timing_context": self.contexts[i]}
+        return context, {"trajectory": self.trajectories[i], "brake_timing_context": self.contexts[i]}
