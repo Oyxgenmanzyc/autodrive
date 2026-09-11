@@ -1,4 +1,12 @@
 scripts/pcs/*.sh text eol=lf
+navsim/agents/diffusiondrive/pcs/model.py text eol=lf
+navsim/agents/diffusiondrive/pcs/v2_blocks.py text eol=lf
+navsim/agents/diffusiondrive/pcs/scoring.py text eol=lf
+navsim/agents/diffusiondrive/pcs/common.py text eol=lf
+navsim/agents/diffusiondrive/transfuser_model_v2.py text eol=lf
+navsim/agents/diffusiondrive/transfuser_config.py text eol=lf
+navsim/agents/diffusiondrive/transfuser_features.py text eol=lf
+navsim/planning/script/config/pdm_scoring/default_scoring_parameters.yaml text eol=lf
 navsim/agents/diffusiondrive/generator_timing/*.py text eol=lf
 navsim/planning/script/run_generator_timing.py text eol=lf
 navsim/planning/script/compare_generator_timing.py text eol=lf
