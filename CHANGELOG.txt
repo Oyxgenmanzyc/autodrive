@@ -8,6 +8,9 @@
 2026-09-11 换行来源修正：将旧PCS/TRV来源校验涉及的8个文件统一记录为LF，
 避免Windows打包产生CRLF后与服务器checkpoint中保存的源码SHA256不一致；无逻辑变化。
 
+2026-09-11 smoke修正：冻结父生成器处于eval时，显式调用轨迹头的训练/推理入口，
+避免训练步骤误走forward_test并缺少trajectory_loss；新增分支调度回归测试。
+
 修改目的：
 纠正 timing-weighted-gain-selector 分支把 3.22 用在筛选端的方向偏差。
 本版以原 TRV 611e87b 为基础，将 3.22 的时机监督用于轨迹生成，

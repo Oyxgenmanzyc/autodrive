@@ -79,15 +79,26 @@ class TimingLossTests(unittest.TestCase):
         self.assertEqual(float(context[4]), 0.)
 
 
+class ToyTrajectoryHead(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.plan_anchor = nn.Parameter(torch.ones(1, 8, 2))
+        self.plan_reg_branch = nn.Linear(2, 2)
+        self.plan_cls_branch = nn.Linear(2, 2)
+        self.diff_decoder = nn.Identity()
+
+    def forward_train(self, ego, agents, bev, shape, status, targets=None):
+        return {"trajectory_loss": self.plan_reg_branch(ego[..., :2]).sum()}
+
+    def forward_test(self, ego, agents, bev, shape, status, global_img=None):
+        return {"proposal_trajectory": ego.new_zeros((len(ego), 1, 8, 3))}
+
+
 class ToyGenerator(nn.Module):
     def __init__(self):
         super().__init__()
         self.encoder = nn.Sequential(nn.Linear(2, 2), nn.BatchNorm1d(2), nn.Dropout())
-        self._trajectory_head = nn.Module()
-        self._trajectory_head.plan_anchor = nn.Parameter(torch.ones(1, 8, 2))
-        self._trajectory_head.plan_reg_branch = nn.Linear(2, 2)
-        self._trajectory_head.plan_cls_branch = nn.Linear(2, 2)
-        self._trajectory_head.diff_decoder = nn.Identity()
+        self._trajectory_head = ToyTrajectoryHead()
 
 
 class FrozenScopeTests(unittest.TestCase):
@@ -110,6 +121,21 @@ class FrozenScopeTests(unittest.TestCase):
         self.assertFalse(module.generator.encoder.training)
         self.assertTrue(module.generator._trajectory_head.training)
         module.eval()
+        self.assertFalse(module.generator._trajectory_head.training)
+
+    def test_cached_context_dispatches_explicit_train_and_eval_paths(self):
+        module = GeneratorTimingModule(ToyGenerator(), {})
+        context = {
+            "bev": torch.zeros(2, 256, 8, 8),
+            "agents": torch.zeros(2, 30, 256),
+            "ego": torch.zeros(2, 1, 256),
+        }
+        targets = {"trajectory": torch.zeros(2, 8, 3)}
+        train_output = module._forward_head(context, targets)
+        self.assertIn("trajectory_loss", train_output)
+        self.assertTrue(module.generator._trajectory_head.training)
+        eval_output = module._forward_head(context)
+        self.assertIn("proposal_trajectory", eval_output)
         self.assertFalse(module.generator._trajectory_head.training)
 
 

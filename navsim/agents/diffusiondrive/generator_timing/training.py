@@ -84,9 +84,16 @@ class GeneratorTimingModule(pl.LightningModule):
         agents = context["agents"].float()
         ego = context["ego"].float()
         status = ego.new_zeros((len(ego), 1, ego.shape[-1]))
-        return self.generator._trajectory_head(
-            ego, agents, bev, bev.shape[-2:], status, targets=targets,
-        )
+        head = self.generator._trajectory_head
+        arguments = (ego, agents, bev, bev.shape[-2:], status)
+        if targets is not None:
+            # The frozen parent deliberately remains in eval mode. Dispatch the
+            # train path explicitly so Lightning cannot route this call through
+            # TrajectoryHead.forward_test via the parent's mode propagation.
+            head.train(True)
+            return head.forward_train(*arguments, targets=targets)
+        head.train(False)
+        return head.forward_test(*arguments, global_img=None)
 
     def validation_step(self, batch, batch_idx):
         context, targets = batch
