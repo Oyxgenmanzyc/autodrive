@@ -235,3 +235,19 @@ tests/test_diffusiondrive_variable_anchor.py
 
 与论文撰写的关系：
 该版本作为“原版 DiffusionDrive + Adaptive Multimodal Anchor”的独立消融实验，与 3.1.01 时序优化实验分离，可用于直接比较固定 20-anchor 与 adaptive variable-K anchor 的覆盖率、训练稳定性及 NAVSIM 指标。
+3.1.05_4 选后时机修正 PTR / Post-selection Timing Refiner
+修改日期：2026-09-12
+修改目的：固定原K67+PCS+TRV决策，只学习最终选中轨迹的制动时机与力度参数。
+核心改动：
+- 新增24种渐进制动变体及严格恒等动作；沿原几何路径弧长重定时，不自由改写XY。
+- 单次时机query Cross-Attention，预测动作相对官方PDMS增益与安全/舒适退化风险。
+- 使用全部动作标签和有害编辑监督；navtrain val校准阈值、选PDMS checkpoint，可整体回退恒等。
+- 无N层折扣：层权重不等于Bellman backup，重复层数不增加独立训练样本。
+- 复用原205G PCS上下文及train/test metric cache；新增可续用的128场景分块标签。
+- 包含单卡/四卡Smoke、缓存分片、训练恢复与原方案对照评估脚本。
+涉及文件：navsim/agents/diffusiondrive/post_selection/，run_post_selection.py，run_3_1_05_4.sh，tests/test_post_selection.py，docs/*3_1_05_4.md。
+预期影响：只验证选后受控制动是否提高最终PDMS；不承诺提升。旧注意力生成器不参与。
+验证结果：未在本地运行测试或Smoke，待服务器navhigh验证；新增11项行为测试。
+实验记录：原方案89.1819；旧生成器注意力epoch12=89.1252、last=89.0861。
+论文关系：网络图中位于PCS/TRV后、完整扩散循环之外。PTR是本实验命名，不是已有论文模块或强化学习方法。
+证据限制：已有近邻候选Oracle 95.4096不等于严格同路径制动上限；本版先计算受控动作Oracle。
