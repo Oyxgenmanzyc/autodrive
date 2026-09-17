@@ -4,6 +4,7 @@ import numpy as np
 import torch
 from navsim.agents.diffusiondrive.post_selection.geometry import ACTIONS, brake_bank, safe_oracle
 from navsim.agents.diffusiondrive.post_selection.model import PostSelectionRefiner, decide, refinement_loss
+from navsim.planning.script.run_post_selection import validate_identity_rescore
 
 
 class GeometryTests(unittest.TestCase):
@@ -60,6 +61,17 @@ class GeometryTests(unittest.TestCase):
         direction[2] = 0.
         self.assertEqual(int(safe_oracle(labels, scores, direction)), 0)
         self.assertEqual(int(safe_oracle(np.ones((3, 5)), np.ones(3), np.ones(3))), 0)
+
+    def test_identity_rescore_allows_only_progress_drift(self):
+        variants = brake_bank(self.path)
+        cached = np.ones(5, np.float32)
+        rescored = np.ones((25, 5), np.float32)
+        rescored[0, 2] = .75
+        direction = np.ones(25, np.float32)
+        validate_identity_rescore(self.path, variants, cached, 1., rescored, direction)
+        rescored[0, 3] = 0.
+        with self.assertRaises(AssertionError):
+            validate_identity_rescore(self.path, variants, cached, 1., rescored, direction)
 
 
 class ModelTests(unittest.TestCase):

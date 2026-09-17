@@ -251,3 +251,4 @@ tests/test_diffusiondrive_variable_anchor.py
 实验记录：原方案89.1819；旧生成器注意力epoch12=89.1252、last=89.0861。
 论文关系：网络图中位于PCS/TRV后、完整扩散循环之外。PTR是本实验命名，不是已有论文模块或强化学习方法。
 证据限制：已有近邻候选Oracle 95.4096不等于严格同路径制动上限；本版先计算受控动作Oracle。
+缓存续跑修正（2026-09-17）：重建 navtrain metric cache 时，PDM 参考轨迹可能令归一化 progress 和总分轻微漂移。PTR identity 校验改为要求动作零轨迹逐元素一致，且 NC、DAC、TTC、comfort、direction 与原缓存一致；不再错误地要求旧、新 composite PDM 总分在 1e-5 内相等。25 个动作的训练标签仍统一来自同一次新 metric cache 官方评分。

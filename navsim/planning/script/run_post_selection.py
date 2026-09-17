@@ -23,6 +23,26 @@ from navsim.agents.diffusiondrive.post_selection.model import PostSelectionRefin
 from navsim.planning.script.run_pcs import loader, save_entry, new_run, prepare_source
 
 
+def validate_identity_rescore(selected, variants, cached_labels, cached_direction,
+                              rescored_labels, rescored_direction):
+    """Verify identity semantics while allowing reference-progress drift.
+
+    Rebuilding a metric cache can slightly change the PDM reference trajectory,
+    which changes normalized progress and the composite score. The identity
+    action is still valid when its trajectory is bit-exact and all protected
+    safety/comfort gates are unchanged.
+    """
+    np.testing.assert_array_equal(
+        variants[0], selected, err_msg='Identity action changed the selected trajectory')
+    protected = [0, 1, 3, 4]  # NC, DAC, TTC, comfort; progress may be renormalized.
+    np.testing.assert_allclose(
+        rescored_labels[0, protected], np.asarray(cached_labels)[protected],
+        atol=1e-6, rtol=0, err_msg='Identity protected metrics changed')
+    np.testing.assert_allclose(
+        rescored_direction[0], cached_direction, atol=1e-6, rtol=0,
+        err_msg='Identity direction compliance changed')
+
+
 def checked_veto(args, identity):
     veto, meta = load_veto(args.veto, 'cuda:0', identity)
     if meta['pcs_scorer_sha256'] != sha256(args.pcs_scorer):
@@ -70,10 +90,11 @@ def prepare(args):
                 entries, pending = [], []
 
                 def finish(job):
-                    future, selected, mode, expected = job
+                    future, selected, mode, variants, cached_labels, cached_direction = job
                     labels, scores, direction = future.result()
-                    np.testing.assert_allclose(scores[0], expected, atol=1e-5, rtol=0,
-                                               err_msg='Identity no longer matches original PDM')
+                    validate_identity_rescore(
+                        selected.numpy(), variants, cached_labels, cached_direction,
+                        labels, direction)
                     entries.append({'selected': selected.clone(), 'mode': torch.tensor(mode),
                                     'labels': torch.from_numpy(labels), 'scores': torch.from_numpy(scores),
                                     'direction': torch.from_numpy(direction)})
@@ -88,7 +109,8 @@ def prepare(args):
                     variants = brake_bank(selected.numpy())
                     future = pool.submit(score_candidates, paths[record['token']], variants, not verified)
                     verified = True
-                    pending.append((future, selected, mode, float(item['scores'][mode])))
+                    pending.append((future, selected, mode, variants,
+                                    item['labels'][mode].numpy(), float(item['direction'][mode])))
                     if len(pending) >= args.score_workers*2:
                         finish(pending.pop(0))
                 for job in pending:
