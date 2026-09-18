@@ -99,15 +99,15 @@ class GatedModule(pl.LightningModule):
     def on_train_epoch_end(self):
         if (self.current_epoch+1) % 5:
             return
-        gathered = [self.negative_scores]
-        if torch.distributed.is_initialized():
-            gathered = [None]*torch.distributed.get_world_size()
-            torch.distributed.all_gather_object(gathered, self.negative_scores)
-        merged = {}
-        for values in gathered:
-            for index, score in values.items():
-                merged[index] = max(score, merged.get(index, -float('inf')))
-        self.mined_negatives = sorted(merged, key=lambda i: (-merged[i], i))[:1024]
+        # Each DDP rank mines only the negatives it has already visited. An
+        # all_gather_object here previously deadlocked at the first five-epoch
+        # boundary and NCCL's watchdog aborted the job. Rank-local pools still
+        # diversify hard examples because PairedBatchSampler partitions positive
+        # groups across ranks; no extra collective is needed for this heuristic.
+        self.mined_negatives = sorted(
+            self.negative_scores,
+            key=lambda i: (-self.negative_scores[i], i),
+        )[:1024]
         self.negative_scores.clear()
 
     def validation_step(self, batch, batch_idx):

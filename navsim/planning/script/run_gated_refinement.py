@@ -5,7 +5,9 @@ import os
 from pathlib import Path
 import torch
 from navsim.agents.diffusiondrive.pcs.common import load_torch, write_new_json
-from navsim.agents.diffusiondrive.gated_refinement.data import prepare, GatedDataset, code_identity
+from navsim.agents.diffusiondrive.gated_refinement.data import (
+    prepare, GatedDataset, compatible_sources,
+)
 from navsim.agents.diffusiondrive.gated_refinement.labels import PairedBatchSampler
 from navsim.planning.script.run_pcs import loader, new_run
 
@@ -130,7 +132,7 @@ def evaluate(args):
     veto = checked_veto(args, identity)
     ckpt = load_torch(args.refiner)
     meta = ckpt['gate_metadata']
-    if meta['stage'] != 'joint' or meta['identity']['sources'] != code_identity():
+    if meta['stage'] != 'joint' or not compatible_sources(meta['identity']['sources']):
         raise ValueError('Require a matching joint checkpoint, not a Gate-only probe')
     identity_meta = meta['identity']['edit_manifest']
     if (identity_meta['provenance'] != identity

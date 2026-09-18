@@ -1,4 +1,5 @@
 2026-09-18 | 3.1.05_5 | Independent Gate and paired refinement
+# 2026-09-18 运行修复：移除每5轮难负例更新中的跨卡 all_gather_object；原正式probe在epoch 4后触发NCCL watchdog并以134退出。改为各rank本地难例池，标签/模型/损失不变，兼容故障前checkpoint续训。服务器复测待完成。
 # 3.1.05_5：独立修改 Gate 与配对专精训练
 
 修改日期：2026-09-18。涉及文件：`gated_refinement/{labels,data,model,training}.py`、`run_gated_refinement.py`、`run_3_1_05_5.sh`、`install_3_1_05_5.sh`、`test_gated_refinement.py`、服务器文档和 CHANGELOG。预期影响是检验可修正场景的可辨识性并减少identity主导的决策失效；论文中应作为独立Gate/动作头与配对训练的新增实验，不能把Oracle上界写成学习模型提升。

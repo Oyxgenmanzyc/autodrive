@@ -7,6 +7,7 @@ from navsim.agents.diffusiondrive.gated_refinement.labels import (
 )
 from navsim.agents.diffusiondrive.gated_refinement.model import GatedRefiner, decide, loss_terms
 from navsim.agents.diffusiondrive.gated_refinement.training import gate_metrics, calibrate
+from navsim.agents.diffusiondrive.gated_refinement.data import code_identity, compatible_sources
 from navsim.agents.diffusiondrive.post_selection.geometry import brake_bank
 
 
@@ -84,6 +85,15 @@ class LabelTests(unittest.TestCase):
             sampler.set_hard_negatives([0])
         sampler.set_hard_negatives([2, 3])
         self.assertEqual(len(list(sampler)), 1)
+
+    def test_runtime_fix_does_not_invalidate_supervision(self):
+        cached = code_identity()
+        cached['training.py'] = 'old-runtime-hash'
+        cached['runner'] = 'old-runner-hash'
+        cached['data.py'] = 'old-loader-hash'
+        self.assertTrue(compatible_sources(cached))
+        cached['labels.py'] = 'changed-label-definition'
+        self.assertFalse(compatible_sources(cached))
 
 
 class DecisionTests(unittest.TestCase):

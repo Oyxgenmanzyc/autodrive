@@ -45,3 +45,9 @@
 ## 验证状态
 
 遵循本项目 skill：not run locally; pending server smoke test。新增服务器单元测试覆盖标签保护、噪声增益、软目标、匹配防泄漏、DDP 配对采样、Gate/identity 解耦、并列 AUPRC、校准和梯度；训练效果待服务器验证。未声称已获得 PDM 提升。
+
+## 2026-09-18 DDP 运行修复
+
+首轮四卡正式 probe 在 epoch 4 结束后的第一次难负例更新处停滞，约 26 分钟后由 NCCL watchdog 中止（退出码 134）。这与客户端 SSH 断网无关；训练由服务器 `nohup` 运行。根因是训练钩子中新增的 Python 字典 `all_gather_object` collective。修复后每个 rank 只从自身已经访问的训练负例维护最多 1024 个难例，不再为该启发式步骤创建额外 NCCL collective。验证集全量汇总逻辑未变，因为它在 epoch 0--4 已连续正常完成且用于去除 DDP padding。
+
+该修复只改变训练期难负例池的跨卡通信，不改变标签、Gate/动作模型、损失、采样比例或部署决策。为允许从故障前 checkpoint 续训，cache 兼容性仍严格验证标签定义和模型张量语义，同时继续验证 records、全部 edit block 内容 hash、generator/candidate provenance；训练调度、runner 和 loader 的运行修复不再伪装成标签失配。修复后的服务器单元测试及四卡续训仍待执行。

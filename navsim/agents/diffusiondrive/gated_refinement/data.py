@@ -17,6 +17,17 @@ def code_identity():
     return result
 
 
+def compatible_sources(cached):
+    """Permit runtime-only fixes without invalidating immutable supervision.
+
+    labels.py defines the offline targets and model.py defines checkpoint tensor
+    semantics. data/training/runner fixes do not change already materialized
+    labels, whose records and source block hashes are checked independently.
+    """
+    current = code_identity()
+    return all(cached.get(name) == current[name] for name in ('labels.py', 'model.py'))
+
+
 def validate_edit_schema(manifest):
     # Training-head/runner changes do not invalidate already scored trajectories.
     # Exact brake geometry must still match; selector SHA is checked at evaluation,
@@ -109,7 +120,7 @@ class GatedDataset(RefinementDataset):
             raise ValueError('Incomplete gate preparation')
         self.gate_manifest = json.loads((root/'manifest.json').read_text())
         m = self.gate_manifest
-        if m['schema'] != 'gated_refinement_v1' or m['sources'] != code_identity():
+        if m['schema'] != 'gated_refinement_v1' or not compatible_sources(m['sources']):
             raise ValueError('Gate code/cache mismatch')
         if m['edit_manifest'] != self.manifest:
             raise ValueError('Gate/edit manifest mismatch')
