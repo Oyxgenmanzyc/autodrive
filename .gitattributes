@@ -14,3 +14,6 @@ tests/test_generator_timing*.py text eol=lf
 navsim/agents/diffusiondrive/timing_attention/*.py text eol=lf
 navsim/planning/script/run_timing_attention.py text eol=lf
 tests/test_timing_attention.py text eol=lf
+navsim/agents/diffusiondrive/gated_refinement/*.py text eol=lf
+navsim/planning/script/run_gated_refinement.py text eol=lf
+tests/test_gated_refinement.py text eol=lf
