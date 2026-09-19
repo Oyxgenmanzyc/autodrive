@@ -1,3 +1,13 @@
+2026-09-19 | 3.1.05_6 | Independent cost-weighted PCS ranking
+
+修改目的：延续已有效的K67候选/PDM评分路径，直接纠正高代价候选错序。遵照用户要求，新排序模块单独训练，仅一个代价加权pairwise排序loss；不将BCE、Gate、风险、时机等辅助loss混入，也不更新原PCS/生成器权重。
+核心改动：冻结原PCS提取512维候选特征，独立残差排序器零初始化；固定67条候选不变。按train完整log三折训练独立随机初始化PCS教师，生成折外分数挖掘top5高代价误排；临时教师BCE与最终排序训练是分离阶段。正常候选对保留基础权重。
+数据依赖：复用原205GB候选/PDM缓存，新增约8GB紧凑特征和小型OOF预测。训练不需要raw training_cache、navtrain metric cache、GTRS或失败版edit/gate缓存，不删除旧文件。折外仅针对教师；原生成器和基础PCS特征并非全链路交叉拟合。
+验证设计：calibration选择固定网格alpha和checkpoint；audit仅报告。无验证收益时alpha=0。报告PDM、误选损失、新增安全失败、救回和selection regret。navtest固定策略，对比base/PCS/TRV/新ranker，旧TRV不接在新排序后面。
+涉及文件：新增cost_rank包、run_cost_rank.py、run_3_1_05_6.sh、install_3_1_05_6.sh、test_cost_rank.py、实验及服务器文档；旧PCS/生成器/provenance源码字节保持不变。
+历史结果记录：3.1.05_5最佳joint epoch16 calibration +0.027234分、audit -0.015178分；audit55次修改中5有益/41有害，未进行该版navtest。它未证明后处理路线整体不可能有效。
+验证状态：仅静态审阅；未在本地运行测试或语法检查，等待服务器navhigh单元测试、单卡/四卡Smoke和完整实验。无新增实测收益，论文不能将Oracle空间写成实现提升。
+
 2026-09-18 | 3.1.05_5 | Independent Gate and paired refinement
 # 2026-09-18 运行修复：移除每5轮难负例更新中的跨卡 all_gather_object；原正式probe在epoch 4后触发NCCL watchdog并以134退出。改为各rank本地难例池，标签/模型/损失不变，兼容故障前checkpoint续训。服务器复测待完成。
 # 3.1.05_5：独立修改 Gate 与配对专精训练
