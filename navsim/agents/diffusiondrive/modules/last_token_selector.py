@@ -55,7 +55,9 @@ class LASTTokenSelector(nn.Module):
         k = max(1, min(tokens, round(tokens * self.topk_ratio)))
 
         with torch.autocast(device_type=x.device.type, enabled=False):
-            score_x = x.float()
+            # oneMKL/cuFFT require a materialized layout for zero-stride views
+            # such as expand(); normal permuted BEV tokens are handled too.
+            score_x = x.float().contiguous()
             if self.pre_norm:
                 score_x = F.layer_norm(score_x, (channels,))
             spectrum = torch.fft.fftshift(torch.fft.fft(score_x, dim=-1), dim=-1)

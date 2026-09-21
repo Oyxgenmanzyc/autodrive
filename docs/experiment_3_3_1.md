@@ -153,4 +153,4 @@ python navsim/planning/script/run_pdm_score.py \
 
 ## 验证记录
 
-本地未运行单元测试、smoke test 或训练；待服务器执行上述命令。已进行代码路径审阅，尚无训练/评估指标。工作流约定将运行验证放在服务器，本地 Windows 不代跑；本仓库为 Python 项目，没有 `mvnw`，Java/Maven 检查不适用。
+服务器首次运行 16 项单元测试，15 项通过；`expand()` 产生的零步长测试输入在 oneMKL FFT 中报 DFTI 配置错误。现已在 FFT 前显式 materialize contiguous layout，等待服务器重跑确认。真实数据 smoke test、训练和评估尚未运行。工作流约定将运行验证放在服务器，本地 Windows 不代跑；本仓库为 Python 项目，没有 `mvnw`，Java/Maven 检查不适用。
