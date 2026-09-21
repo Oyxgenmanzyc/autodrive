@@ -1,11 +1,16 @@
-# 新 3.1.05：PDM Candidate Scoring（PCS）
+# 0_89.6pdm：K67 + PCS + Cost Ranker
 
-本分支以原 3.1.02 K67 为基础，冻结候选生成器，迁移 DiffusionDriveV2 的单阶段 PDM 子指标评分器。
-原 SPR 分支保留。本版本尚待服务器训练与验证，不代表已有 PDM 提升。
+这是 3.1.05 系列的干净定稿。部署链路只保留 K67 自适应候选生成器、冻结的 PDM Candidate Scoring（PCS）和独立训练的 Cost Ranker：
 
-- [实验设计、来源与取舍](docs/experiment_3_1_05_pcs.md)
-- [navhigh / 物理 0–3 卡 / 每卡 BS32 服务器指令](docs/server_3_1_05_pcs.md)
-- 统一入口：`bash scripts/pcs/run_3_1_05.sh help`
+`K67 candidates -> PCS scores/features -> Cost Ranker residual -> argmax`
+
+12,146 个 navtest 场景的固定 checkpoint 结果为 **0.8945933668 PDM**；原 PCS 为 0.8907557098，base 为 0.8848893597。`0_89.6pdm` 是版本标签，论文和实验表应填写未经错误取整的真实结果。
+
+最终推理不加载 TRV、GTRS 保守选择器、Timing Cross-Attention、选后轨迹修正 Gate 或 Future Occupancy veto。历史实验仍可在对应旧分支查阅，但不属于本分支的运行依赖。
+
+- [最终方法、证据与边界](docs/experiment_3_1_05_6.md)
+- [服务器复现步骤](docs/server_3_1_05_6.md)
+- 统一入口：`bash scripts/pcs/run_3_1_05_6.sh help`
 
 ---
 

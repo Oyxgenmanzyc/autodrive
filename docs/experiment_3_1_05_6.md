@@ -7,8 +7,8 @@
 - 同一 K67 候选集合，navtest：base 88.488936 → PCS 89.075571 → PCS+TRV 89.181861。
 - navtrain val：PCS 87.410486，候选 Oracle 96.175107；这是候选上限，不是可兑现收益，更不能当作 navtest 上限。
 - 3.1.05_5 联合训练最佳 epoch16：calibration +0.027234 PDM分；audit -0.015178分，55次修改仅5次有益、41次有害。没有运行该版 navtest。现有实现未证实泛化收益，不等于证明所有后处理路线不可能有效。
-- 原 TRV 的 NC 相对风险样本 train 56/85109、val 126/18179；后处理 Gate 正样本率 train 约1.17%、val约8.39%。泛化错误分布不同是已观察事实，不能仅凭这些数字断定其唯一原因是过拟合或缺失未来信息。
-- 3.1.05_6 尚无服务器实验结果，不预报提升分数。
+- 3.1.05_6 已完成服务器训练与固定 checkpoint 的完整 navtest：Cost Ranker 89.459337，原 PCS 89.075571，base 88.488936；相对 PCS 提升 0.383766 PDM 点。
+- `0_89.6pdm` 是用户指定的定稿标签；实验表格和论文正文使用真实分数 89.459337，避免把 89.46 错写成四舍五入后的 89.6。
 
 ## 架构：只有新模块接收梯度
 
@@ -20,7 +20,7 @@
 - 残差末层零初始化；初始输出分数/argmax 与同一次原 PCS 推理完全相同，包括并列值。
 - 同一组67条轨迹不变；允许选第三条等候选，不限于 PCS/base 二选一。
 - 新模块没有 gate、risk、PDM回归、BCE、蒸馏、时机或力度辅助损失。
-- 旧 TRV 是独立对照，不接到新排名后面。它的训练分布与 PCS hash 都绑定原 PCS，不应强行复用作新策略否决器。
+- 最终定稿不加载旧 TRV、Gate、时机生成或选后修正模块；这些失败实验不属于部署链路。
 - feature 用FP16存储再还原FP32；原 PCS 分数及轨迹保留FP32；零初始化和实时评估遵循同样规则。批大小改变仍可能导致旧 PCS 极近分数的 argmax 浮点翻转，不能宣称跨不同批大小 bitwise 等价。
 
 ## 唯一训练目标
@@ -63,16 +63,16 @@
 - 均值安全约束不保证每场景安全，新增失败必须一并审阅。
 - 这些navtrain val日志在旧实验中已经反复查看；本版audit只表示本次未用于选模型的分区，不能声称是历史上从未查看的独立数据。反复根据audit改模型会进一步削弱独立性。
 - 若calibration禁用、audit负收益或严重失误增加，保留负结果，不自动运行navtest。
-- 通过后才进行固定checkpoint/固定alpha的navtest，输出原base/原PCS/原TRV/新ranker四个对照。navtest不重调alpha。
-- 先证明优于原PCS，再检查是否超过89.181861的旧TRV对照；前者不能代替后者。
+- 通过后才进行固定checkpoint/固定alpha的navtest，输出原base、原PCS和新ranker三个对照。navtest不重调alpha。
+- 历史TRV 89.181861仅作为论文中的外部实验结果，不再成为代码或checkpoint依赖。
 
 ## 代码与验证记录
 
-新增 `cost_rank/{model,data,metrics,pipeline,training}.py`、runner、launcher、installer和专门单元测试。没有修改旧PCS/生成器/评分/provenance文件。
+新增 `cost_rank/{model,data,metrics,pipeline,training}.py`、runner、launcher、installer和专门单元测试。生成器、PCS网络、评分逻辑和候选缓存 provenance 不变；仅让 PCS 数据集读取接口返回缓存中已有的 `direction` 字段，供排名验证统计使用。
 
 测试覆盖：原PCS冻结、零初始化及并列值、标签不能进入推理、唯一loss梯度方向/代价权重/OOF权重、无有效候选对、log划分、校准回退/安全约束/audit不能选策略。单卡与四卡Smoke均为完整训练前的必经步骤。
 
-**本地不运行测试或语法检查；等待服务器navhigh执行单元测试、单卡/四卡Smoke和正式验证。** 静态代码审阅不代表服务器已通过。
+历史实验已在服务器 navhigh 通过单元测试、单卡/四卡 Smoke、20轮排序训练和12,146场景完整 navtest。干净定稿分支只移除了未进入最终策略的TRV对照加载与输出；按用户要求不再重跑eval，沿用固定权重的历史完整结果。
 
 ## 论文表述
 

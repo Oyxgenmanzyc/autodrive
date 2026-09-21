@@ -122,5 +122,6 @@ class CandidateDataset(Dataset):
         return {
             "context": {k: entry["context"][k] for k in CONTEXT_KEYS},
             "labels": entry["labels"], "scores": entry["scores"],
+            "direction": entry["direction"],
             "index": index,
         }

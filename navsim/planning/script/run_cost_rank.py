@@ -164,7 +164,6 @@ def evaluate(args):
     from navsim.agents.diffusiondrive.pcs.common import provenance, generate_context
     from navsim.agents.diffusiondrive.pcs.scoring import score_candidates
     from navsim.agents.diffusiondrive.pcs.model import METRIC_NAMES
-    from navsim.agents.diffusiondrive.pcs.veto import load_veto
     args.split, args.feature_cache = 'navtest', None
     generator, _, source, paths, device = prepare_source(args)
     identity = provenance(args.baseline, args.anchor, args.seed)
@@ -174,16 +173,13 @@ def evaluate(args):
         raise ValueError('Ranker does not match original generator/PCS')
     scorer, _ = load_scorer(args.scorer, device, identity)
     frozen = FrozenPCS(scorer).eval()
-    reference, reference_meta = load_veto(args.reference_trv, device, identity)
-    if reference_meta['pcs_scorer_sha256'] != fm['pcs_sha256']:
-        raise ValueError('Reference TRV uses a different original PCS')
     policy = meta['policy']
     run = new_run(args.output)
     write_new_json(run/'run.json', dict(arguments=vars(args), policy=policy, rank_metadata=meta))
     rows, pending = [], []
     stream = (run/'paired_results.csv').open('x', newline='', encoding='utf-8')
     writer = None
-    prefixes = ('rank', 'pcs', 'trv', 'base')
+    prefixes = ('rank', 'pcs', 'base')
 
     def finish(job):
         nonlocal writer
@@ -195,7 +191,6 @@ def evaluate(args):
             row[prefix+'_score'], row[prefix+'_direction'] = float(scores[i]), float(direction[i])
             row[prefix+'_mode'] = modes[i]
         row['delta_vs_pcs'] = float(scores[0]-scores[1])
-        row['delta_vs_trv'] = float(scores[0]-scores[2])
         if writer is None:
             writer = csv.DictWriter(stream, fieldnames=list(row))
             writer.writeheader()
@@ -206,7 +201,7 @@ def evaluate(args):
     try:
         with ProcessPoolExecutor(max_workers=args.score_workers, mp_context=mp.get_context('spawn')) as pool:
             for index, (record, features) in enumerate(tqdm(loader(source, args.workers, batch_size=None),
-                                                          desc='Fixed K67: rank vs PCS vs TRV')):
+                                                          desc='Fixed K67: rank vs PCS vs base')):
                 context = generate_context(generator, features, record['token'], args.seed, device)
                 gpu = {k: v.unsqueeze(0).to(device) for k, v in context.items()}
                 with torch.no_grad():
@@ -214,9 +209,8 @@ def evaluate(args):
                     residual = ranker(compact)
                     pcs_mode = compact['pcs_scores'].argmax(-1)
                     base_mode = gpu['base_logits'].argmax(-1)
-                    reference_output = reference(gpu, selected_mode=pcs_mode, base_mode=base_mode)
                     modes = [int(select(compact['pcs_scores'], residual, policy['alpha'])[0]),
-                             int(pcs_mode[0]), int(reference_output['final_mode'][0]), int(base_mode[0])]
+                             int(pcs_mode[0]), int(base_mode[0])]
                 # True labels are read only AFTER all deployable choices are fixed.
                 future = pool.submit(score_candidates, paths[record['token']],
                                      context['proposals'][modes].numpy(), index == 0)
@@ -238,7 +232,7 @@ def evaluate(args):
                    (*METRIC_NAMES, 'driving_direction_compliance', 'score')}
         write_csv(run/f'{prefix}.csv', standard+[dict(token='average', valid=True, **average)])
         summary[prefix] = average
-    for ref in ('pcs', 'trv'):
+    for ref in ('pcs',):
         delta = np.asarray([r['rank_score']-r[ref+'_score'] for r in rows])
         summary['vs_'+ref] = dict(gain_points=float(delta.mean()*100), beneficial=int((delta > 1e-6).sum()),
                                   harmful=int((delta < -1e-6).sum()), severe_losses=int((delta <= -.2).sum()))
@@ -298,7 +292,7 @@ def parser():
     q.add_argument('--batch-size', type=int, default=32)
     q.add_argument('--workers', type=int, default=0)
     q = subs.add_parser('evaluate')
-    for key in ('baseline', 'backbone', 'anchor', 'scorer', 'reference-trv', 'ranker',
+    for key in ('baseline', 'backbone', 'anchor', 'scorer', 'ranker',
                 'metric-cache', 'data-root', 'output'):
         q.add_argument('--'+key, required=True)
     q.add_argument('--max-scenes', type=int, default=0)

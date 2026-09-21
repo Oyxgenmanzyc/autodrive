@@ -12,7 +12,6 @@ RANK_FEATURES=${RANK_FEATURES:-$RANK_EXP/features/navtrain}
 PILOT_RANK_FEATURES=${PILOT_RANK_FEATURES:-$RANK_EXP/features/pilot}
 OOF_ROOT=${OOF_ROOT:-$RANK_EXP/oof}
 PCS_SCORER=${PCS_SCORER:-$EXP_ROOT/pdm_candidate_scoring_k67_3_1_05/train/2026.09.07.19.15.17.705777/checkpoints/epoch=05.ckpt}
-REFERENCE_TRV=${REFERENCE_TRV:-$EXP_ROOT/triple_risk_veto_k67_3_1_05_2/train/2026.09.09.14.53.12.850967/checkpoints/epoch=02.ckpt}
 BASELINE_CKPT=${BASELINE_CKPT:-$EXP_ROOT/adaptive_multimodal_anchor_k67_3_1_02_4gpu_resume/2026.08.24.11.26.23/lightning_logs/version_0/checkpoints/epoch=99-step=266000.ckpt}
 ANCHOR_PATH=${ANCHOR_PATH:-$EXP_ROOT/anchors/adaptive_v1/adaptive_anchor_bank.npy}
 BKB_PATH=${BKB_PATH:-$DATA_ROOT/pytorch_model.bin}
@@ -169,7 +168,7 @@ PY
         extra=()
         if [ "$MODE" = eval-smoke ]; then extra+=(--max-scenes 8); fi
         run_logged "$MODE" env CUDA_VISIBLE_DEVICES="$EVAL_GPU" "${runner[@]}" evaluate \
-            --ranker "$RANK_CKPT" --scorer "$PCS_SCORER" --reference-trv "$REFERENCE_TRV" \
+            --ranker "$RANK_CKPT" --scorer "$PCS_SCORER" \
             --baseline "$BASELINE_CKPT" --anchor "$ANCHOR_PATH" --backbone "$BKB_PATH" \
             --metric-cache "$TEST_METRIC_CACHE" --data-root "$DATA_ROOT" --output "$RANK_EXP/$MODE" \
             --workers "${WORKERS:-0}" --score-workers "${SCORE_WORKERS:-2}" "${extra[@]}"

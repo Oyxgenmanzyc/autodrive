@@ -31,3 +31,34 @@ tests/test_diffusiondrive_variable_anchor.py
 
 与论文撰写的关系：
 该版本作为“原版 DiffusionDrive + Adaptive Multimodal Anchor”的独立消融实验，与 3.1.01 时序优化实验分离，可用于直接比较固定 20-anchor 与 adaptive variable-K anchor 的覆盖率、训练稳定性及 NAVSIM 指标。
+修改主题：0_89.6pdm 定稿——K67 + PCS + Cost Ranker
+修改日期：2026-09-21
+
+修改目的：
+从 3.1.02 K67 基线重建干净定稿，只保留已在完整 navtest 获得最佳结果的候选生成、PCS评分和代价敏感排序链路。
+
+核心改动：
+- 冻结 K67 自适应多模态 Anchor 生成器，保留67条候选与原两步DDIM推理。
+- PCS独立预测每条候选的五项PDM分量与合成分数，不更新生成器。
+- Cost Ranker读取冻结PCS特征、分项、分数、原分类概率和轨迹几何，通过候选Self-Attention预测有界排序残差。
+- 最终选择分数为 PCS score + 0.25 * residual；残差头零初始化，初始行为严格回退原PCS。
+- 只训练代价加权pairwise ranking loss；按日志三折OOF教师仅用于难例挖掘。
+- navtrain val按日志拆分calibration/audit；audit不参与epoch或alpha选择。
+- navtest评估只输出rank、PCS和base，不再加载TRV checkpoint。
+
+去除的冗余实验：
+- TRV三风险否决器、GTRS保守选择器。
+- Generator Brake Timing与Timing Cross-Attention Generator。
+- Post-selection Timing Refiner与Gated Paired Timing Refiner。
+- predicted-margin gate、future-occupancy veto及其缓存/训练依赖。
+
+正式结果：
+- 12,146场景完整navtest：rank 0.8945933668，PCS 0.8907557098，base 0.8848893597。
+- 相对PCS提升0.383766 PDM点；NC、DAC、TTC、comfort、direction均值提高，ego progress轻微下降。
+- 分支名0_89.6pdm为用户指定实验名；论文与报告使用未经取整的真实分数0.8945933668。
+
+验证状态：
+- 复用已完成的服务器完整训练与navtest结果。
+- 干净分支未重新执行服务器eval；用户明确要求直接定稿上传。代码裁剪没有改动K67、PCS或Cost Ranker权重与排名计算，只移除了TRV对照的加载和输出。
+
+------------------------------------------------------------

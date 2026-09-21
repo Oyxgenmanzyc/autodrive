@@ -8,7 +8,7 @@ INSTALL_ROOT=${INSTALL_ROOT:-/home/hndx/zyc/training_code/3.1.05}
 source "${CONDA_SH:-/home/hndx/miniconda3/etc/profile.d/conda.sh}"
 conda activate navhigh
 mkdir -p "$INSTALL_ROOT"
-DEST="$INSTALL_ROOT/autodrive-cost-ranked-pcs-3.1.05_6-${COMMIT:0:12}"
+DEST="$INSTALL_ROOT/autodrive-0_89.6pdm-${COMMIT:0:12}"
 if [ -e "$DEST" ]; then
     if [ -f "$DEST/.release_commit" ] && [ "$(cat "$DEST/.release_commit")" = "$COMMIT" ]; then
         echo "Already installed. CODE_ROOT=$DEST"

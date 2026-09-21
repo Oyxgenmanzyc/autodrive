@@ -1,4 +1,4 @@
-# 3.1.05_6 服务器步骤
+# 0_89.6pdm（3.1.05_6）服务器步骤
 
 使用Git发布zip直接解压，或者 `bash scripts/pcs/install_3_1_05_6.sh FULL_COMMIT /path/to/release.zip`。安装器会打印**实际**CODE_ROOT，后续必须使用这个目录，不要自行推测名称。新目录保留Git LF字节，避免旧缓存provenance因CRLF不一致而失效。以下命令均不含会退出交互终端的顶层`exit`。
 
@@ -111,6 +111,6 @@ bash scripts/pcs/run_3_1_05_6.sh eval-smoke &&
 bash scripts/pcs/run_3_1_05_6.sh eval
 ```
 
-navtest才需要原生成器/图像backbone/anchor、navtest原始数据与metric_cache及旧TRV checkpoint。评估输出`rank.csv`、`pcs.csv`、`trv.csv`、`base.csv`和逐场景paired_results.csv。新ranker不接旧TRV，TRV只是固定对照；真实PDM标签只在选轨迹之后用于统计。
+navtest需要原生成器、图像backbone、anchor、navtest原始数据与metric_cache，不再需要旧TRV checkpoint。评估输出`rank.csv`、`pcs.csv`、`base.csv`和逐场景`paired_results.csv`；真实PDM标签只在选轨迹之后用于统计。
 
 旧实验缓存不自动删除；这次任务无需清理文件。

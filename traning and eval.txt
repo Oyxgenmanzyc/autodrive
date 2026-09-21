@@ -1,0 +1,268 @@
+0_89.6pdm（3.1.05_6 Cost Ranker）训练与验证复现记录
+========================================================
+
+记录日期：2026-09-21
+GitHub： https://github.com/Oyxgenmanzyc/autodrive
+分支： best/0_89.6pdm
+
+一、正式结果
+------------
+
+固定 checkpoint、固定 alpha=0.25，在 NAVSIM navtest 12,146 个场景上的结果：
+
+- Cost Ranker：0.8945933668
+- 原 PCS：0.8907557098
+- 原 base selector：0.8848893597
+- Cost Ranker 相对 PCS：+0.0038376570，即 +0.383766 PDM 点
+
+版本名“0_89.6pdm”是实验标签。论文和表格应记录真实结果 0.8945933668。
+本分支的最终推理链路只有：K67 candidates -> PCS -> Cost Ranker -> argmax。
+TRV、GTRS、Timing Cross-Attention、选后轨迹修正 Gate 和 Future Occupancy veto 均不参与最终推理。
+
+二、服务器上已经存在的正式产物
+--------------------------------
+
+1. 数据与基础权重
+
+NAVSIM 数据根目录：
+/home/hndx/navsim_workspace/dataset
+
+图像 backbone：
+/home/hndx/navsim_workspace/dataset/pytorch_model.bin
+
+K67 生成器 checkpoint：
+/home/hndx/navsim_workspace/exp/adaptive_multimodal_anchor_k67_3_1_02_4gpu_resume/2026.08.24.11.26.23/lightning_logs/version_0/checkpoints/epoch=99-step=266000.ckpt
+
+K67 anchor bank：
+/home/hndx/navsim_workspace/exp/anchors/adaptive_v1/adaptive_anchor_bank.npy
+
+只有重新生成 PCS candidate cache 时才需要的 K67 原始特征缓存：
+/home/hndx/navsim_workspace/exp/training_cache_3_1_02_k67
+
+navtrain PDM metric cache：
+/home/hndx/navsim_workspace/exp/metric_cache_navtrain_pcs_3_1_05
+
+navtest metric cache：
+/home/hndx/navsim_workspace/exp/metric_cache
+
+2. PCS 候选和评分器
+
+完整 K67 candidate cache（train 85,109；val 18,179）：
+/home/hndx/navsim_workspace/exp/pcs_candidates_k67_3_1_05
+
+关键文件：
+/home/hndx/navsim_workspace/exp/pcs_candidates_k67_3_1_05/manifest.json
+/home/hndx/navsim_workspace/exp/pcs_candidates_k67_3_1_05/records.json
+
+PCS 正式训练目录：
+/home/hndx/navsim_workspace/exp/pdm_candidate_scoring_k67_3_1_05/train/2026.09.07.19.15.17.705777
+
+正式 PCS checkpoint：
+/home/hndx/navsim_workspace/exp/pdm_candidate_scoring_k67_3_1_05/train/2026.09.07.19.15.17.705777/checkpoints/epoch=05.ckpt
+
+3. Cost Ranker 特征、OOF 和 checkpoint
+
+Cost Ranker 实验根目录：
+/home/hndx/navsim_workspace/exp/cost_ranked_pcs_3_1_05_6
+
+冻结 PCS 的紧凑特征缓存（约 7.6 GiB）：
+/home/hndx/navsim_workspace/exp/cost_ranked_pcs_3_1_05_6/features/navtrain
+
+必须保留的特征缓存控制文件：
+/home/hndx/navsim_workspace/exp/cost_ranked_pcs_3_1_05_6/features/navtrain/manifest.json
+/home/hndx/navsim_workspace/exp/cost_ranked_pcs_3_1_05_6/features/navtrain/complete.json
+/home/hndx/navsim_workspace/exp/cost_ranked_pcs_3_1_05_6/features/navtrain/train_records.json
+/home/hndx/navsim_workspace/exp/cost_ranked_pcs_3_1_05_6/features/navtrain/val_records.json
+
+三折 OOF 根目录：
+/home/hndx/navsim_workspace/exp/cost_ranked_pcs_3_1_05_6/oof
+
+正式排名训练所需的 OOF 文件：
+/home/hndx/navsim_workspace/exp/cost_ranked_pcs_3_1_05_6/oof/fold_0_predictions.pt
+/home/hndx/navsim_workspace/exp/cost_ranked_pcs_3_1_05_6/oof/fold_1_predictions.pt
+/home/hndx/navsim_workspace/exp/cost_ranked_pcs_3_1_05_6/oof/fold_2_predictions.pt
+/home/hndx/navsim_workspace/exp/cost_ranked_pcs_3_1_05_6/oof/fold_0.json
+/home/hndx/navsim_workspace/exp/cost_ranked_pcs_3_1_05_6/oof/fold_1.json
+/home/hndx/navsim_workspace/exp/cost_ranked_pcs_3_1_05_6/oof/fold_2.json
+/home/hndx/navsim_workspace/exp/cost_ranked_pcs_3_1_05_6/oof/oof_scores.npy
+/home/hndx/navsim_workspace/exp/cost_ranked_pcs_3_1_05_6/oof/manifest.json
+/home/hndx/navsim_workspace/exp/cost_ranked_pcs_3_1_05_6/oof/complete.json
+
+三个临时 OOF teacher 的准确 checkpoint 路径保存在 fold_0.json、fold_1.json、fold_2.json 的 checkpoint 字段中。已有完整 oof_scores.npy 后，重新训练最终 Ranker 不需要再次加载 teacher checkpoint。
+
+Cost Ranker 正式训练目录：
+/home/hndx/navsim_workspace/exp/cost_ranked_pcs_3_1_05_6/train/2026.09.19.19.00.42.148759
+
+最终 Cost Ranker checkpoint：
+/home/hndx/navsim_workspace/exp/cost_ranked_pcs_3_1_05_6/train/2026.09.19.19.00.42.148759/checkpoints/epoch=14.ckpt
+
+最后一轮/断点 checkpoint：
+/home/hndx/navsim_workspace/exp/cost_ranked_pcs_3_1_05_6/train/2026.09.19.19.00.42.148759/checkpoints/last.ckpt
+
+训练选择记录：
+/home/hndx/navsim_workspace/exp/cost_ranked_pcs_3_1_05_6/train/2026.09.19.19.00.42.148759/result.json
+/home/hndx/navsim_workspace/exp/cost_ranked_pcs_3_1_05_6/train/2026.09.19.19.00.42.148759/epoch_14_report.json
+
+4. 产生 0.8945933668 的完整 navtest 结果
+
+结果目录：
+/home/hndx/navsim_workspace/exp/cost_ranked_pcs_3_1_05_6/eval/2026.09.19.19.11.08.347352
+
+关键结果文件：
+/home/hndx/navsim_workspace/exp/cost_ranked_pcs_3_1_05_6/eval/2026.09.19.19.11.08.347352/summary.json
+/home/hndx/navsim_workspace/exp/cost_ranked_pcs_3_1_05_6/eval/2026.09.19.19.11.08.347352/rank.csv
+/home/hndx/navsim_workspace/exp/cost_ranked_pcs_3_1_05_6/eval/2026.09.19.19.11.08.347352/pcs.csv
+/home/hndx/navsim_workspace/exp/cost_ranked_pcs_3_1_05_6/eval/2026.09.19.19.11.08.347352/base.csv
+/home/hndx/navsim_workspace/exp/cost_ranked_pcs_3_1_05_6/eval/2026.09.19.19.11.08.347352/paired_results.csv
+/home/hndx/navsim_workspace/exp/cost_ranked_pcs_3_1_05_6/eval/2026.09.19.19.11.08.347352/run.json
+
+注意：旧版结果目录可能还包含 trv.csv。它只是历史对照，不是本分支的最终运行依赖；干净分支重新评估只生成 rank、pcs、base 三组结果。
+
+三、服务器安装最终代码
+----------------------
+
+已有历史代码目录（实际产生上述训练与验证结果）：
+/home/hndx/zyc/training_code/3.1.05/autodrive-cae169866f9a2dd64f4b2de505ee34d8d47da245
+
+从 GitHub 安装干净定稿：
+
+source /home/hndx/miniconda3/etc/profile.d/conda.sh
+conda activate navhigh
+
+INSTALL_ROOT=/home/hndx/zyc/training_code/3.1.05
+cd "$INSTALL_ROOT"
+git clone --branch best/0_89.6pdm --single-branch \
+  https://github.com/Oyxgenmanzyc/autodrive.git autodrive-0_89.6pdm
+
+export CODE_ROOT="$INSTALL_ROOT/autodrive-0_89.6pdm"
+export EXP_ROOT=/home/hndx/navsim_workspace/exp
+export DATA_ROOT=/home/hndx/navsim_workspace/dataset
+export RANK_EXP="$EXP_ROOT/cost_ranked_pcs_3_1_05_6"
+cd "$CODE_ROOT"
+
+四、固定环境变量
+----------------
+
+source /home/hndx/miniconda3/etc/profile.d/conda.sh
+conda activate navhigh
+
+export CODE_ROOT=/home/hndx/zyc/training_code/3.1.05/autodrive-0_89.6pdm
+export EXP_ROOT=/home/hndx/navsim_workspace/exp
+export DATA_ROOT=/home/hndx/navsim_workspace/dataset
+export RANK_EXP="$EXP_ROOT/cost_ranked_pcs_3_1_05_6"
+export PCS_CACHE="$EXP_ROOT/pcs_candidates_k67_3_1_05"
+export RANK_FEATURES="$RANK_EXP/features/navtrain"
+export OOF_ROOT="$RANK_EXP/oof"
+
+export BASELINE_CKPT="$EXP_ROOT/adaptive_multimodal_anchor_k67_3_1_02_4gpu_resume/2026.08.24.11.26.23/lightning_logs/version_0/checkpoints/epoch=99-step=266000.ckpt"
+export ANCHOR_PATH="$EXP_ROOT/anchors/adaptive_v1/adaptive_anchor_bank.npy"
+export BKB_PATH="$DATA_ROOT/pytorch_model.bin"
+export PCS_SCORER="$EXP_ROOT/pdm_candidate_scoring_k67_3_1_05/train/2026.09.07.19.15.17.705777/checkpoints/epoch=05.ckpt"
+export RANK_CKPT="$RANK_EXP/train/2026.09.19.19.00.42.148759/checkpoints/epoch=14.ckpt"
+export TEST_METRIC_CACHE="$EXP_ROOT/metric_cache"
+
+export TRAIN_GPUS="GPU-ca2805ee-6ed8-b153-e487-087872e087ac,GPU-12dd0e4c-f7aa-3523-a136-63f0782786f6,GPU-fa24445c-8297-4539-4b52-095a9ad39eea,GPU-d9166e6d-dfbc-3785-a88e-d171f0c79c78"
+export EVAL_GPU="GPU-ca2805ee-6ed8-b153-e487-087872e087ac"
+
+cd "$CODE_ROOT"
+
+五、直接复用现有缓存重新训练 Cost Ranker
+--------------------------------------
+
+以下命令不会训练 K67，也不会更新 PCS；只训练独立 Cost Ranker：
+
+bash scripts/pcs/run_3_1_05_6.sh check
+bash scripts/pcs/run_3_1_05_6.sh test
+
+test -f "$RANK_FEATURES/complete.json"
+test -f "$OOF_ROOT/complete.json"
+
+EPOCHS=20 BATCH_SIZE=32 WORKERS=0 LR=1e-4 \
+bash scripts/pcs/run_3_1_05_6.sh train
+
+训练配置：4张 RTX 5880 Ada 物理卡，每卡 batch size 32，全局 batch size 128，20 epochs，FP32，LR=1e-4。最佳 checkpoint 依据 calibration PDM 选择，不按训练 loss 最低选择。成功实验的最佳 epoch 是 14，固定策略 alpha=0.25；重新训练仍应读取新 run 的 result.json，不能硬编码假设每次都是 epoch14。
+
+六、从 PCS candidate cache 重建 Ranker 特征和 OOF
+-------------------------------------------------
+
+只有在 features/navtrain 或 oof 不存在时执行：
+
+bash scripts/pcs/run_3_1_05_6.sh prepare
+
+TEACHER_EPOCHS=20 BATCH_SIZE=32 WORKERS=0 \
+bash scripts/pcs/run_3_1_05_6.sh oof
+
+EPOCHS=20 BATCH_SIZE=32 WORKERS=0 LR=1e-4 \
+bash scripts/pcs/run_3_1_05_6.sh train
+
+OOF 会依次训练三个独立 teacher。每个 teacher 用另外两个日志折训练20轮，再预测未见过的一折，最后生成 oof_scores.npy。三个 teacher 只用于难例挖掘，不参与最终推理。
+
+七、从头训练 PCS（只有 PCS cache/checkpoint 丢失时执行）
+------------------------------------------------------
+
+export FEATURE_CACHE="$EXP_ROOT/training_cache_3_1_02_k67"
+export TRAIN_METRIC_CACHE="$EXP_ROOT/metric_cache_navtrain_pcs_3_1_05"
+export PCS_EXP="$EXP_ROOT/pdm_candidate_scoring_k67_3_1_05"
+
+# metric cache 不存在时：
+bash scripts/pcs/run_3_1_05.sh metric
+
+# 生成 85,109 train + 18,179 val 的 K67 candidate cache：
+bash scripts/pcs/run_3_1_05.sh cache
+
+# 四卡、每卡32、20轮、16-mixed、LR=3e-4：
+bash scripts/pcs/run_3_1_05.sh train
+
+PCS 训练完成后必须使用打印的 best checkpoint。成功实验使用 epoch=05.ckpt。随后重新执行 Ranker 的 prepare、oof 和 train。
+
+八、固定 checkpoint 的缓存验证和完整 navtest 指令
+--------------------------------------------------
+
+# navtrain val 缓存验证：
+bash scripts/pcs/run_3_1_05_6.sh validate
+
+# 8场景链路检查：
+bash scripts/pcs/run_3_1_05_6.sh eval-smoke
+
+# 12,146场景完整 navtest：
+bash scripts/pcs/run_3_1_05_6.sh eval
+
+上述 eval 命令使用 checkpoint 内已经固定的 alpha=0.25，不在 navtest 上调参。真实 PDM 标签只在 rank/PCS/base 三种选择全部确定后用于统计。
+
+九、快速完整性检查
+------------------
+
+for FILE in \
+  "$BASELINE_CKPT" \
+  "$ANCHOR_PATH" \
+  "$BKB_PATH" \
+  "$PCS_SCORER" \
+  "$RANK_CKPT" \
+  "$PCS_CACHE/manifest.json" \
+  "$PCS_CACHE/records.json" \
+  "$RANK_FEATURES/manifest.json" \
+  "$RANK_FEATURES/complete.json" \
+  "$OOF_ROOT/oof_scores.npy" \
+  "$OOF_ROOT/complete.json"
+do
+  test -f "$FILE" && echo "存在：$FILE" || echo "缺少：$FILE"
+done
+
+du -sh "$PCS_CACHE" "$RANK_FEATURES" "$OOF_ROOT"
+df -h "$EXP_ROOT"
+
+十、不能删除的最小复现集合
+--------------------------
+
+若只保留“利用现有缓存重新训练并验证”的能力，至少保留：
+
+1. dataset 目录和 navtest metric_cache。
+2. K67 baseline checkpoint、anchor bank、pytorch_model.bin。
+3. pcs_candidates_k67_3_1_05 完整目录。
+4. PCS epoch=05.ckpt。
+5. cost_ranked_pcs_3_1_05_6/features/navtrain 完整目录。
+6. cost_ranked_pcs_3_1_05_6/oof 中的 oof_scores.npy、manifest.json、complete.json；如要审计OOF来源，同时保留三个 fold prediction、fold JSON 和 teacher checkpoint。
+7. Cost Ranker epoch=14.ckpt、对应 result.json 和 epoch_14_report.json。
+8. 完整 navtest 结果目录 2026.09.19.19.11.08.347352。
+
+不需要 TRV、GTRS、3.1.05_5 Gate、Timing Cross-Attention、PTR edit cache 或 Future Occupancy cache 才能复现最终 Cost Ranker 推理结果。
