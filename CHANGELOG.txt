@@ -1,0 +1,25 @@
+修改主题：3.3.1 LAST-BEV-Gate 第一版
+修改日期：2026-09-21
+修改目的：把 LAST-ViT 的通道频域稳定性选择机制适配到 DiffusionDrive 的 8×8 BEV memory，隔离验证对 query aggregation 的影响。
+基线：main / 3cf6b7b2750a9bf8ba6d6e4728eafdad44e68e3a；独立于 3.1.x 时序实验。
+涉及文件：
+  navsim/agents/diffusiondrive/modules/last_token_selector.py
+  navsim/agents/diffusiondrive/transfuser_config.py
+  navsim/agents/diffusiondrive/transfuser_model_v2.py
+  navsim/planning/script/config/common/agent/diffusiondrive_last_agent.yaml
+  scripts/training/run_last_3_3_1.sh
+  tests/test_last_token_selector.py
+  tests/test_last_model_routing.py
+  tests/fixtures/diffusiondrive_main_v2.py
+  docs/experiment_3_3_1.md
+核心改动：
+  - 无参数 LASTTokenSelector：FP32 通道 FFT、Gaussian low-pass、signed stability、每通道空间 Top-K、vote 残差软 gate。
+  - 修正 Gaussian DC 中心偏移；用 population std 避免单 token NaN；保留原始值梯度。
+  - 在 positional embedding 之前选择；decoder memory 和 cross-BEV 独立开关，AMP 下保持原位置编码 dtype。
+  - 专用 agent 开启 decoder-only gate，K=16/64、alpha=0.25；通用 config 默认关闭。
+  - 可选 trajectory query global 注入及只读 similarity/vote/gate 输出。
+  - 无新增 state_dict 键；保留 CNN/GPT/20 anchors/diffusion/loss/100 epoch 优化器调度。
+预期影响：检验空间 token 选择是否改善规划信息聚合；不预先断言背景抑制或 PDMS 提升。
+测试/验证结果：本地未运行；待服务器单元测试、真实数据 smoke test、正式训练和 navtest PDMS 评估。
+  单元测试包含冻结 main V2 class 的路由回归，backbone/heads 使用替身；不等价于全模型或真实 checkpoint 验证。
+与论文撰写的关系：作为 3.3.1 B2/C1 最小迁移及 B0/B1/B3 对照基础。其余 backbone/causal mask/语义命中率分析不属于本版完成范围。

@@ -1,0 +1,17 @@
+# 3.3.1 B2/C1: LAST-Gate on the 8x8 decoder memory only.
+defaults:
+  - diffusiondrive_agent
+  - _self_
+
+config:
+  last_enable: true
+  last_apply_decoder: true
+  last_apply_cross_bev: false
+  last_topk_ratio: 0.25
+  last_sigma_scale: 1.0
+  last_eps: 1e-6
+  last_gate_alpha: 0.25
+  last_pre_norm: true
+  last_query_injection: false
+  last_query_scale: 0.1
+  last_debug: false

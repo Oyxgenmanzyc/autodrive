@@ -75,6 +75,19 @@ class TransfuserConfig:
     tf_num_head: int = 8
     tf_dropout: float = 0.0
 
+    # 3.3.1: LAST-inspired BEV memory adaptation (legacy behavior by default).
+    last_enable: bool = False
+    last_apply_decoder: bool = True
+    last_apply_cross_bev: bool = False
+    last_topk_ratio: float = 0.25
+    last_sigma_scale: float = 1.0
+    last_eps: float = 1e-6
+    last_gate_alpha: float = 0.25
+    last_pre_norm: bool = True
+    last_query_injection: bool = False
+    last_query_scale: float = 0.1
+    last_debug: bool = False
+
     # detection
     num_bounding_boxes: int = 30
 

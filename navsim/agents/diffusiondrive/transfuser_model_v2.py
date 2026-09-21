@@ -12,6 +12,7 @@ from navsim.agents.diffusiondrive.modules.conditional_unet1d import ConditionalU
 import torch.nn.functional as F
 from navsim.agents.diffusiondrive.modules.blocks import linear_relu_ln,bias_init_with_prob, gen_sineembed_for_position, GridSampleCrossBEVAttention
 from navsim.agents.diffusiondrive.modules.multimodal_loss import LossComputer
+from navsim.agents.diffusiondrive.modules.last_token_selector import LASTTokenSelector
 from torch.nn import TransformerDecoder,TransformerDecoderLayer
 from typing import Any, List, Dict, Optional, Union
 class V2TransfuserModel(nn.Module):
@@ -31,6 +32,13 @@ class V2TransfuserModel(nn.Module):
         ]
 
         self._config = config
+        self._last_selector = LASTTokenSelector(
+            topk_ratio=config.last_topk_ratio,
+            sigma_scale=config.last_sigma_scale,
+            eps=config.last_eps,
+            gate_alpha=config.last_gate_alpha,
+            pre_norm=config.last_pre_norm,
+        )
         self._backbone = TransfuserBackbone(config)
 
         self._keyval_embedding = nn.Embedding(8**2 + 1, config.tf_d_model)  # 8x8 feature grid + trajectory
@@ -109,10 +117,30 @@ class V2TransfuserModel(nn.Module):
         bev_feature = bev_feature.permute(0, 2, 1)
         status_encoding = self._status_encoding(status_feature)
 
-        keyval = torch.concatenate([bev_feature, status_encoding[:, None]], dim=1)
+        # Score content before positional embeddings. Keep the two consumers
+        # independent so decoder-only gating cannot leak into diffusion memory.
+        decoder_bev = bev_feature
+        cross_bev = bev_feature
+        last_global = None
+        last_aux = None
+        if self._config.last_enable:
+            gated_bev, last_global, last_aux = self._last_selector(bev_feature)
+            if self._config.last_apply_decoder:
+                decoder_bev = gated_bev
+            if self._config.last_apply_cross_bev:
+                cross_bev = gated_bev
+
+        keyval = torch.concatenate([decoder_bev, status_encoding[:, None]], dim=1)
         keyval += self._keyval_embedding.weight[None, ...]
 
-        concat_cross_bev = keyval[:,:-1].permute(0,2,1).contiguous().view(batch_size, -1, concat_cross_bev_shape[0], concat_cross_bev_shape[1])
+        if self._config.last_enable:
+            # Match the legacy in-place positional add's dtype under AMP.
+            cross_memory = cross_bev.clone()
+            cross_memory += self._keyval_embedding.weight[None, :-1]
+        else:
+            # Preserve the original operations exactly with LAST disabled.
+            cross_memory = keyval[:, :-1]
+        concat_cross_bev = cross_memory.permute(0,2,1).contiguous().view(batch_size, -1, concat_cross_bev_shape[0], concat_cross_bev_shape[1])
         # upsample to the same shape as bev_feature_upscale
 
         concat_cross_bev = F.interpolate(concat_cross_bev, size=bev_spatial_shape, mode='bilinear', align_corners=False)
@@ -122,12 +150,29 @@ class V2TransfuserModel(nn.Module):
         cross_bev_feature = self.bev_proj(cross_bev_feature.flatten(-2,-1).permute(0,2,1))
         cross_bev_feature = cross_bev_feature.permute(0,2,1).contiguous().view(batch_size, -1, bev_spatial_shape[0], bev_spatial_shape[1])
         query = self._query_embedding.weight[None, ...].repeat(batch_size, 1, 1)
+        if self._config.last_enable and self._config.last_query_injection:
+            global_feat = F.layer_norm(last_global, (last_global.shape[-1],))
+            query = torch.cat([
+                query[:, :1] + self._config.last_query_scale * global_feat[:, None],
+                query[:, 1:],
+            ], dim=1)
         query_out = self._tf_decoder(query, keyval)
 
         bev_semantic_map = self._bev_semantic_head(bev_feature_upscale)
         trajectory_query, agents_query = query_out.split(self._query_splits, dim=1)
 
         output: Dict[str, torch.Tensor] = {"bev_semantic_map": bev_semantic_map}
+        if self._config.last_debug:
+            # Read-only diagnostics; similarity is not an attention weight.
+            with torch.no_grad():
+                output["last_plan_similarity"] = F.cosine_similarity(
+                    bev_feature.float(), trajectory_query.float(), dim=-1,
+                ).reshape(batch_size, *concat_cross_bev_shape)
+                if last_aux is not None:
+                    for name in ("vote", "gate"):
+                        output[f"last_{name}"] = last_aux[name].detach().reshape(
+                            batch_size, *concat_cross_bev_shape,
+                        )
 
         trajectory = self._trajectory_head(trajectory_query,agents_query, cross_bev_feature,bev_spatial_shape,status_encoding[:, None],targets=targets,global_img=None)
         output.update(trajectory)
