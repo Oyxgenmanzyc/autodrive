@@ -3,6 +3,10 @@ defaults:
   - diffusiondrive_agent
   - _self_
 
+# 4-GPU training recipe for 3.3.1 uses 1e-4; the launcher also sets it
+# explicitly so baseline and LAST ablations cannot silently diverge.
+lr: 0.0001
+
 config:
   last_enable: true
   last_apply_decoder: true

@@ -19,6 +19,11 @@
   - 专用 agent 开启 decoder-only gate，K=16/64、alpha=0.25；通用 config 默认关闭。
   - 可选 trajectory query global 注入及只读 similarity/vote/gate 输出。
   - 无新增 state_dict 键；保留 CNN/GPT/20 anchors/diffusion/loss/100 epoch 优化器调度。
+训练配置：
+  - 服务器数据根目录：/home/hndx/navsim_workspace/dataset；maps 使用其 maps 子目录。
+  - anchor：/home/hndx/navsim_workspace/dataset/kmeans_navsim_traj_20.npy。
+  - ResNet-34 权重：/home/hndx/navsim_workspace/dataset/pytorch_model.bin。
+  - 物理 GPU 4–7，4 卡 DDP，每卡 batch size 32，全局 batch size 128，学习率 1e-4，100 epochs，16-mixed。
 预期影响：检验空间 token 选择是否改善规划信息聚合；不预先断言背景抑制或 PDMS 提升。
 测试/验证结果：本地未运行；待服务器单元测试、真实数据 smoke test、正式训练和 navtest PDMS 评估。
   单元测试包含冻结 main V2 class 的路由回归，backbone/heads 使用替身；不等价于全模型或真实 checkpoint 验证。
