@@ -153,4 +153,4 @@ python navsim/planning/script/run_pdm_score.py \
 
 ## 验证记录
 
-服务器首次运行 16 项单元测试，15 项通过；`expand()` 产生的零步长测试输入在 oneMKL FFT 中报 DFTI 配置错误。现已在 FFT 前显式 materialize contiguous layout，等待服务器重跑确认。真实数据 smoke test、训练和评估尚未运行。工作流约定将运行验证放在服务器，本地 Windows 不代跑；本仓库为 Python 项目，没有 `mvnw`，Java/Maven 检查不适用。
+服务器首次运行 16 项单元测试，15 项通过；`expand()` 产生的零步长测试输入在 oneMKL FFT 中报 DFTI 配置错误，现已在 FFT 前显式 materialize contiguous layout。随后 smoke test 到达 optimizer setup，发现服务器新版 PyTorch 已移除 `_LRScheduler` 的 `verbose` 参数；现保留 `WarmupCosLR` 对外参数但不再向父类转发，并新增兼容测试。等待服务器重跑确认；真实训练和评估尚未运行。工作流约定将运行验证放在服务器，本地 Windows 不代跑；本仓库为 Python 项目，没有 `mvnw`，Java/Maven 检查不适用。

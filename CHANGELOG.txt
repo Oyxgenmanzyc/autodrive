@@ -25,6 +25,6 @@
   - ResNet-34 权重：/home/hndx/navsim_workspace/dataset/pytorch_model.bin。
   - 物理 GPU 4–7，4 卡 DDP，每卡 batch size 32，全局 batch size 128，学习率 1e-4，100 epochs，16-mixed。
 预期影响：检验空间 token 选择是否改善规划信息聚合；不预先断言背景抑制或 PDMS 提升。
-测试/验证结果：服务器首次运行 16 项单元测试，15 项通过；零步长 expand view 在 oneMKL FFT 触发 DFTI 配置错误。已在 FFT 前显式 contiguous 修复，待服务器重跑确认；真实数据 smoke test、正式训练和 navtest PDMS 尚未运行。
+测试/验证结果：服务器首次运行 16 项单元测试，15 项通过；零步长 expand view 在 oneMKL FFT 触发 DFTI 配置错误，已在 FFT 前显式 contiguous 修复。随后 smoke test 到达 optimizer setup，发现服务器新版 PyTorch 已移除 _LRScheduler 的 verbose 参数；现保留 WarmupCosLR 对外参数但不再向父类转发，并新增兼容测试。待服务器重跑确认；真实训练和 navtest PDMS 尚未运行。
   单元测试包含冻结 main V2 class 的路由回归，backbone/heads 使用替身；不等价于全模型或真实 checkpoint 验证。
 与论文撰写的关系：作为 3.3.1 B2/C1 最小迁移及 B0/B1/B3 对照基础。其余 backbone/causal mask/语义命中率分析不属于本版完成范围。
