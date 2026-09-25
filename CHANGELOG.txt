@@ -313,3 +313,22 @@ tests/test_diffusiondrive_variable_anchor.py
 论文关系：网络图中位于PCS/TRV后、完整扩散循环之外。PTR是本实验命名，不是已有论文模块或强化学习方法。
 证据限制：已有近邻候选Oracle 95.4096不等于严格同路径制动上限；本版先计算受控动作Oracle。
 缓存续跑修正（2026-09-17）：重建 navtrain metric cache 时，PDM 参考轨迹可能令归一化 progress 和总分轻微漂移。PTR identity 校验改为要求动作零轨迹逐元素一致，且 NC、DAC、TTC、comfort、direction 与原缓存一致；不再错误地要求旧、新 composite PDM 总分在 1e-5 内相等。25 个动作的训练标签仍统一来自同一次新 metric cache 官方评分。
+2026-09-25：双向 Timing Selector 独立训练（3.1.05_7）
+
+- 目的：把已经通过 Pareto 验证的 31 动作双向 Timing Oracle 转换为推理时可用的 Selector。
+- 保持生成器、PCS Scorer 和 3.1.05_6 Cost Ranker 完全冻结；只训练独立的小型 Timing Selector。
+- 输入仅使用推理时可见的冻结候选特征、PCS 子分数、PCS 分数、原 selector 概率和最终所选轨迹几何。
+- 动作空间保持为 identity、24 个 extra_brake、3 个 frontload_progress 和 3 个 backload_progress。
+- 使用一个代价加权 pairwise ranking loss；安全退化被编码为最低标量目标，没有混合辅助 loss。
+- 训练集教师标签由 navtrain train 的 metric cache 离线生成；val 按完整 log 固定拆为 calibration/audit。
+- calibration 只负责锁定置信阈值和 checkpoint，audit 不参与调参。
+- 单卡默认参数保持 EPOCHS=20、BATCH_SIZE=32、WORKERS=0、LR=1e-4、FP32。
+- 新增：
+  - navsim/agents/diffusiondrive/timing_oracle/
+  - navsim/agents/diffusiondrive/timing_selector/
+  - navsim/planning/script/run_bidirectional_timing_oracle.py
+  - navsim/planning/script/run_bidirectional_timing_selector.py
+  - scripts/pcs/run_bidirectional_timing_selector.sh
+  - tests/test_bidirectional_timing_oracle.py
+  - tests/test_bidirectional_timing_selector.py
+- 本地通过 py_compile 和 git diff --check；本地 Python 未安装 torch，完整单元测试与训练 Smoke 留待 navhigh 服务器执行。
