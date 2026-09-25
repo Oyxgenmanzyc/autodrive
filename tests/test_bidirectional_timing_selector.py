@@ -8,6 +8,7 @@ from navsim.agents.diffusiondrive.timing_selector.metrics import calibrated_repo
 from navsim.agents.diffusiondrive.timing_selector.model import (
     BidirectionalTimingSelector, scalar_targets, timing_ranking_loss,
 )
+from navsim.planning.script.run_bidirectional_timing_selector_eval import select_timing_action
 
 
 class TestBidirectionalTimingSelector(unittest.TestCase):
@@ -63,6 +64,13 @@ class TestBidirectionalTimingSelector(unittest.TestCase):
         self.assertIn("threshold", report["policy"])
         self.assertTrue(report["reports"]["calibration"]["safety_pass"])
         self.assertTrue(report["reports"]["audit"]["safety_pass"])
+
+    def test_locked_threshold_keeps_identity_below_threshold(self):
+        logits = torch.zeros(1, len(ACTIONS))
+        logits[0, 4] = 0.09
+        self.assertEqual(select_timing_action(logits, {"enabled": True, "threshold": 0.1})[0], 0)
+        logits[0, 4] = 0.1001
+        self.assertEqual(select_timing_action(logits, {"enabled": True, "threshold": 0.1})[0], 4)
 
 
 if __name__ == "__main__":
