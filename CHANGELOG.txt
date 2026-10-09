@@ -62,3 +62,18 @@ tests/test_diffusiondrive_variable_anchor.py
 - 干净分支未重新执行服务器eval；用户明确要求直接定稿上传。代码裁剪没有改动K67、PCS或Cost Ranker权重与排名计算，只移除了TRV对照的加载和输出。
 
 ------------------------------------------------------------
+
+修改主题：3.1.05_11 生成器内的纵向时机 mode（独立实验）
+修改日期：2026-10-09
+
+修改目的：针对第一瓶颈——原 K67 只显式覆盖空间路径，早/晚驾驶时机并非受控生成自由度。3.1.05_10 的生成后固定变形与选择器在独立 audit 失效，不能将其当作此瓶颈的验证。
+
+涉及文件：navsim/agents/diffusiondrive/generator_timing/、navsim/planning/script/run_generator_timing.py、navsim/planning/script/generator_timing_eval.py、scripts/pcs/run_3_1_05_11.sh、tests/test_generator_timing.py、docs/experiment_3_1_05_11_generator_timing.md、training_and_eval_3_1_05_11.txt。
+
+核心改动：每个 K67 空间 anchor 建立早/晚时机种子；134 条新增候选在原冻结 DDIM 两步、每层解码中由时机条件和可训练残差生成。数据侧对每个原候选独立构造并官方打分早/晚目标；仅安全且时机不同的目标监督对应 mode，不把同一 GT 轨迹强压给所有 mode。仅训练新增时机模块，原 67 条候选、PCS 和 Cost Ranker 权重保持冻结。校准/audit 与 201 候选固定后处理、多采样等量对照，只有通过独立 audit 才允许 navtest。
+
+预期影响：将时机差异从生成后的轨迹编辑前移到候选生成；能否提升仍须以生成候选的官方 Oracle、独立 audit 与等量对照判断，不能由教师 Oracle 推断成功。
+
+测试/验证：本地未运行训练或 smoke；须在服务器依次执行 check、test、pilot、完整标签缓存、smoke-train、20 epoch 正式训练和独立 validate。当前不声称 PDM 提升。
+
+与论文关系：提供“显式空间×时机 mode 是否有效”的直接消融，区分候选数量收益、固定后处理收益与真正生成器时机条件收益。

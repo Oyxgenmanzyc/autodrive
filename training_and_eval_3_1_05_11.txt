@@ -1,0 +1,53 @@
+3.1.05_11 generator timing experiment (separate from best/0_89.6pdm)
+
+Server code after installing this branch/package:
+/home/hndx/zyc/training_code/3.1.05/autodrive-change-20261009-generator-timing-modes-3.1.05_11
+
+Existing immutable inputs:
+/home/hndx/navsim_workspace/exp/pcs_candidates_k67_3_1_05
+/home/hndx/navsim_workspace/exp/metric_cache_navtrain_pcs_3_1_05
+/home/hndx/navsim_workspace/exp/metric_cache
+/home/hndx/navsim_workspace/exp/anchors/adaptive_v1/adaptive_anchor_bank.npy
+/home/hndx/navsim_workspace/exp/adaptive_multimodal_anchor_k67_3_1_02_4gpu_resume/2026.08.24.11.26.23/lightning_logs/version_0/checkpoints/epoch=99-step=266000.ckpt
+/home/hndx/navsim_workspace/exp/pdm_candidate_scoring_k67_3_1_05/train/2026.09.07.19.15.17.705777/checkpoints/epoch=05.ckpt
+/home/hndx/navsim_workspace/exp/cost_ranked_pcs_3_1_05_6/train/2026.09.19.19.00.42.148759/checkpoints/epoch=14.ckpt
+/home/hndx/navsim_workspace/dataset/pytorch_model.bin
+
+New outputs, all under:
+/home/hndx/navsim_workspace/exp/generator_timing_modes_3_1_05_11
+teachers/{train,val}, teachers/complete.json, train/checkpoints/epoch=19.pt,
+validation/<run>/decision.json, navtest/<run>/summary.json
+
+In a NEW terminal on the old 8-GPU server:
+source /home/hndx/miniconda3/etc/profile.d/conda.sh
+conda activate navhigh
+export CODE_ROOT=/home/hndx/zyc/training_code/3.1.05/autodrive-change-20261009-generator-timing-modes-3.1.05_11
+cd "$CODE_ROOT"
+bash scripts/pcs/run_3_1_05_11.sh check
+bash scripts/pcs/run_3_1_05_11.sh test
+bash scripts/pcs/run_3_1_05_11.sh pilot
+
+If the pilot completes, build and verify the full teacher cache. This may take
+hours because each scene officially scores 335 trajectories. Existing blocks are
+skipped on retry. Run in a persistent terminal or redirect the whole command to
+a log with nohup:
+bash scripts/pcs/run_3_1_05_11.sh prepare-all
+
+Then run a short four-GPU gradient test, followed by the fixed formal training:
+EPOCHS=1 bash scripts/pcs/run_3_1_05_11.sh smoke-train
+EPOCHS=20 bash scripts/pcs/run_3_1_05_11.sh train
+
+Set TIMING_CKPT to the formal trained adapter, then run a small evaluation and
+the independent full validation. The checkpoint is fixed BEFORE reading audit:
+export TIMING_CKPT=/home/hndx/navsim_workspace/exp/generator_timing_modes_3_1_05_11/train/checkpoints/epoch=19.pt
+bash scripts/pcs/run_3_1_05_11.sh validate-pilot
+bash scripts/pcs/run_3_1_05_11.sh validate
+
+Read validation/<run>/decision.json. Only if pass_for_navtest is true:
+export DECISION_JSON=/home/hndx/navsim_workspace/exp/generator_timing_modes_3_1_05_11/validation/<run>/decision.json
+bash scripts/pcs/run_3_1_05_11.sh navtest
+
+Important: mode teacher PDM is privileged and cannot be used as an inference
+feature. The new candidates are generated inside DDIM; fixed warps and extra
+samples appear only as matched validation controls. The original 67 candidate
+outputs and old Ranker checkpoint are unchanged.
