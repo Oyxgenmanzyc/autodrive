@@ -17,6 +17,8 @@ class TransfuserConfig:
     lidar_architecture: str = "resnet34"
     bkb_path: str = "/home/users/bencheng.liao/.cache/huggingface/hub/checkpoints/resnet34.a1_in1k/pytorch_model.bin"
     plan_anchor_path: str = "/home/users/bencheng.liao/PlanWrapper/playground/visualization/kmeans_navsim_traj_20.npy"
+    # Optional observation only; does not change losses, anchors, or inference.
+    anchor_diagnostics: bool = False
 
     latent: bool = False
     latent_rad_thresh: float = 4 * np.pi / 9

@@ -81,3 +81,5 @@ tests/test_diffusiondrive_variable_anchor.py
 验证状态：按项目实验工作流，本地未执行测试或训练；服务器需先运行 tests/test_timing_modes.py、完整缓存、Smoke、训练和独立 audit。详见 docs/experiment_3_1_05_10.md。
 
 ------------------------------------------------------------
+
+3.1.05_10 server compatibility fix (2026-10-09): Restore the disabled anchor_diagnostics config field from the exact K67 candidate-cache source. The released source omitted this inert field, causing CandidateDataset to reject the immutable cache at init-cache. The restored file SHA256 is 19c7f12d09d4fcea2c59ec34297b04b9281888b63aacd32fd8c214c0e072d476. Server unit tests passed (5/5); cache pilot remains pending.
