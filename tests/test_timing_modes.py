@@ -7,6 +7,7 @@ from navsim.agents.diffusiondrive.timing_modes.data import inputs_from_source
 from navsim.agents.diffusiondrive.timing_modes.geometry import expand_path, expand_top, top_modes
 from navsim.agents.diffusiondrive.timing_modes.metrics import reports
 from navsim.agents.diffusiondrive.timing_modes.model import TimingModeValue, choose, safe_targets, value_loss
+from navsim.planning.script.run_timing_modes import progress_only_identity_drift
 
 
 class TimingGeometryTest(unittest.TestCase):
@@ -34,6 +35,23 @@ class TimingGeometryTest(unittest.TestCase):
 
 
 class TimingModelTest(unittest.TestCase):
+    def test_progress_reference_drift_keeps_current_official_labels(self):
+        current = np.ones((5, 5), dtype=np.float32)
+        cached = current.copy()
+        cached[2, 2] = .52
+        old_scores = cached[:, 0]*cached[:, 1]*(
+            5*cached[:, 2]+5*cached[:, 3]+2*cached[:, 4])/12
+        current_scores = np.ones(5, dtype=np.float32)
+        direction = np.ones(5, dtype=np.float32)
+        changed, maximum = progress_only_identity_drift(
+            current, current_scores, direction, cached, old_scores, direction)
+        self.assertEqual(changed.tolist(), [2])
+        self.assertAlmostEqual(maximum, .48, places=5)
+        cached[2, 3] = 0
+        with self.assertRaisesRegex(AssertionError, 'Identity safety label drift'):
+            progress_only_identity_drift(
+                current, current_scores, direction, cached, old_scores, direction)
+
     def test_frozen_input_assembly_and_zero_initialization(self):
         source = dict(features=torch.zeros(67, 512), subscores=torch.zeros(67, 5),
                       pcs_scores=torch.zeros(67), base_logits=torch.zeros(67),

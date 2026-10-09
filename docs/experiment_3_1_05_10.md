@@ -63,3 +63,6 @@ bash scripts/pcs/run_3_1_05_10.sh complete-cache
 ## 状态
 
 代码、单元测试和重现入口已写入分支；尚无 3.1.05_10 的训练或 PDM 结果。本地按实验工作流未运行测试，服务器 `check`、`test`、完整标签、Smoke、训练和独立 audit 均待执行。未经这些结果不能声称第一瓶颈已被解决。
+
+## Metric-cache regeneration discovered during full preparation
+The original K67 candidate labels were written on 2026-09-07. At least two navtrain metric-cache files were rewritten on 2026-09-17. Re-scoring all 67 original trajectories with those current files changes ego-progress only; the frozen K67 candidate records, compact features, and PCS/Ranker predictions are unchanged. For a controlled comparison the timing experiment scores all 20 alternatives, including the unchanged identity, against the same current per-scene metric cache. A rare old-vs-current identity mismatch is permitted only if NC, DAC, TTC, comfort, and direction stay equal; the score reconstructs from the subscores; and each mismatched identity agrees with a separate official pairwise PDM call. Counts and maximum drift are recorded in complete.json. Any safety-metric or unexplained score drift aborts preparation. Previously completed blocks passed the stricter identity check and remain valid. Historical K67 train/val label means must not be mixed into this experiment's new Oracle or policy comparisons.

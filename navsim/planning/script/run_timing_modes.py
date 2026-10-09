@@ -101,6 +101,25 @@ def rank_candidates(ranker, source, alpha, device):
     return top_modes(scores), scores
 
 
+def progress_only_identity_drift(labels, scores, direction, cached_labels,
+                                 cached_scores, cached_direction, atol=1e-5):
+    """Accept only a changed progress reference; safety and score math must agree."""
+    guarded = [0, 1, 3, 4]
+    np.testing.assert_allclose(labels[:, guarded], cached_labels[:, guarded],
+                               atol=atol, rtol=0, err_msg='Identity safety label drift')
+    np.testing.assert_allclose(direction, cached_direction, atol=atol, rtol=0,
+                               err_msg='Identity direction drift')
+    for name, values, subscores in (('current', scores, labels),
+                                    ('cached', cached_scores, cached_labels)):
+        reconstructed = subscores[:, 0]*subscores[:, 1]*(
+            5*subscores[:, 2]+5*subscores[:, 3]+2*subscores[:, 4])/12
+        np.testing.assert_allclose(values, reconstructed, atol=atol, rtol=0,
+                                   err_msg=f'{name} identity score/label mismatch')
+    drift = np.maximum(np.abs(scores-cached_scores),
+                       np.max(np.abs(labels-cached_labels), axis=1))
+    return np.flatnonzero(drift > atol), float(drift.max())
+
+
 def prepare_shard(args):
     if not 0 <= args.shard_index < args.num_shards:
         raise ValueError('Invalid shard index')
@@ -132,6 +151,13 @@ def prepare_shard(args):
                 original_entry = load_torch(entry_path(args.candidate_cache, data.records[index]))
                 if original_entry['token'] != token or original_entry['provenance'] != data.manifest['provenance']:
                     raise ValueError(f'Original candidate entry differs: {token}')
+                for key, cached in (('proposals', source['proposals']),
+                                    ('scores', source['scores']),
+                                    ('labels', source['labels']),
+                                    ('direction', source['direction'])):
+                    original = original_entry['context'][key] if key == 'proposals' else original_entry[key]
+                    if not torch.equal(original, cached):
+                        raise ValueError(f'Compact K67 {key} differs from candidate cache: {token}')
                 scene = original_entry['context']
                 variant_context = {key: scene[key][None].to('cuda:0')
                                    for key in ('bev', 'agents', 'ego')}
@@ -148,17 +174,29 @@ def prepare_shard(args):
                 jobs.append((future, source, modes, rank_scores, trajectories, variant, token))
             piece = dict(tokens=[], modes=[], rank_scores=[], trajectories=[],
                          labels=[], scores=[], direction=[], variant_features=[],
-                         variant_subscores=[], variant_pcs_scores=[])
+                         variant_subscores=[], variant_pcs_scores=[],
+                         identity_progress_drift=[])
             for future, source, modes, rank_scores, trajectories, variant, token in jobs:
                 labels, scores, direction = future.result()
                 if labels.shape != (VARIANTS, 5) or scores.shape != (VARIANTS,):
                     raise ValueError('Unexpected PDM timing label shape')
                 identity = np.arange(TOP_SPATIAL)*len(MODE_NAMES)
-                np.testing.assert_allclose(scores[identity], source['scores'][modes].numpy(),
-                                           atol=1e-5, rtol=0, err_msg=f'Identity score drift: {token}')
-                np.testing.assert_allclose(labels[identity], source['labels'][modes].numpy(),
-                                           atol=1e-5, rtol=0, err_msg=f'Identity labels drift: {token}')
+                drift_indices, drift_max = progress_only_identity_drift(
+                    labels[identity], scores[identity], direction[identity],
+                    source['labels'][modes].numpy(), source['scores'][modes].numpy(),
+                    source['direction'][modes].numpy())
+                for slot in drift_indices:
+                    position = identity[slot]
+                    single = score_candidates(paths[token], trajectories[position:position+1], verify=True)
+                    for batched, pairwise in zip((labels[position], scores[position], direction[position]),
+                                                 (single[0][0], single[1][0], single[2][0])):
+                        np.testing.assert_allclose(batched, pairwise, atol=1e-5, rtol=0,
+                                                   err_msg=f'Current metric is not pairwise: {token}')
+                if len(drift_indices):
+                    print(f'Current-metric progress reference changed: {token}; '
+                          f'identities={len(drift_indices)}, max_drift={drift_max:.6f}', flush=True)
                 piece['tokens'].append(token)
+                piece['identity_progress_drift'].append(torch.tensor(drift_max, dtype=torch.float32))
                 for key, value in (('modes', modes), ('rank_scores', rank_scores),
                                    ('trajectories', trajectories), ('labels', labels),
                                    ('scores', scores), ('direction', direction),
@@ -179,9 +217,11 @@ def prepare_shard(args):
 def complete_cache(args):
     root = Path(args.output)
     counts = {}
+    progress_drift = {}
     for split in ('train', 'val'):
         data = CompactDataset(args.features, split, smoke=args.smoke)
         verify_cache(args, data)
+        drift_count, maximum_drift = 0, 0.
         for start in tqdm(range(0, len(data), BLOCK), desc=f'Check {split} blocks'):
             path = root/split/f'block_{start//BLOCK:05d}.pt'
             if not path.is_file():
@@ -195,10 +235,18 @@ def complete_cache(args):
                     item['variant_subscores'].shape != (len(item['tokens']), VARIANTS, 5) or
                     item['variant_pcs_scores'].shape != (len(item['tokens']), VARIANTS)):
                 raise ValueError(f'Timing block frozen PCS shape mismatch: {path}')
+            # Blocks produced by the strict validator had zero drift and no field.
+            observed = item.get('identity_progress_drift')
+            if observed is not None:
+                if observed.shape != (len(item['tokens']),) or not torch.isfinite(observed).all():
+                    raise ValueError(f'Invalid identity progress drift record: {path}')
+                drift_count += int((observed > 1e-5).sum())
+                maximum_drift = max(maximum_drift, float(observed.max()))
         counts[split] = len(data)
+        progress_drift[split] = dict(scenes=drift_count, maximum=maximum_drift)
     write_new_json(root/'complete.json', dict(manifest_sha256=sha256(root/'manifest.json'),
-                                              counts=counts))
-    print('Complete timing-mode labels:', root, counts)
+                                              counts=counts, progress_drift=progress_drift))
+    print('Complete timing-mode labels:', root, counts, progress_drift)
 
 
 def diagnose(args):
