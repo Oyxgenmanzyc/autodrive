@@ -77,3 +77,5 @@ tests/test_diffusiondrive_variable_anchor.py
 测试/验证：本地未运行训练或 smoke；须在服务器依次执行 check、test、pilot、完整标签缓存、smoke-train、20 epoch 正式训练和独立 validate。当前不声称 PDM 提升。
 
 与论文关系：提供“显式空间×时机 mode 是否有效”的直接消融，区分候选数量收益、固定后处理收益与真正生成器时机条件收益。
+
+兼容性修正（2026-10-09）：恢复 transfuser_config.py 中原 K67 候选缓存记录的只读 anchor_diagnostics 配置字段，使八项源码 SHA256 与旧缓存严格一致。该字段不参与训练或推理；禁止跳过候选缓存的 provenance 校验。

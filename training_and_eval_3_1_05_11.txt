@@ -51,3 +51,9 @@ Important: mode teacher PDM is privileged and cannot be used as an inference
 feature. The new candidates are generated inside DDIM; fixed warps and extra
 samples appear only as matched validation controls. The original 67 candidate
 outputs and old Ranker checkpoint are unchanged.
+
+Source compatibility correction (2026-10-09): The frozen K67 candidate cache
+requires the exact implementation SHA256 for eight source/config files.
+transfuser_config.py includes the inert anchor_diagnostics field from the
+original cache-building source. Run `check` before `pilot` or `prepare-all`;
+never bypass the candidate cache provenance guard.
