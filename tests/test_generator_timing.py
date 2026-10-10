@@ -11,6 +11,27 @@ from navsim.agents.diffusiondrive.generator_timing.model import timing_loss
 
 
 class GeneratorTimingTests(unittest.TestCase):
+    def test_cached_half_features_are_promoted_before_generator_controls(self):
+        from navsim.planning.script.generator_timing_eval import _candidate_context
+
+        source = {
+            'bev': torch.randn(4, 3, 3).half(),
+            'agents': torch.randn(2, 4).half(),
+            'ego': torch.randn(1, 4).half(),
+        }
+        proposals = torch.zeros(67, 8, 3)
+        logits = torch.zeros(67)
+        context = _candidate_context(source, proposals, logits, 'cpu')
+        for key, value in context.items():
+            self.assertEqual(value.dtype, torch.float32, key)
+        for key in source:
+            self.assertTrue(torch.equal(context[key][0], source[key].float()))
+            self.assertEqual(source[key].dtype, torch.float16)
+        # This is the input/weight boundary that failed in the original head.
+        output = torch.nn.Conv2d(4, 4, 1)(context['bev'])
+        self.assertEqual(tuple(output.shape), (1, 4, 3, 3))
+        self.assertTrue(torch.isfinite(output).all())
+
     def test_every_parent_has_distinct_early_and_late_seed(self):
         t = torch.arange(1, 9, dtype=torch.float32)
         anchors = torch.zeros(67, 8, 2)
@@ -43,5 +64,5 @@ class GeneratorTimingTests(unittest.TestCase):
         loss = timing_loss(predicted, targets, torch.tensor([[[True, False]]]),
                            torch.ones(1, 1, 2))
         loss.backward()
-        self.assertGreater(float(loss), 0.)
+        self.assertGreater(float(loss.detach()), 0.)
         self.assertEqual(float(predicted.grad[:, :, 1].abs().sum()), 0.)

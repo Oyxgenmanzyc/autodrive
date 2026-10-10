@@ -34,9 +34,12 @@ def _rank(context, frozen, ranker, alpha):
 
 
 def _candidate_context(source, proposals, logits, device):
-    result = {key: source[key].unsqueeze(0).to(device) for key in ('bev', 'agents', 'ego')}
-    result['proposals'] = proposals.unsqueeze(0).to(device)
-    result['base_logits'] = logits.unsqueeze(0).to(device)
+    # Compact cache features use FP16 storage; all frozen inference heads run
+    # in FP32, including the original DDIM head used by the sampling control.
+    result = {key: source[key].unsqueeze(0).to(device=device, dtype=torch.float32)
+              for key in ('bev', 'agents', 'ego')}
+    result['proposals'] = proposals.unsqueeze(0).to(device=device, dtype=torch.float32)
+    result['base_logits'] = logits.unsqueeze(0).to(device=device, dtype=torch.float32)
     return result
 
 

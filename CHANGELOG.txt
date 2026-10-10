@@ -79,3 +79,5 @@ tests/test_diffusiondrive_variable_anchor.py
 与论文关系：提供“显式空间×时机 mode 是否有效”的直接消融，区分候选数量收益、固定后处理收益与真正生成器时机条件收益。
 
 兼容性修正（2026-10-09）：恢复 transfuser_config.py 中原 K67 候选缓存记录的只读 anchor_diagnostics 配置字段，使八项源码 SHA256 与旧缓存严格一致。该字段不参与训练或推理；禁止跳过候选缓存的 provenance 校验。
+
+验证精度修正（2026-10-10）：缓存 BEV/agents/ego 以 FP16 保存，PCS 与 timing 训练分支原先已有转回 FP32 的边界；额外 DDIM 采样对照直接接收缓存，遗漏转换而在 Conv2d 报 Half/float 不匹配。统一验证输入在 _candidate_context 转为 FP32，保留缓存原有数值精度；新增半精度缓存进入单精度卷积的回归测试。该修正仅涉及验证代码，不改训练模块、教师缓存或已完成的 20 轮 checkpoint。本地未运行测试；待服务器单元测试和验证 Pilot。
